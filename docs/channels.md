@@ -559,10 +559,20 @@ the returned command, and confirms relay-owned state before removing a row. Arch
 confirmed Delete/Leave use the existing access-loss purge. Commands use narrow
 development-broker routes or the packaged native `relay_channel_sign` and
 `relay_channel_publish` commands, never the message outbox or automatic replay.
-Both hosts admit only the exact two-tag `9002` shape with `archived=true` (Archive)
-or `archived=false` (Unarchive); other values, extra tags, cross-route commands and
+The same route carries the **Auto-join new members** switch as two commands
+without a confirmation dialog, `auto-join-on` and `auto-join-off`, each a `9002`
+with `auto_join=true|false`. The lifecycle owner requires fresh relay metadata for an
+active public stream channel before signing (channel roles cannot show community
+ownership; the relay accepts the flag only from community owners and admins) and
+confirms the result from the republished `39000`: the relay advertises the flag
+as a bare `auto_join` tag only while it is in effect, so success is that tag's
+presence or absence, not the written value.
+Both hosts admit only the exact two-tag `9002` shape with `archived=true` (Archive),
+`archived=false` (Unarchive) or `auto_join=true|false` (the switch); other values,
+extra tags, cross-route commands and
 altered or foreign signatures are rejected. Hosts without this capability display
-an unavailable notice. Native Unarchive requires rebuilding/restarting the desktop
+an unavailable notice. Native Unarchive and the auto-join switch require
+rebuilding/restarting the desktop
 binary; updating the frontend alone does not update the Rust validator. Rust
 validator and production-IPC tests cover both values, but do not establish an
 installed desktop Archive → Unarchive round trip against a live relay; that
@@ -633,6 +643,12 @@ row are omitted.
 Duration uses Create's Ongoing/Temporary cards. Access controls live in the members
 dialog, separate from the text and lifespan draft. These details controls stage
 changes; none publishes immediately.
+**Auto-join new members**, between Description and Members, is separate: an
+immediate switch that publishes its own narrow `9002` (see
+[Channel lifecycle](#channel-lifecycle)) and shows pending, the relay's refusal
+or refresh guidance beside itself. It appears only to community owners and admins
+(the relay-signed kind `13534` roster) on an active public stream channel; the
+relay enforces that rule, so the gate is display-only.
 **Save changes** submits the draft together and is enabled only for valid, changed values.
 **Cancel** explicitly discards edits and closes without confirmation. Close, Escape
 and backdrop clicks close untouched forms immediately; changed drafts first show
