@@ -178,10 +178,15 @@ it.each([
     const view = render(h.view);
     await waitFor(() => expect(rows()).toHaveLength(2));
     await chooseFilter("Mentions");
-    const thread = rows().find((row) =>
-      row.textContent?.includes("Matching thread mention"),
-    );
-    if (!thread) throw new Error("Missing matching-mention row");
+    // The mention's root is not retained until the lookup fetches it; the
+    // startup repair holds the reply's row until then.
+    const thread = await waitFor(() => {
+      const row = rows().find((row) =>
+        row.textContent?.includes("Matching thread mention"),
+      );
+      if (!row) throw new Error("Missing matching-mention row");
+      return row;
+    });
     if (action === "menu") {
       fireEvent.contextMenu(
         within(thread).getByRole("button", { name: /^Open / }),
@@ -1770,7 +1775,12 @@ function fixture(
         ) {
           unreadStarted = true;
           await unreadGate;
-          if (unreadFails) throw new Error("unread window unavailable");
+          // Only the channel windows fail; the remembered thread reads land.
+          if (
+            unreadFails &&
+            filters.some((filter) => filter.since !== undefined)
+          )
+            throw new Error("unread window unavailable");
         }
         if (
           filters.some((filter) => !!filter["#p"] && filter.kinds?.includes(9))

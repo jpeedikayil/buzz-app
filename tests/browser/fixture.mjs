@@ -21,6 +21,7 @@ import { buildApp } from "./build.mjs";
 import { fixtureBody } from "./fixture-body.mjs";
 import { watchPageErrors } from "./page-errors.mjs";
 import { validTypingTemplate } from "../../src/features/relay/typing-protocol.ts";
+import { isUnreadWindowBatch } from "../../src/features/relay/unread-window-batch.ts";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 // Public nonmember channel for search/preview/join journeys. Real channel ids
@@ -2270,9 +2271,10 @@ export const test = base.extend({
           throw new Error(
             `Unexpected fixture request: ${request.method} ${request.url}`,
           );
-        // The host reads up to four filters per request.
+        // The host reads up to four filters per request, or an unread
+        // repair batch of up to 128.
         expect(body.length).toBeGreaterThan(0);
-        expect(body.length).toBeLessThanOrEqual(4);
+        expect(body.length <= 4 || isUnreadWindowBatch(body)).toBe(true);
         const filter = body[0];
         const result = [
           ...new Map(

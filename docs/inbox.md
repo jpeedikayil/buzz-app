@@ -131,13 +131,20 @@ channel's thread out of the Inbox. Threads the viewer took part in—replied in,
 was mentioned or answered in, or follows—are refetched whole on every repair,
 before the channel windows, and remembered per relay and viewer on this
 device, at most 100 threads, so they stay in the Inbox after their channel's
-window has moved on. The Inbox is ready once the viewer's own recent messages
-and the remembered threads have landed and reports `observing` while the
-windows still read. A read that fails is tried once more; dropped after that,
-its channels stay as they were and the Inbox notes that some channels could
-not be checked until the next refresh, with no automatic retry. When the
-budget is full, the oldest evidence outside those threads goes first; the
-observation completes rather than resetting. A lazy addressed query returns up to 50 kind-9/40002
+window has moved on. The windows, the viewer's own recent messages and the
+thread reads ride together, up to 128 filters per request with two requests
+in flight, so a roster costs one or two round trips. The Inbox is ready once
+the viewer's own recent messages and the remembered threads have landed, or
+were dropped, and reports `observing` while further windows still read. A
+read that fails is tried once more; dropped after that, its channels stay as
+they were and the Inbox notes that some channels could not be checked until
+the next refresh, with no automatic retry, and later reads that fail in the
+same pass are dropped at once. A repair in which no read lands fails
+instead, keeping the previous evidence and its stale freshness. While a
+repair runs, a reply whose root is not yet retained is not shown as a row
+of its own; it appears under its root once the thread read or lookup brings
+it. When the budget is full, the oldest evidence outside those threads goes
+first; the observation completes rather than resetting. A lazy addressed query returns up to 50 kind-9/40002
 messages. For those exact IDs and unresolved failed targets, general `#e`
 queries page signed kind-40003 edits and kind-5/9005 deletions, then deletions
 of the edits; `include_aux` on an ordinary `#p` query is not a supported relay

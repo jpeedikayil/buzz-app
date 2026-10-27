@@ -501,8 +501,10 @@ The timeline, channel-list preview and filtered plugin views share that operatio
 ## Bounds and lifecycle
 
 - Reads: three active slots, at most one background request, 128 pending distinct
-  requests, ten-second deadlines including queue time, four filters per request,
-  500 per-filter limit, 64 KiB keys, and an 8 MiB result budget.
+  requests, ten-second deadlines including queue time, four filters per request
+  (the workflow-definition, sidebar-preference and unread-repair batch shapes
+  may carry up to 128), 500 per-filter limit, 64 KiB keys, and an 8 MiB result
+  budget.
 - Outbox: at most 256 operations / 2 MiB persisted, 32 KiB per submitted payload,
   three concurrent deliveries, ten-second delivery deadlines including queue time. Only outstanding
   operations count toward capacity; completed events move to a separate 2,048-event /

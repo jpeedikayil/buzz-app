@@ -1,3 +1,4 @@
+import type { ReadFilter } from "./events";
 import { afterEach, expect, it, vi } from "vitest";
 import { createRelayReader } from "./reader";
 import { flush, scriptedTransport } from "./testing";
@@ -309,6 +310,50 @@ it("disposal settles paused work and removes lifecycle callbacks and pending ren
   await flush();
   expect(h.pending).toHaveLength(0);
   await expect(h.read(filter("retry"))).rejects.toThrow();
+});
+
+it("admits an unread repair batch of up to 128 content filters, and nothing shaped otherwise", async () => {
+  const { read, next, pending } = setup();
+  const channel = (i: number) =>
+    `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`;
+  const kinds = [9, 40002, 40008];
+  const root = "a".repeat(64);
+  const batch: ReadFilter[] = [
+    { kinds, authors: ["b".repeat(64)], include_aux: true, limit: 100 },
+    ...Array.from({ length: 125 }, (_, i) => ({
+      kinds,
+      "#h": [channel(i)],
+      since: 1000,
+      include_aux: true,
+      limit: 24,
+    })),
+    {
+      kinds,
+      "#h": [channel(200)],
+      "#e": [root],
+      include_aux: true,
+      limit: 200,
+    },
+    { kinds, ids: [root], include_aux: true, limit: 1 },
+  ];
+  const result = read(batch);
+  expect(next().filters).toHaveLength(128);
+  const window = (f: ReadFilter) => f.since !== undefined;
+  for (const invalid of [
+    [...batch, { ...batch[1], "#h": [channel(300)] }],
+    batch.map((f) => ({ ...f, kinds: [9] })),
+    batch.map(({ include_aux: _aux, ...f }) => f),
+    batch.map(({ since: _since, ...f }) => f),
+    batch.map((f) => (window(f) ? { ...f, "#h": [channel(1)] } : f)),
+    batch.map((f) => (window(f) ? { ...f, until: 2000 } : f)),
+    [...batch.slice(1), batch[0], batch[0]],
+    batch.map((f) => (f.ids ? { ...f, limit: 2 } : f)),
+  ] as ReadFilter[][])
+    await expect(read(invalid)).rejects.toThrow("1–4 filters");
+  expect(pending).toHaveLength(0);
+  const rejected = expect(result).rejects.toMatchObject({ name: "AbortError" });
+  owners.at(-1)?.dispose();
+  await rejected;
 });
 
 it("admits only the bounded workflow batch exception without relaxing other read budgets", async () => {

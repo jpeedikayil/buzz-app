@@ -23,6 +23,10 @@ import { foldMessages, deletionApplies, messageAuthor } from "./fold";
 import { eventMs } from "./message-order";
 import { threadReference } from "./thread-reference";
 import {
+  UNREAD_CONTENT_KINDS,
+  UNREAD_WINDOW_BATCH,
+} from "./unread-window-batch";
+import {
   memoryThreadFollows,
   THREAD_FOLLOW_LIMIT,
   type ThreadFollows,
@@ -570,6 +574,20 @@ export function createUnread({
       entry.mentioned ||
       entry.broadcast ||
       conversation(entry));
+  /** A reply whose root is not retained would be a row of its own. While a
+   * repair runs, whose thread reads fetch the roots it lacks, and the
+   * structure lookup `want` queues has not finished, the reply waits, so a
+   * thread does not flash as one row per reply before grouping under its
+   * root. Otherwise it shows by itself, as a live mention does, and joins
+   * its root once that is verified. */
+  const rootless = (entry: Evidence) =>
+    refresh !== undefined &&
+    entry.parentId !== undefined &&
+    entry.rootId === undefined &&
+    entry.threadRootId !== undefined &&
+    !lookups.get(
+      `${conversationKey(entry.channelId, entry.threadRootId)}:structure`,
+    )?.done;
   /** Retained evidence cannot decide this reply's conversation yet. */
   const undecided = (entry: Evidence, dm: boolean) =>
     !entry.quiet &&
@@ -1003,7 +1021,11 @@ export function createUnread({
         const session = channel.channelType === "solo";
         const evidence = (byChannel.get(channel.id) ?? []).filter((entry) => {
           want(entry, dm);
-          return entry.event.pubkey !== viewer && !!category(entry, dm);
+          return (
+            entry.event.pubkey !== viewer &&
+            !!category(entry, dm) &&
+            !(!dm && rootless(entry))
+          );
         });
         // A session's top-level timeline is one conversation; its threads,
         // roots included, stay separate.
@@ -1449,7 +1471,7 @@ export function createUnread({
       lookupEvents.delete(oldest);
     }
   }
-  const contentKinds = [9, 40002, 40008];
+  const contentKinds = UNREAD_CONTENT_KINDS;
   type Target = { parentId: string; rootId: string | undefined };
   /** The viewer's reply decides this lookup: it answers the parent, or is
    * anywhere in the parent's thread. */
@@ -1662,15 +1684,15 @@ export function createUnread({
   // quarters of the retained budget: counts and rows beyond a channel's page
   // are bounded, as under the former global sample, but a busy channel can no
   // longer push a quiet channel's thread out of the sample, not even on a
-  // first run with a large roster. Single-channel filters ride WINDOW_FILTERS
-  // per request (the relay honours per-filter limits; the reader and hosts
-  // allow four filters per read), with WINDOW_CONCURRENCY requests in flight:
+  // first run with a large roster. Single-channel filters ride
+  // UNREAD_WINDOW_BATCH per request (the relay honours per-filter limits; the
+  // reader and hosts admit this batch shape beyond their four-filter rule),
+  // so a roster costs one or two requests, with WINDOW_CONCURRENCY in flight:
   // the reader runs three reads at once, and the third slot stays free for
   // the channel the viewer opens meanwhile. Each landed request publishes.
   const WINDOW_LIMIT = 100;
   const WINDOW_LEAST = 20;
   const WINDOW_BUDGET = 3072;
-  const WINDOW_FILTERS = 4;
   const WINDOW_CONCURRENCY = 2;
   const WINDOW_FLOOR_SECONDS = 7 * 24 * 60 * 60;
   // The viewer's threads are refetched whole, one filter per channel naming
@@ -1687,24 +1709,29 @@ export function createUnread({
     Array.from({ length: Math.ceil(items.length / size) }, (_, i) =>
       items.slice(i * size, (i + 1) * size),
     );
+  /** One repair's reads: whether any landed, whether one was dropped, and
+   * the last failure, which is the repair's error when nothing landed. */
+  type Pass = { landed: boolean; dropped: boolean; failure: unknown };
   /** Reads `requests` WINDOW_CONCURRENCY at a time, workers pulling the next
-   * as one lands; `landed` sees each result and may push follow-up requests.
-   * A request that fails is read once more in its slot with a fresh deadline
-   * (one window in five live runs stalled past it alone); failing again, it
-   * is dropped and the rest still land. True when every request landed,
-   * false when some were dropped, undefined when the repair was retired
-   * meanwhile or `landed` declined. */
+   * as one lands; `landed` sees each result (undefined for a dropped request)
+   * and may push follow-up requests. A request that fails is read once more
+   * in its slot with a fresh deadline (one window in five live runs stalled
+   * past it alone); failing again, it is dropped and the rest still land.
+   * Once a request has been dropped, a failing request is dropped at once —
+   * a second stall is the relay, not the request — so a dead relay holds a
+   * pass for one deadline per request beyond the two the first costs. False
+   * when the repair was retired meanwhile or `landed` declined. */
   async function pool(
     requests: ReadFilter[][],
     generation: number,
     priority: Priority,
+    pass: Pass,
     landed: (
       request: readonly ReadFilter[],
-      result: readonly RelayEvent[],
+      result: readonly RelayEvent[] | undefined,
       requests: ReadFilter[][],
     ) => boolean,
   ) {
-    let complete = true;
     let retired = false;
     const worker = async () => {
       for (
@@ -1713,19 +1740,19 @@ export function createUnread({
         request = requests.shift()
       ) {
         let result: readonly RelayEvent[] | undefined;
-        for (let attempt = 0; attempt < 2 && !result; attempt++)
+        for (let attempt = 0; attempt < (pass.dropped ? 1 : 2); attempt++)
           try {
             result = await reader.read(request, {
               signal: deadline(),
               priority,
             });
-          } catch {
+            break;
+          } catch (cause) {
             if (closed || generation !== epoch) return;
+            pass.failure = cause;
           }
-        if (!result) {
-          complete = false;
-          continue;
-        }
+        if (result) pass.landed = true;
+        else pass.dropped = true;
         if (
           closed ||
           generation !== epoch ||
@@ -1737,8 +1764,7 @@ export function createUnread({
     await Promise.all(
       Array.from({ length: WINDOW_CONCURRENCY }, () => worker()),
     );
-    if (closed || generation !== epoch || retired) return undefined;
-    return complete;
+    return !closed && generation === epoch && !retired;
   }
   async function rememberedRoots() {
     if (remembered) return remembered;
@@ -1822,7 +1848,7 @@ export function createUnread({
               limit: ids.length,
             })),
           ],
-          WINDOW_FILTERS,
+          UNREAD_WINDOW_BATCH,
         );
       },
       landed(
@@ -1845,8 +1871,9 @@ export function createUnread({
               ),
           ).length;
           if (page < THREAD_LIMIT) continue;
+          // The split stays ahead of the windows, as the thread read was.
           const half = Math.ceil(rootIds.length / 2);
-          requests.push([
+          requests.unshift([
             threads(channelId, rootIds.slice(0, half)),
             threads(channelId, rootIds.slice(half)),
           ]);
@@ -1980,25 +2007,31 @@ export function createUnread({
               limit,
             })),
           ],
-          WINDOW_FILTERS,
+          UNREAD_WINDOW_BATCH,
         );
         const threads = pass.requests();
         requests.splice(1, 0, ...threads);
         remembered = pass.roots;
-        // Once those have landed the Inbox is no longer loading; the windows
-        // still reading show as `observing`.
+        // Once those have landed, or were dropped, the Inbox is no longer
+        // loading; the windows still reading show as `observing`.
         const first = new Set<readonly ReadFilter[]>(
           requests.slice(0, 1 + threads.length),
         );
+        const progress: Pass = {
+          landed: false,
+          dropped: false,
+          failure: undefined,
+        };
         const landed = (
           request: readonly ReadFilter[],
-          result: readonly RelayEvent[],
+          result: readonly RelayEvent[] | undefined,
           queue: ReadFilter[][],
         ) => {
-          let ok: boolean;
-          if (request.some((filter) => filter["#e"] || filter.ids))
+          // A dropped request leaves its channels as they were.
+          let ok = true;
+          if (result && request.some((filter) => filter["#e"] || filter.ids))
             ok = pass.landed(request, result, queue);
-          else {
+          else if (result) {
             // A read channel with nothing since its mark is observed with
             // nothing unread; a never-read channel with no recent history
             // stays unknown rather than claiming zero.
@@ -2022,22 +2055,21 @@ export function createUnread({
           }
           return ok;
         };
-        const windowed = await pool(requests, generation, priority, landed);
-        if (windowed === undefined) return;
+        if (!(await pool(requests, generation, priority, progress, landed)))
+          return;
         // Threads the windows newly taught, usually none.
         pass.learn();
-        const taught = await pool(
-          pass.requests(),
-          generation,
-          priority,
-          landed,
-        );
-        if (taught === undefined) return;
+        if (
+          !(await pool(pass.requests(), generation, priority, progress, landed))
+        )
+          return;
+        // Nothing landed: nothing was observed, so the repair failed.
+        if (!progress.landed) throw progress.failure;
         pass.learn();
         pass.save();
         // A dropped request leaves its channels as they were; the Inbox says
         // so until the next repair, with no automatic retry.
-        partial = !(windowed && taught);
+        partial = progress.dropped;
         freshness = "observed";
         owing = false;
         error = undefined;

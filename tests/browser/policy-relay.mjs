@@ -364,7 +364,8 @@ export function policyRelay({
         }
         // Unread participation: the viewer's threads refetched whole, one
         // `#e` filter per channel naming its roots, with roots the retained
-        // evidence lacks fetched by ID in the same request.
+        // evidence lacks fetched by ID in the same request. Unread repair
+        // requests carry up to 128 filters (`isUnreadWindowBatch`).
         if (
           filters.every(
             (filter) =>
@@ -377,7 +378,7 @@ export function policyRelay({
                 (filter.ids && !filter["#h"] && !filter["#e"])),
           )
         ) {
-          expect(filters.length).toBeLessThanOrEqual(4);
+          expect(filters.length).toBeLessThanOrEqual(128);
           const community = communityOf(url);
           for (const filter of filters) {
             expect(filter.limit).toBe(filter.ids ? filter.ids.length : 200);
@@ -435,9 +436,9 @@ export function policyRelay({
             filters.flatMap((filter) => answer(communityOf(url), filter)),
           );
         }
-        // Unread evidence windows: up to four single-channel filters, each
-        // since its channel's read mark; the viewer's own newest messages
-        // ride the first request.
+        // Unread evidence windows: single-channel filters, each since its
+        // channel's read mark, up to 128 per request; the viewer's own newest
+        // messages ride the first request.
         if (
           filters.every(
             (filter) =>
@@ -449,7 +450,7 @@ export function policyRelay({
                   !filter["#e"])),
           )
         ) {
-          expect(filters.length).toBeLessThanOrEqual(4);
+          expect(filters.length).toBeLessThanOrEqual(128);
           const community = communityOf(url);
           for (const filter of filters) {
             // One page per channel, smaller on a large roster.

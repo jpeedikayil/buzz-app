@@ -391,7 +391,7 @@ it.each([1, 2, 130])(
       const answered: string[] = [];
       let authored = 0;
       const answer = (batch: Scripted) => {
-        expect(batch.filters.length).toBeLessThanOrEqual(4);
+        expect(batch.filters.length).toBeLessThanOrEqual(128);
         const batchIds = batch.filters.flatMap((filter) => {
           if (filter.authors) {
             authored++;

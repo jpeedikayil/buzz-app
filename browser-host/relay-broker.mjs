@@ -1,4 +1,5 @@
 import { isSidebarPreferencesBatch } from "../src/features/relay/sidebar-preferences.ts";
+import { isUnreadWindowBatch } from "../src/features/relay/unread-window-batch.ts";
 import {
   isCatalogKind,
   MAX_EVENT_BYTES as CATALOG_EVENT_BYTES,
@@ -746,7 +747,8 @@ export function validFilters(filters) {
     filters.length >= 1 &&
     (filters.length <= MAX_FILTERS ||
       isWorkflowDefinitionBatch(filters) ||
-      isSidebarPreferencesBatch(filters)) &&
+      isSidebarPreferencesBatch(filters) ||
+      isUnreadWindowBatch(filters)) &&
     filters.every(
       (filter) =>
         filter &&

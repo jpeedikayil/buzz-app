@@ -280,16 +280,26 @@ it("a window that times out once is read again in its slot and the repair comple
   ).toMatchObject({ observedCount: 5, freshness: "observed" });
 });
 
+// A roster whose windows need a second request: the first carries the
+// viewer's authored page and 127 windows, most recently read first.
+const filler = Array.from({ length: 125 }, (_, i) => `f${i}`);
+const fillerFrontiers = Object.fromEntries(filler.map((id) => [id, 1050]));
+
 it("a window dropped after its retry leaves its channel unknown and the Inbox partial, with the viewer's thread still read", async () => {
-  // Windows go most recently read first, so the failing channel's request
-  // follows the one carrying the viewer's authored page.
+  // The never-read channel's window goes last, in the second request.
   const h = await setup({
-    channels: ["quiet", "busy", "c2", "c3", "c4"],
-    frontiers: { quiet: 1015, busy: 900, c2: 1200, c3: 1100 },
+    channels: ["quiet", "busy", "c2", "c3", ...filler],
+    frontiers: {
+      quiet: 1055,
+      busy: 900,
+      c2: 1200,
+      c3: 1100,
+      ...fillerFrontiers,
+    },
   });
   const root = event("quiet", peer, 1000);
   const mine = reply("quiet", viewer, 1010, root);
-  const answer = reply("quiet", peer, 1020, root);
+  const answer = reply("quiet", peer, 1060, root);
   h.store.push(root, mine, answer, ...flood("quiet", 120, 1100));
   h.failing.add("busy");
   await h.owner.capability.ensure();
@@ -326,13 +336,13 @@ it("a window dropped after its retry leaves its channel unknown and the Inbox pa
   expect(snapshot("busy").coverage).toBe("observed");
 });
 
-it("reads the viewer's page first, remembered and newly taught threads next, then windows most recently read first", async () => {
+it("reads the viewer's page with 127 windows first, remembered and newly taught threads next, then the remaining windows", async () => {
   const participation = memoryThreadParticipation();
   const remembered = "f".repeat(64);
   await participation.write(new Map([[`c1:${remembered}`, 1000]]));
   const h = await setup({
-    channels: ["never1", "c1", "c2", "c3", "never2"],
-    frontiers: { c1: 1100, c2: 1300, c3: 1200 },
+    channels: ["never1", "c1", "c2", "c3", "never2", ...filler],
+    frontiers: { c1: 1100, c2: 1300, c3: 1200, ...fillerFrontiers },
     participation,
   });
   // A thread the viewer replied in before c3's mark: only the authored page
@@ -341,8 +351,9 @@ it("reads the viewer's page first, remembered and newly taught threads next, the
   h.store.push(root, reply("c3", viewer, 1010, root));
   await h.owner.capability.ensure();
   const requests = h.reader.read.mock.calls.map(([filters]) => filters);
+  expect(requests[0]).toHaveLength(128);
   expect(requests[0]?.[0]).toMatchObject({ authors: [viewer] });
-  expect(requests[0]?.slice(1).map((filter) => filter["#h"]?.[0])).toEqual([
+  expect(requests[0]?.slice(1, 4).map((filter) => filter["#h"]?.[0])).toEqual([
     "c2",
     "c3",
     "c1",
@@ -361,10 +372,123 @@ it("reads the viewer's page first, remembered and newly taught threads next, the
   expect(taught).toBeGreaterThan(1);
   expect(never).toBeGreaterThan(taught);
   expect(requests[never]).toEqual([
+    expect.objectContaining({ "#h": ["f124"], since: 1050 }),
     expect.objectContaining({ "#h": ["never1"], since: floor }),
     expect.objectContaining({ "#h": ["never2"], since: floor }),
   ]);
   expect(requests).toHaveLength(4);
+});
+
+it("a thread read's full-page split goes ahead of the remaining windows", async () => {
+  const participation = memoryThreadParticipation();
+  const h = await setup({
+    channels: ["c1", "c0", ...filler, "never"],
+    frontiers: { c1: 5000, c0: 4000, ...fillerFrontiers },
+    participation,
+  });
+  const roots = [event("c1", peer, 1000), event("c1", peer, 1001)];
+  await participation.write(
+    new Map(roots.map((root, i) => [`c1:${root.id}`, 2000 + i])),
+  );
+  // Each root has a full page of replies, so one read of both overflows.
+  for (const root of roots)
+    for (let i = 0; i < 200; i++)
+      h.store.push(reply("c1", peer, 1100 + i, root));
+  h.store.push(...roots);
+  // The first request waits until the thread read has landed and queued its
+  // split, so the split and the remaining window compete for the next slot.
+  const release = h.hold("c0");
+  const requests = () => h.reader.read.mock.calls.map(([filters]) => filters);
+  const done = h.owner.capability.ensure();
+  try {
+    await vi.waitFor(() =>
+      expect(
+        requests().some((request) =>
+          request.some((filter) => filter["#e"]?.length === 1),
+        ),
+      ).toBe(true),
+    );
+  } finally {
+    release();
+  }
+  await done;
+  const whole = requests().findIndex((request) =>
+    request.some((filter) => filter["#e"]?.length === 2),
+  );
+  const split = requests().findIndex((request) =>
+    request.some((filter) => filter["#e"]?.length === 1),
+  );
+  const never = requests().findIndex((request) =>
+    request.some((filter) => filter["#h"]?.[0] === "never"),
+  );
+  expect(whole).toBe(1);
+  expect(split).toBeGreaterThan(whole);
+  expect(never).toBeGreaterThan(split);
+  expect(requests()[split]).toEqual(
+    expect.arrayContaining(
+      roots.map((root) =>
+        expect.objectContaining({ "#h": ["c1"], "#e": [root.id] }),
+      ),
+    ),
+  );
+});
+
+it("a dropped first request still lets the Inbox leave loading", async () => {
+  const h = await setup({
+    channels: ["c1", "c0", ...filler, "quiet"],
+    frontiers: { c1: 1000, c0: 1000, ...fillerFrontiers, quiet: 900 },
+  });
+  h.store.push(event("quiet", peer, 1100, [["p", viewer]]));
+  // The request carrying the authored page and c1 fails both reads; the
+  // second request, quiet's window, lands.
+  h.failing.add("c1");
+  await h.owner.capability.ensure();
+  expect(h.owner.capability.inbox()).toMatchObject({
+    status: "ready",
+    freshness: "observed",
+    partial: true,
+    items: [expect.objectContaining({ channelId: "quiet", unreadCount: 1 })],
+  });
+  expect(
+    h.filters().filter((filter) => filter["#h"]?.[0] === "c1"),
+  ).toHaveLength(2);
+});
+
+it("replies of a thread never show as rows of their own while the repair fetches its root", async () => {
+  const h = await setup({
+    channels: ["other", "second"],
+    frontiers: { other: 1005, second: 1000 },
+  });
+  // The root predates other's read mark, so the window returns the replies
+  // alone; the viewer's reply in the authored page makes them the viewer's
+  // conversation, and the thread read it teaches fetches the root.
+  const root = event("other", peer, 1000);
+  h.store.push(
+    root,
+    reply("other", viewer, 1010, root),
+    ...Array.from({ length: 3 }, (_, i) =>
+      reply("other", peer, 1020 + i, root),
+    ),
+    event("second", peer, 1100, [["p", viewer]]),
+  );
+  const counts: number[] = [];
+  const inbox = () => h.owner.capability.inbox();
+  h.owner.capability.subscribeInbox(() => counts.push(inbox().items.length));
+  const read = h.reader.read.getMockImplementation();
+  assert(read);
+  h.reader.read.mockImplementation(async (filters: readonly ReadFilter[]) => {
+    counts.push(inbox().items.length);
+    return read(filters);
+  });
+  await h.owner.capability.ensure();
+  expect(inbox().items).toEqual([
+    expect.objectContaining({ channelId: "second", unreadCount: 1 }),
+    expect.objectContaining({ rootId: root.id, unreadCount: 3 }),
+  ]);
+  expect(Math.max(...counts)).toBeLessThanOrEqual(2);
+  expect(
+    h.filters().filter((filter) => filter["#e"]?.[0] === root.id),
+  ).toHaveLength(1);
 });
 
 it("a first run with a large roster sizes each window so the pass fits the budget, and a quiet channel's mention survives", async () => {
@@ -450,8 +574,15 @@ it("a followed thread is remembered as of the follow and refetched", async () =>
 
 it("the Inbox leaves loading once the viewer's page and remembered threads land, observing until the windows do", async () => {
   const h = await setup({
-    channels: ["c0", "c1", "c2", "c3", "c4"],
-    frontiers: { c0: 1400, c1: 1300, c2: 1200, c3: 1100, c4: 1000 },
+    channels: ["c0", "c1", "c2", "c3", "c4", ...filler],
+    frontiers: {
+      c0: 1400,
+      c1: 1300,
+      c2: 1200,
+      c3: 1100,
+      c4: 1000,
+      ...fillerFrontiers,
+    },
   });
   h.store.push(event("c0", peer, 1500, [["p", viewer]]));
   const release = h.hold("c4");

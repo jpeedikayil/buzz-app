@@ -3088,14 +3088,14 @@ it("inbox observation exposes empty, failure, recovery and cache clear without a
     release();
   }
   await work;
-  // Dropped after its retry: observed but partial, not an error.
+  // Dropped after its retry with nothing else landed: nothing was observed.
   expect(h.session.unread.inbox()).toMatchObject({
-    status: "ready",
-    freshness: "observed",
-    partial: true,
+    status: "error",
+    freshness: "stale",
+    error: "offline",
     items: [],
   });
-  expect(h.session.unread.inbox().error).toBeUndefined();
+  expect(h.session.unread.inbox().partial).toBeUndefined();
   h.query.mockResolvedValue([]);
   await h.session.unread.refresh();
   expect(h.session.unread.inbox()).toMatchObject({

@@ -208,6 +208,37 @@ test("edits admit one exact target without new notification recipients or arbitr
   assert.equal(validMessageTemplate({ ...edit, content: " " }), false);
 });
 
+test("unread repair batches may exceed four filters: windows, the authored page, thread reads and root IDs, 128 at most", () => {
+  const kinds = [9, 40002, 40008];
+  const root = "a".repeat(64);
+  const batch = [
+    { kinds, authors: ["b".repeat(64)], include_aux: true, limit: 100 },
+    ...Array.from({ length: 125 }, (_, i) => ({
+      kinds,
+      "#h": [`room-${i}`],
+      since: 1000,
+      include_aux: true,
+      limit: 24,
+    })),
+    { kinds, "#h": ["room-200"], "#e": [root], include_aux: true, limit: 200 },
+    { kinds, ids: [root], include_aux: true, limit: 1 },
+  ];
+  assert.equal(validFilters(batch), true);
+  for (const invalid of [
+    [...batch, { ...batch[1], "#h": ["room-300"] }],
+    batch.map((f) => ({ ...f, kinds: [9] })),
+    batch.map((f) => ({ ...f, include_aux: undefined })),
+    batch.map((f) => ("since" in f ? { ...f, since: undefined } : f)),
+    batch.map((f) => ("since" in f ? { ...f, "#h": ["room-1"] } : f)),
+    batch.map((f) => ("since" in f ? { ...f, until: 2000 } : f)),
+    batch.map((f) => ("since" in f ? { ...f, limit: 501 } : f)),
+    [...batch.slice(1), batch[0], batch[0]],
+    batch.map((f) => ("ids" in f ? { ...f, limit: 2 } : f)),
+    [...batch.slice(0, 5), null],
+  ])
+    assert.equal(validFilters(invalid), false);
+});
+
 test("workflow list batches alone may exceed four filters, with 128 unique channels at most", () => {
   const batch = Array.from({ length: 128 }, (_, i) => ({
     kinds: [30620],

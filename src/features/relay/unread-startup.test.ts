@@ -192,7 +192,7 @@ it("evidence gets its own deadline after a failed marker read; marker errors sta
   expect(h.session.unread.sync().status).toBe("reconciled");
 });
 
-it("queries all 278 membership IDs in four-channel requests and publishes each landed request", async () => {
+it("queries all 278 membership IDs in 128-filter requests and publishes each landed request", async () => {
   const h = setup(278);
   const batches: string[][] = [];
   const first = message(h.peer, "other", "first", 11);
@@ -205,7 +205,7 @@ it("queries all 278 membership IDs in four-channel requests and publishes each l
   h.query.mockImplementation(async (filters) => {
     if (!filters[0]?.kinds?.includes(9)) return [];
     if (!filters.some((filter) => filter["#h"])) return [];
-    expect(filters.length).toBeLessThanOrEqual(4);
+    expect(filters.length).toBeLessThanOrEqual(128);
     // The viewer's authored page rides the first request. Windows are sized
     // so a roster this large stays within the budget: the least, 20 each.
     const ids = filters.flatMap((filter) => {
@@ -226,7 +226,7 @@ it("queries all 278 membership IDs in four-channel requests and publishes each l
     );
   });
   await h.session.unread.ensure();
-  expect(batches).toHaveLength(70);
+  expect(batches).toHaveLength(3);
   expect(batches.flat().sort()).toEqual([...h.ids].sort());
   expect(observed).toContain(1);
   expect(
@@ -253,10 +253,11 @@ it("a full channel window does not starve later channels, and a dropped request 
     return ids.map((id) => message(h.peer, id, "quiet", 11));
   });
   await h.session.unread.ensure();
-  // Each of the 32 failing requests is read once more, then dropped; the
-  // busy channel's request landed, so the Inbox is observed but partial.
+  // The second request, the two windows beyond the first's 128 filters, is
+  // read once more, then dropped; the busy channel's request landed, so the
+  // Inbox is observed but partial.
   const attempted = batches.length;
-  expect(attempted).toBe(1 + 2 * 32);
+  expect(attempted).toBe(1 + 2);
   expect(h.snapshot()).toMatchObject({
     observedCount: 100,
     freshness: "observed",
@@ -276,7 +277,7 @@ it("a full channel window does not starve later channels, and a dropped request 
   expect(batches).toHaveLength(attempted); // No automatic retry loop.
   fail = false;
   await h.session.unread.refresh();
-  expect(batches).toHaveLength(attempted + 33);
+  expect(batches).toHaveLength(attempted + 2);
   expect(h.snapshot()).toMatchObject({
     observedCount: 100,
     freshness: "observed",
@@ -892,15 +893,15 @@ it("transient startup failure recovers on live reconnect without an automatic re
     return [h.row];
   });
   await h.session.unread.ensure();
-  // Dropped after its one retry: the channel stays unknown and the Inbox
-  // notes the partial pass instead of failing.
+  // Dropped after its one retry, and nothing else landed: the channel stays
+  // unknown and the repair failed rather than claiming a partial observation.
   expect(h.snapshot().coverage).toBe("unknown");
   expect(h.session.unread.inbox()).toMatchObject({
-    status: "ready",
-    freshness: "observed",
-    partial: true,
+    status: "error",
+    freshness: "stale",
+    error: "Transient evidence failure",
   });
-  expect(h.session.unread.inbox().error).toBeUndefined();
+  expect(h.session.unread.inbox().partial).toBeUndefined();
   const count = h.query.mock.calls.length;
   await h.session.unread.ensure();
   expect(h.query).toHaveBeenCalledTimes(count);
@@ -1162,6 +1163,67 @@ it("a covered reconnect does not postpone the recovery tick's full unread repair
   }
 });
 
+it("a reconnect repair in which nothing lands keeps the observation stale instead of claiming it observed", async () => {
+  const h = setup();
+  await h.session.unread.ensure();
+  expect(h.snapshot()).toMatchObject({
+    observedCount: 1,
+    freshness: "observed",
+  });
+  h.query.mockImplementation(async (filters) => {
+    if (filters[0]?.kinds?.includes(39002))
+      return [
+        roster(h.relay, "other", [h.viewer.pubkey], 10),
+        metadata(h.relay, "other", "other", 10),
+      ];
+    if (filters[0]?.kinds?.includes(9)) throw new Error("Relay read timed out");
+    return [];
+  });
+  const count = h.query.mock.calls.length;
+  h.reconnect();
+  // The one request is read twice, then dropped; nothing was observed.
+  await vi.waitFor(() =>
+    expect(
+      h.query.mock.calls
+        .slice(count)
+        .filter(([filters]) => filters[0]?.kinds?.includes(9)),
+    ).toHaveLength(2),
+  );
+  await vi.waitFor(() =>
+    expect(h.session.unread.inbox()).toMatchObject({
+      status: "error",
+      freshness: "stale",
+      error: "Relay read timed out",
+    }),
+  );
+  expect(h.snapshot()).toMatchObject({ observedCount: 1, freshness: "stale" });
+  expect(h.session.unread.inbox().partial).toBeUndefined();
+});
+
+it("a relay that accepts reads but answers none costs one read per request after the first drop", async () => {
+  const h = setup(300);
+  const batches: string[][] = [];
+  h.query.mockImplementation(async (filters) => {
+    if (!filters[0]?.kinds?.includes(9) || !filters.some((f) => f["#h"]))
+      return [];
+    batches.push(filters.flatMap((filter) => filter["#h"] ?? []));
+    throw new Error("Relay read timed out");
+  });
+  await h.session.unread.ensure();
+  // Three requests (the authored page and 299 windows, then 128, then 45):
+  // the first is read twice, the last once; the second, in flight beside
+  // the first, at most twice. Six reads would mean a retry per request.
+  const sizes = batches.map((batch) => batch.length);
+  expect(sizes.filter((size) => size === 127)).toHaveLength(2);
+  expect(sizes.filter((size) => size === 45)).toHaveLength(1);
+  expect(batches.length).toBeLessThanOrEqual(5);
+  expect(h.session.unread.inbox()).toMatchObject({
+    status: "error",
+    freshness: "stale",
+  });
+  expect(h.snapshot().coverage).toBe("unknown");
+});
+
 it("a full budget evicts the oldest evidence and the observation still completes", async () => {
   const h = setup(129);
   const oldest = message(h.peer, "other", "x".repeat(450000), 11);
@@ -1182,7 +1244,7 @@ it("a full budget evicts the oldest evidence and the observation still completes
   });
   await h.session.unread.ensure();
   // Every window request still runs.
-  expect(batches).toBe(33);
+  expect(batches).toBe(2);
   expect(h.snapshot()).toMatchObject({
     observedCount: 18,
     freshness: "observed",
