@@ -76,9 +76,16 @@ async function setup({
   const reader = {
     read: vi.fn(async (filters: readonly ReadFilter[]) => {
       const windows = filters.flatMap((filter) => filter["#h"] ?? []);
-      // The walk's pages beyond the first fail as the "walk" channel would.
+      // The walk's pages beyond the first fail as the "walk" channel would,
+      // and single-root `since` thread reads as "cold".
       if (filters.some((filter) => filter.until !== undefined))
         windows.push("walk");
+      if (
+        filters.some(
+          (filter) => filter.since !== undefined && filter["#e"]?.length === 1,
+        )
+      )
+        windows.push("cold");
       await Promise.all(windows.map((id) => held.get(id)));
       if (windows.some((id) => failing.has(id)))
         throw new Error("Relay read timed out");
@@ -936,17 +943,20 @@ it("a device's first repair walks the viewer's history behind the windows, remem
     expect.objectContaining({
       "#h": ["a"],
       "#e": [oldest.id],
-      since: 2001,
+      since: 2000,
       limit: 50,
     }),
   );
   expect(cold).toContainEqual(
-    expect.objectContaining({ "#h": ["b"], "#e": [quiet.id], since: 2002 }),
+    expect.objectContaining({ "#h": ["b"], "#e": [quiet.id], since: 2001 }),
   );
+  // Each cold read is inclusive of the thread's newest time, which the walk
+  // taught from the viewer's reply without retaining it, so that reply
+  // returns and every root is fetched once.
   const fetched = h.filters().flatMap((filter) => filter.ids ?? []);
-  expect(fetched).toHaveLength(51);
+  expect(fetched).toHaveLength(140);
   expect(fetched).toContain(oldest.id);
-  expect(fetched).not.toContain(quiet.id);
+  expect(fetched).toContain(quiet.id);
   const inbox = () => h.owner.capability.inbox();
   expect(inbox()).toMatchObject({ status: "ready", freshness: "observed" });
   expect(inbox().partial).toBeUndefined();
@@ -1036,4 +1046,178 @@ it("a dropped walk page leaves the walk to the next repair without marking chann
   const saved = await participation.read();
   expect(saved.roots.size).toBe(140);
   expect(saved.walk).toEqual({ since: 3479 });
+});
+
+// A remembered thread outside the 50 most recently active, so the repair asks
+// it for replies since its newest time rather than reading it whole: 50 newer
+// threads are remembered beside it, and the walk mark is past everything.
+async function coldThread(
+  participation: ReturnType<typeof memoryThreadParticipation>,
+  channelId: string,
+  root: RelayEvent,
+  at: number,
+) {
+  const newer = Array.from({ length: 50 }, (_, i): [string, number] => [
+    `${channelId}:${"f".repeat(60)}${i.toString(16).padStart(4, "0")}`,
+    5000 + i,
+  ]);
+  await participation.write({
+    roots: new Map([...newer, [`${channelId}:${root.id}`, at]]),
+    walk: { since: 6000 },
+  });
+}
+const coldReads = (h: Awaited<ReturnType<typeof setup>>, root: RelayEvent) =>
+  h
+    .filters()
+    .filter(
+      (filter) =>
+        filter["#e"]?.length === 1 &&
+        filter["#e"][0] === root.id &&
+        filter.since !== undefined,
+    );
+
+it("a cold thread's read is inclusive of its newest time, so a peer reply in the same second as the viewer's is recovered", async () => {
+  const participation = memoryThreadParticipation();
+  const root = event("c0", peer, 1000);
+  await coldThread(participation, "c0", root, 1010);
+  const h = await setup({
+    channels: ["c0"],
+    frontiers: { c0: 1005 },
+    participation,
+  });
+  const mine = reply("c0", viewer, 1010, root);
+  const answer = reply("c0", peer, 1010, root);
+  // Later traffic keeps the channel window from reaching the replies.
+  h.store.push(root, mine, answer, ...flood("c0", 100, 2000));
+  await h.owner.capability.ensure();
+  expect(coldReads(h, root)).toEqual([
+    expect.objectContaining({
+      "#h": ["c0"],
+      "#e": [root.id],
+      since: 1010,
+      limit: 50,
+    }),
+  ]);
+  await vi.waitFor(() =>
+    expect(h.owner.capability.inbox().items).toContainEqual(
+      expect.objectContaining({
+        rootId: root.id,
+        messageIds: [answer.id],
+        unreadCount: 1,
+      }),
+    ),
+  );
+  expect((await participation.read()).roots.get(`c0:${root.id}`)).toBe(1010);
+});
+
+it("a cold thread whose page comes back full is read whole, losing none of its replies", async () => {
+  const participation = memoryThreadParticipation();
+  const root = event("c0", peer, 1000);
+  await coldThread(participation, "c0", root, 1010);
+  const h = await setup({
+    channels: ["c0"],
+    frontiers: { c0: 1005 },
+    participation,
+  });
+  const answers = Array.from({ length: 60 }, (_, i) =>
+    reply("c0", peer, 1020 + i, root),
+  );
+  h.store.push(
+    root,
+    reply("c0", viewer, 1010, root),
+    ...answers,
+    ...flood("c0", 100, 2000),
+  );
+  await h.owner.capability.ensure();
+  // The 50-reply page since 1010 is full, so the whole thread is read next.
+  expect(coldReads(h, root)).toHaveLength(1);
+  expect(h.filters()).toContainEqual({
+    kinds: [9, 40002, 40008],
+    "#h": ["c0"],
+    "#e": [root.id],
+    include_aux: true,
+    limit: 200,
+  });
+  await vi.waitFor(() =>
+    expect(h.owner.capability.inbox().items).toContainEqual(
+      expect.objectContaining({ rootId: root.id, unreadCount: 60 }),
+    ),
+  );
+  expect((await participation.read()).roots.get(`c0:${root.id}`)).toBe(1079);
+});
+
+it("a dropped cold read leaves its thread to the next repair without marking channels unchecked", async () => {
+  const participation = memoryThreadParticipation();
+  const root = event("c0", peer, 1000);
+  await coldThread(participation, "c0", root, 1010);
+  const h = await setup({
+    channels: ["c0"],
+    frontiers: { c0: 1005 },
+    participation,
+  });
+  const answer = reply("c0", peer, 1100, root);
+  h.store.push(
+    root,
+    reply("c0", viewer, 1010, root),
+    answer,
+    ...flood("c0", 100, 2000),
+  );
+  h.failing.add("cold");
+  await h.owner.capability.ensure();
+  const inbox = () => h.owner.capability.inbox();
+  expect(inbox()).toMatchObject({ status: "ready", freshness: "observed" });
+  expect(inbox().partial).toBeUndefined();
+  expect(inbox().error).toBeUndefined();
+  // Tried twice, then dropped: the thread's time is unchanged, and the
+  // channel's window is still observed.
+  expect(coldReads(h, root)).toHaveLength(2);
+  expect(inbox().items.find((item) => item.rootId === root.id)).toBeUndefined();
+  expect((await participation.read()).roots.get(`c0:${root.id}`)).toBe(1010);
+  expect(
+    h.owner.capability.snapshot({ kind: "channel", channelId: "c0" }).coverage,
+  ).toBe("observed");
+  h.failing.clear();
+  await h.owner.capability.refresh();
+  await vi.waitFor(() =>
+    expect(inbox().items).toContainEqual(
+      expect.objectContaining({ rootId: root.id, unreadCount: 1 }),
+    ),
+  );
+});
+
+it("a remembered thread in a channel the roster lacks is kept through a save and read again when the channel returns", async () => {
+  const participation = memoryThreadParticipation();
+  const root = event("c1", peer, 1000);
+  await participation.write({
+    roots: new Map([[`c1:${root.id}`, 1010]]),
+    walk: { since: 6000 },
+  });
+  const channels = ["c0"];
+  const h = await setup({
+    channels,
+    frontiers: { c0: 1005, c1: 1300 },
+    participation,
+  });
+  h.store.push(
+    root,
+    reply("c1", viewer, 1010, root),
+    reply("c1", peer, 1100, root),
+  );
+  await h.owner.capability.ensure();
+  expect(h.filters().some((filter) => filter["#h"]?.[0] === "c1")).toBe(false);
+  // Not read, not forgotten: the walk mark has passed the viewer's reply.
+  expect((await participation.read()).roots).toEqual(
+    new Map([[`c1:${root.id}`, 1010]]),
+  );
+  channels.push("c1");
+  await h.owner.capability.refresh();
+  expect(h.filters()).toContainEqual(
+    expect.objectContaining({ "#h": ["c1"], "#e": [root.id] }),
+  );
+  await vi.waitFor(() =>
+    expect(h.owner.capability.inbox().items).toContainEqual(
+      expect.objectContaining({ rootId: root.id, unreadCount: 0 }),
+    ),
+  );
+  expect((await participation.read()).roots.get(`c1:${root.id}`)).toBe(1100);
 });

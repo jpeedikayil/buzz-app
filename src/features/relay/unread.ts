@@ -1857,16 +1857,17 @@ export function createUnread({
    * time, so one first seen here is as recent as this repair), and grow with
    * what this repair's evidence and walk teach: the viewer's replies, replies
    * that mention the viewer, and replies in the viewer's conversations.
-   * Unfollowed threads and left channels are skipped. The newest are read
-   * and remembered. */
+   * Unfollowed threads are forgotten; threads in channels the roster lacks
+   * are neither read nor forgotten, since the walk mark advances past the
+   * viewer's replies in them. The newest are read and remembered. */
   function participating(
     members: ReadonlySet<string>,
     stored: ThreadParticipation,
   ) {
+    const followed = (key: string) => choices().get(key) !== false;
     const active = (key: string) =>
-      members.has(key.slice(0, key.indexOf(":"))) &&
-      choices().get(key) !== false;
-    const roots = new Map([...stored.roots].filter(([key]) => active(key)));
+      members.has(key.slice(0, key.indexOf(":"))) && followed(key);
+    const roots = new Map([...stored.roots].filter(([key]) => followed(key)));
     const seen = Math.floor(now() / 1000);
     for (const [key, following] of choices())
       if (following && !roots.has(key) && active(key)) roots.set(key, seen);
@@ -1875,6 +1876,7 @@ export function createUnread({
     };
     const newest = () =>
       [...roots]
+        .filter(([key]) => active(key))
         .sort(([, a], [, b]) => b - a)
         .slice(0, THREAD_PARTICIPATION_LIMIT)
         .map(([key]) => key);
@@ -1973,16 +1975,20 @@ export function createUnread({
               );
           }
           const oldest = page.at(-1);
+          // Ending at SEED_PAGES with a full page is the one case the mark
+          // advances past replies never seen: the oldest of a history longer
+          // than the walk reads.
           if (page.length < filter.limit || !oldest || pages >= SEED_PAGES) {
             walked = true;
             return;
           }
           pages++;
+          // An oversized page was halved (see `split`); the next keeps that.
           return {
             ...filter,
             until: oldest.created_at,
             before_id: oldest.id,
-            limit: SEED_PAGE,
+            limit: filter.until === undefined ? SEED_PAGE : filter.limit,
           };
         },
       },
@@ -2005,7 +2011,9 @@ export function createUnread({
         );
       },
       /** Reads of the other remembered roots not yet asked for, each for
-       * replies since the newest time seen in it. */
+       * replies since the newest time seen in it, inclusive: a reply in the
+       * same second as that one is not passed over, and the one seen returns
+       * too, free of the budget while it is retained. */
       cold() {
         return chunk(
           [...group(newest().slice(HOT_THREADS))].flatMap(
@@ -2014,7 +2022,7 @@ export function createUnread({
                 threads(
                   channelId,
                   [rootId],
-                  (roots.get(`${channelId}:${rootId}`) ?? 0) + 1,
+                  roots.get(`${channelId}:${rootId}`) ?? 0,
                 ),
               ),
           ),
@@ -2026,12 +2034,13 @@ export function createUnread({
         result: readonly RelayEvent[],
         requests: ReadFilter[][],
       ) {
-        for (const event of result) rows.set(event.id, event);
-        // A full page may hide replies under a filter's other roots.
+        // A full page may hide replies under a filter's other roots, or
+        // older than a lone root's `since` page reaches.
         for (const filter of request) {
           const channelId = filter["#h"]?.[0];
           const rootIds = filter["#e"];
-          if (!channelId || !rootIds || rootIds.length < 2) continue;
+          if (!channelId || !rootIds) continue;
+          if (rootIds.length < 2 && filter.since === undefined) continue;
           const page = result.filter(
             (event) =>
               contentKind(event) &&
@@ -2042,19 +2051,35 @@ export function createUnread({
           ).length;
           if (page < filter.limit) continue;
           // The split stays ahead of the windows, as the thread read was.
+          if (rootIds.length < 2) {
+            requests.unshift([threads(channelId, rootIds)]);
+            continue;
+          }
           const half = Math.ceil(rootIds.length / 2);
           requests.unshift([
             { ...filter, "#e": rootIds.slice(0, half) },
             { ...filter, "#e": rootIds.slice(half) },
           ]);
         }
+        // Replies already retained cost the budget nothing: a cold read's
+        // boundary reply, or one a window read. The rest are admitted newest
+        // first while the budget lasts; what is not admitted is not kept and
+        // teaches no thread a newer time, so a later read still reaches it.
         const reply = (event: RelayEvent) =>
           contentKind(event) && !!threadReference(event);
         const replies = result
-          .filter((event) => reply(event) && !admitted.has(event.id))
+          .filter(
+            (event) =>
+              reply(event) && !admitted.has(event.id) && !structural(event.id),
+          )
           .sort(byTime)
           .slice(0, Math.max(0, PARTICIPATION_BUDGET - admitted.size));
         for (const event of replies) admitted.add(event.id);
+        const kept = result.filter(
+          (event) =>
+            !reply(event) || admitted.has(event.id) || !!structural(event.id),
+        );
+        for (const event of kept) rows.set(event.id, event);
         // A root an admitted reply names that nothing holds is fetched, so
         // the reply groups under it rather than standing as its own row.
         const missing = [
@@ -2070,9 +2095,7 @@ export function createUnread({
         );
         if (missing.length)
           requests.unshift(...chunk(byId(missing), UNREAD_WINDOW_BATCH));
-        return accept(
-          result.filter((event) => admitted.has(event.id) || !reply(event)),
-        );
+        return accept(kept);
       },
       /** Learns roots and their newest times from retained evidence and the
        * thread reads so far. */
@@ -2215,12 +2238,16 @@ export function createUnread({
           dropped: false,
           failure: undefined,
         };
-        // A dropped read leaves its channels or threads as they were, which
-        // the Inbox says; a dropped walk page leaves the walk to the next
-        // repair, which is no channel's concern.
+        // A dropped window, or the first request carrying them, leaves its
+        // channels as they were, which the Inbox says; a dropped thread read
+        // or walk page leaves those threads or the walk to the next repair,
+        // which is no channel's concern.
         let unchecked = false;
         const walkPage = (request: readonly ReadFilter[]) =>
           request.find((filter) => filter.authors);
+        const checks = (filter: ReadFilter) =>
+          (!!filter["#h"] && !filter["#e"]) ||
+          (!!filter.authors && filter.until === undefined);
         const landed = (
           request: readonly ReadFilter[],
           result: readonly RelayEvent[] | undefined,
@@ -2228,7 +2255,7 @@ export function createUnread({
         ) => {
           let ok = true;
           const walk = walkPage(request);
-          if (!result) unchecked ||= walk?.until === undefined;
+          if (!result) unchecked ||= request.some(checks);
           else if (request.some((filter) => filter["#e"] || filter.ids))
             ok = pass.landed(request, result, queue);
           else {

@@ -24,10 +24,10 @@ const keysAre = (filter: object, names: readonly string[]) => {
  * filters with `include_aux`, each one of the repair's shapes — a channel
  * window (`#h` of one channel, `since`), the viewer's authored page
  * (`authors` of one key, at most once, `since` the last walk or none), a
- * thread read (`#h` of one channel and up to 100 `#e` roots, whole or
- * `since` the threads' newest time) or a fetch of up to 100 `ids` with the
- * same `limit`. The relay honours each filter's own limit, which keeps the
- * events one request returns bounded. */
+ * thread read (`#h` of one channel and up to 100 `#e` roots read whole, or
+ * one root `since` the thread's newest time) or a fetch of up to 100 `ids`
+ * with the same `limit`. The relay honours each filter's own limit, which
+ * keeps the events one request returns bounded. */
 export function isUnreadWindowBatch(value: unknown): boolean {
   if (
     !Array.isArray(value) ||
@@ -79,7 +79,11 @@ export function isUnreadWindowBatch(value: unknown): boolean {
       return true;
     }
     if (shape(["kinds", "#h", "#e", "include_aux", "limit"]))
-      return channelled && hexes(filter["#e"], 100) && since;
+      return (
+        channelled &&
+        hexes(filter["#e"], filter.since === undefined ? 100 : 1) &&
+        since
+      );
     if (keysAre(filter, ["kinds", "ids", "include_aux", "limit"]))
       return hexes(filter.ids, 100) && filter.limit === filter.ids?.length;
     return false;
