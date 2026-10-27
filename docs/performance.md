@@ -211,11 +211,12 @@ Lists are bullets only, because browser helpers find the timeline through its
 single ordered list.
 
 The app verifies each relay event's signature once per connection and reuses that
-proof. Its startup unread read takes the newest 500 events across joined channels,
-so default history reaches the app before measurement, including 480 of the
-620 older paging rows. `firstSeenHistory` (`scroll-paging-fast-first-seen`) adds a
-joined `busy` channel whose 500 newer messages fill that read, as busier channels
-do. Older pages then first reach the app, and are verified, during the measured
+proof. Its startup unread read takes each joined channel's newest 100 events
+since its read mark, so default history reaches the app before measurement,
+including the newest of the 620 older paging rows. `firstSeenHistory`
+(`scroll-paging-fast-first-seen`) has the fixture honour the never-read window
+start, which the 2023-dated history predates, so none of that history reaches
+the unread read. Older pages then first reach the app, and are verified, during the measured
 traversal. The fixture records the event IDs of each modeled HTTP query response
 when it computes the response, which for a held older page is before release.
 Paging samples record `work.olderRowsServedBefore`, and the first-seen case

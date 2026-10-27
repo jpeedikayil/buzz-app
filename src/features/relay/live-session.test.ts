@@ -22,6 +22,7 @@ import {
   roster,
   scriptedTransport,
   signed,
+  type Scripted,
 } from "./testing";
 
 it("clears retained repository homes on live recovery, cache clearing, and disposal", async () => {
@@ -366,31 +367,75 @@ it.each([1, 2, 130])(
       const oldHead = wire.next();
       const repair = owner.session.unread.ensure();
       await flush();
+      // Per-channel windows ride up to four single-channel filters per
+      // request, two requests in flight beside the head.
+      await vi.waitFor(() =>
+        expect(wire.pending[0]?.filters[0]?.since).toEqual(expect.any(Number)),
+      );
       const evidence = wire.next();
-      expect(evidence.filters[0]?.["#h"]).toEqual(ids.slice(0, 128));
+      expect(evidence.filters[0]).toMatchObject({
+        "#h": [first],
+        include_aux: true,
+        limit: 100,
+        since: expect.any(Number),
+      });
       // Force the production race: both the old head and unread batch are still
       // in flight when the live route establishes. Only the old head is obsolete.
       live.state({ status: "connected", routes: [] });
       live.established(first);
       await flush();
-      const head = wire.next();
-      expect(head.filters[0]).toMatchObject({ "#h": [first], top_level: true });
       expect(oldHead.signal?.aborted).toBe(true);
       expect(evidence.signal?.aborted).toBe(false);
-      head.respond([
-        bounds(relay, first, "head", { has_more: false, next_cursor: null }),
-      ]);
-      for (let offset = 0; offset < ids.length; offset += 128) {
-        const batch = offset === 0 ? evidence : wire.next();
-        const batchIds = ids.slice(offset, offset + 128);
-        expect(batch.filters[0]?.["#h"]).toEqual(batchIds);
+      const answered: string[] = [];
+      let authored = 0;
+      const answer = (batch: Scripted) => {
+        expect(batch.filters.length).toBeLessThanOrEqual(4);
+        const batchIds = batch.filters.flatMap((filter) => {
+          // The viewer's newest messages ride the last request, for the
+          // participation pass.
+          if (filter.authors) {
+            authored++;
+            expect(filter).toMatchObject({
+              authors: [viewer.pubkey],
+              include_aux: true,
+              limit: 100,
+            });
+            return [];
+          }
+          expect(filter["#h"]).toHaveLength(1);
+          return [filter["#h"]?.[0] ?? ""];
+        });
+        answered.push(...batchIds);
         batch.respond(
           batchIds.map((id) =>
             message(peer, id, "unread evidence", 1700000900),
           ),
         );
-        await flush();
+      };
+      answer(evidence);
+      let heads = 0;
+      while (answered.length < ids.length || heads === 0) {
+        await vi.waitFor(() => expect(wire.pending.length).toBeGreaterThan(0));
+        const batch = wire.next();
+        if (batch.filters[0]?.top_level) {
+          heads++;
+          expect(batch.filters[0]).toMatchObject({ "#h": [first] });
+          batch.respond([
+            bounds(relay, first, "head", {
+              has_more: false,
+              next_cursor: null,
+            }),
+          ]);
+        } else answer(batch);
       }
+      expect(heads).toBe(1);
+      expect([...answered].sort()).toEqual([...ids].sort());
+      while (!authored) {
+        await vi.waitFor(() => expect(wire.pending.length).toBeGreaterThan(0));
+        answer(wire.next());
+      }
+      expect(authored).toBe(1);
+      await flush();
       await repair;
       expect(wire.pending).toHaveLength(0);
       for (const channelId of ids) {

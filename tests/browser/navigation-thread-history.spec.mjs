@@ -58,7 +58,7 @@ test("Back restores each thread visit before the previous channel", async ({
     await open(page, app);
     await beta.focus(); // Prepare without selecting or adding a navigation visit.
     await headStarted;
-    await expect.poll(() => app.report.unreadHolds.length).toBe(1);
+    await expect.poll(() => app.report.unreadHolds.length).toBeGreaterThan(0);
     await expect(beta).toHaveAccessibleName("Beta");
   } finally {
     releaseHead();

@@ -55,6 +55,9 @@ async function setup(initial?: ReadJournal) {
       filters.flatMap((filter) => {
         if (filter.authors && filter["#e"]?.length === 1)
           asked.push(filter["#e"][0] ?? "");
+        // The viewer's newest authored page (repair's participation pass)
+        // holds none of these older replies; membership is the lookups' job.
+        if (filter.authors && !filter["#e"]) return [];
         return store
           .filter(
             (item) =>
@@ -107,7 +110,7 @@ async function setup(initial?: ReadJournal) {
   owners.push(owner);
   const lookups = () =>
     reader.read.mock.calls.filter(
-      ([[filter]]) => filter?.ids || filter?.authors,
+      ([[filter]]) => filter?.ids || (filter?.authors && filter["#e"]),
     ).length;
   return { owner, store, asked, reader, lookups };
 }
@@ -165,47 +168,76 @@ it("a lookup batch larger than the witness bound keeps every membership deletabl
       expect(attention(i)).toMatchObject({ category: "thread", unread: true });
 });
 
-it("a later reply of the viewer outlives a negative lookup and a window reset", async () => {
+it("a later reply of the viewer outlives a negative lookup and its eviction", async () => {
   const { owner, store, lookups } = await setup();
   const root = event(peer, 9, 10, []);
   const answer = reply(peer, 700, root);
   store.push(root, answer, ...flood(499, 100));
   await owner.capability.ensure();
-  const attention = () => owner.capability.attention("c0", answer.id);
+  const attention = (id: string) => owner.capability.attention("c0", id);
   await vi.waitFor(() => {
-    expect(attention().pending).toBeUndefined();
+    expect(attention(answer.id).pending).toBeUndefined();
     expect(lookups()).toBeGreaterThan(0);
   });
-  expect(attention().unread).toBe(false);
+  expect(attention(answer.id).unread).toBe(false);
   // The viewer joins the conversation live, after the lookup said no.
   owner.accept([reply(viewer, 800, root)]);
-  expect(attention()).toMatchObject({ category: "thread", unread: true });
+  expect(attention(answer.id)).toMatchObject({
+    category: "thread",
+    unread: true,
+  });
   const count = lookups();
-  // The overflow reset drops the live reply; the refreshed sample lacks it.
+  // Newer traffic evicts the live reply and the answer; the witness keeps the
+  // membership, so the next reply in the conversation is the viewer's thread
+  // without asking again.
   owner.accept(flood(4096, 900));
-  await owner.capability.refresh();
-  expect(attention()).toMatchObject({ category: "thread", unread: true });
+  expect(attention(answer.id).status).toBe("unknown");
+  const later = reply(peer, 5000, root);
+  owner.accept([later]);
+  expect(attention(later.id)).toMatchObject({
+    category: "thread",
+    unread: true,
+  });
   expect(lookups()).toBe(count);
 });
 
-it("lookup results survive a full-window reset and refresh without asking again", async () => {
+it("eviction keeps the newest evidence observed and lookup results survive a refresh without asking again", async () => {
   const { owner, store, lookups } = await setup();
   const mine = event(viewer, 9, 10, []);
   const answer = reply(peer, 700, mine);
   store.push(mine, answer, ...flood(499, 100));
   await owner.capability.ensure();
-  const attention = () => owner.capability.attention("c0", answer.id);
-  await vi.waitFor(() => expect(attention().unread).toBe(true));
+  const attention = (id: string) => owner.capability.attention("c0", id);
+  await vi.waitFor(() => expect(attention(answer.id).unread).toBe(true));
   expect(lookups()).toBeGreaterThan(0);
   const count = lookups();
-  // Overflow the 4,096-event window: every channel's evidence is dropped.
-  owner.accept(flood(4096, 800));
-  expect(
-    owner.capability.snapshot({ kind: "channel", channelId: "c0" }).freshness,
-  ).toBe("stale");
-  expect(attention().status).toBe("unknown");
+  const snapshot = () =>
+    owner.capability.snapshot({ kind: "channel", channelId: "c0" });
+  // Overflow the 4,096-event budget: the oldest evidence goes, the newest
+  // stays, and nothing is reported as failed.
+  const newer = flood(4096, 800);
+  owner.accept(newer);
+  expect(snapshot()).toMatchObject({
+    observedCount: 4096,
+    freshness: "observed",
+  });
+  expect(snapshot().error).toBeUndefined();
+  expect(attention(answer.id).status).toBe("unknown");
+  expect(attention(newer[0]?.id ?? "").unread).toBe(true);
+  // An event older than everything retained cannot displace it.
+  owner.accept([reply(peer, 701, mine)]);
+  expect(snapshot().observedCount).toBe(4096);
   await owner.capability.refresh();
-  expect(attention()).toMatchObject({ category: "thread", unread: true });
+  expect(snapshot()).toMatchObject({
+    observedCount: 4096,
+    freshness: "observed",
+  });
+  const later = reply(peer, 5000, mine);
+  owner.accept([later]);
+  expect(attention(later.id)).toMatchObject({
+    category: "thread",
+    unread: true,
+  });
   expect(lookups()).toBe(count);
 });
 

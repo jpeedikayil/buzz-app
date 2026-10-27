@@ -233,7 +233,8 @@ it("unread repair observes history without seeding the channel window or consumi
   h.query.mockImplementation(async (filters) => {
     const filter = filters[0];
     if (!filter?.kinds?.includes(9)) return [];
-    if (filter.limit === 500) return rows; // Roster-wide unread evidence, not a window page.
+    if (filter.authors) return []; // The participation pass: nothing authored.
+    if (filter.since !== undefined) return rows; // Per-channel unread evidence, not a window page.
     const older = filter.until !== undefined;
     const cursor = rows[older ? 20 : 40];
     if (!cursor) throw new Error("Missing fixture cursor");

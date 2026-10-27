@@ -497,7 +497,9 @@ export const test = base.extend({
             );
           }),
         );
-    // The app's unread read takes the newest 500 events across joined channels.
+    // A joined channel busier than the measured one; its window is read on
+    // its own, so under `firstSeenHistory` the fixture instead honours the
+    // app's never-read window start (see the unread evidence read below).
     if (firstSeenHistory)
       histories.set(
         "primary/busy",
@@ -1671,6 +1673,26 @@ export const test = base.extend({
             }
         return [...rows, ...aux];
       }
+      // Unread participation: the viewer's newest messages in the community.
+      if (
+        filter.kinds?.includes(9) &&
+        filter.authors?.length === 1 &&
+        filter.authors[0] === viewer &&
+        !filter["#h"] &&
+        !filter["#e"] &&
+        !filter.ids
+      )
+        return [...histories]
+          .filter(([key]) => key.startsWith(`${community}/`))
+          .flatMap(([, history]) => history)
+          .filter(
+            (event) =>
+              filter.kinds.includes(event.kind) && event.pubkey === viewer,
+          )
+          .toSorted(
+            (a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id),
+          )
+          .slice(0, filter.limit);
       // Unread conversation lookup: the viewer's replies to undecided parents.
       if (
         filter.kinds?.includes(9) &&
@@ -1704,7 +1726,10 @@ export const test = base.extend({
             (a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id),
           )
           .slice(0, filter.limit);
-      // Unread evidence is not a top-level window, even for a one-ID final batch.
+      // Unread evidence: a channel's window since its read mark, or the
+      // replies under given roots. Fixture history predates the app's
+      // never-read window start by years, so `since` is ignored except under
+      // `firstSeenHistory`, where it keeps the measured history first-seen.
       if (
         filter.kinds?.includes(9) &&
         !filter.top_level &&
@@ -1719,10 +1744,18 @@ export const test = base.extend({
           ])
           .filter(
             (event) =>
-              filter.until === undefined ||
-              event.created_at < filter.until ||
-              (event.created_at === filter.until &&
-                event.id > filter.before_id),
+              (filter.until === undefined ||
+                event.created_at < filter.until ||
+                (event.created_at === filter.until &&
+                  event.id > filter.before_id)) &&
+              (!firstSeenHistory ||
+                filter.since === undefined ||
+                event.created_at >= filter.since) &&
+              (!filter["#e"] ||
+                event.tags.some(
+                  ([key, value]) =>
+                    key === "e" && filter["#e"].includes(value?.toLowerCase()),
+                )),
           )
           .toSorted(
             (a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id),

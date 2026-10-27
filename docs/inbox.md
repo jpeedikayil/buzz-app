@@ -123,8 +123,15 @@ Multiple steps are not atomic: failures leave remaining evidence retryable. Manu
 disable read mutations. Saved frontiers are not proof of remote reconciliation.
 
 This is **bounded recent evidence**, not a complete historical inbox. Unread
-retains at most 4,096 events / 8 MiB, observing up to 500 recent events per
-128-channel roster batch. A lazy addressed query returns up to 50 kind-9/40002
+retains at most 4,096 events / 8 MiB. Each joined channel is observed on its
+own since its read mark (or since the last week, when never read anywhere), up
+to 100 recent events per channel, so one busy channel cannot push another
+channel's thread out of the Inbox. Threads the viewer took part in—wrote or
+replied in, was mentioned in, or follows—are refetched whole on every repair
+and remembered per relay and viewer on this device, at most 100 threads, so
+they stay in the Inbox after their channel's window has moved on. When the
+budget is full, the oldest evidence outside those threads goes first; the
+observation completes rather than resetting. A lazy addressed query returns up to 50 kind-9/40002
 messages. For those exact IDs and unresolved failed targets, general `#e`
 queries page signed kind-40003 edits and kind-5/9005 deletions, then deletions
 of the edits; `include_aux` on an ordinary `#p` query is not a supported relay

@@ -73,6 +73,25 @@ export function policyRelay({
   const unreadHolds = [];
   report.unreadHolds = unreadHolds;
   let heldUnread = false;
+  // Holds an unread evidence response until `releaseUnread`, honouring the
+  // app's abort meanwhile.
+  const holdUnreadResponse = (result, signal) =>
+    new Promise((resolve, reject) => {
+      const held = { pending: true, aborted: false };
+      unreadHolds.push(held);
+      const abort = () => {
+        held.pending = false;
+        held.aborted = true;
+        reject(signal.reason);
+      };
+      if (signal.aborted) return abort();
+      signal.addEventListener("abort", abort, { once: true });
+      pendingUnread.push(() => {
+        held.pending = false;
+        signal.removeEventListener("abort", abort);
+        if (!held.aborted) resolve(Response.json(result));
+      });
+    });
   const profileHolds = [];
   report.profileHolds = profileHolds;
   let heldAuthors = new Set();
@@ -391,6 +410,31 @@ export function policyRelay({
             filters.flatMap((filter) => answer(communityOf(url), filter)),
           );
         }
+        // Unread evidence windows: up to four single-channel filters, each
+        // since its channel's read mark; the viewer's own newest messages
+        // ride the last request.
+        if (
+          filters.every(
+            (filter) =>
+              [9, 40002, 40008].every((kind) => filter.kinds?.includes(kind)) &&
+              filter.include_aux &&
+              ((filter["#h"]?.length === 1 && filter.since !== undefined) ||
+                (filter.authors?.length === 1 &&
+                  !filter["#h"] &&
+                  !filter["#e"])),
+          )
+        ) {
+          expect(filters.length).toBeLessThanOrEqual(4);
+          const community = communityOf(url);
+          for (const filter of filters) {
+            expect(filter.limit).toBe(100);
+            report.queries.push({ community, filter, at: performance.now() });
+          }
+          const result = filters.flatMap((filter) => answer(community, filter));
+          return heldUnread
+            ? holdUnreadResponse(result, init.signal)
+            : Response.json(result);
+        }
         if (filters.length !== 1) {
           // Sidebar preferences read only these five exact own-author coordinates.
           expect(filters).toHaveLength(5);
@@ -501,22 +545,7 @@ export function policyRelay({
           filter.depth_limit === undefined &&
           filter.until === undefined
         )
-          return new Promise((resolve, reject) => {
-            const held = { pending: true, aborted: false };
-            unreadHolds.push(held);
-            const abort = () => {
-              held.pending = false;
-              held.aborted = true;
-              reject(init.signal.reason);
-            };
-            if (init.signal.aborted) return abort();
-            init.signal.addEventListener("abort", abort, { once: true });
-            pendingUnread.push(() => {
-              held.pending = false;
-              init.signal.removeEventListener("abort", abort);
-              if (!held.aborted) resolve(Response.json(result));
-            });
-          });
+          return holdUnreadResponse(result, init.signal);
         if (
           filter.kinds?.includes(0) &&
           filter.authors?.some((id) => heldAuthors.has(id))

@@ -137,6 +137,8 @@ test("channel establishment preserves an in-flight unread batch and its sidebar 
         community === "primary" &&
         filter.kinds?.includes(9) &&
         filter["#h"]?.length &&
+        filter.since !== undefined &&
+        filter["#e"] === undefined &&
         filter.top_level === undefined &&
         filter.depth_limit === undefined &&
         filter.until === undefined,
@@ -145,16 +147,18 @@ test("channel establishment preserves an in-flight unread batch and its sidebar 
   app.relay.holdUnread();
   const opening = open(page, app);
   try {
-    await expect.poll(() => app.report.unreadHolds.length).toBe(1);
-    expect(evidence()[0].filter["#h"]).toContain("alpha");
-    expect(evidence()[0].filter["#h"]).toContain("dm-090");
+    // Per-channel windows, several requests in flight, all held.
+    await expect.poll(() => app.report.unreadHolds.length).toBeGreaterThan(0);
+    expect(evidence()[0].filter["#h"]).toEqual(["alpha"]);
     await expect.poll(() => alphaHeads().length).toBe(1);
 
     // Establish only after unread is in flight; observe the real finite catch-up
     // before releasing evidence. No sleep or scheduler luck creates the overlap.
     app.relay.releaseEose("alpha");
     await expect.poll(() => alphaHeads().length).toBe(2);
-    expect(app.report.unreadHolds).toEqual([{ pending: true, aborted: false }]);
+    expect(app.report.unreadHolds.length).toBeGreaterThan(0);
+    for (const hold of app.report.unreadHolds)
+      expect(hold).toEqual({ pending: true, aborted: false });
     await opening;
     await expect(row(page, "dm-090")).toHaveCount(1);
     await expect(row(page, "dm-090").getByRole("img")).toHaveCount(0);
@@ -167,13 +171,13 @@ test("channel establishment preserves an in-flight unread batch and its sidebar 
       "border-radius",
       "34px",
     );
-    await expect.poll(() => evidence().length).toBe(2); // 130 IDs, not retries.
-    expect(evidence().map(({ filter }) => filter["#h"].length)).toEqual([
-      128, 2,
-    ]);
-    expect(app.report.unreadHolds).toEqual([
-      { pending: false, aborted: false },
-    ]);
+    // One window per channel: 130 IDs, no retries.
+    await expect.poll(() => evidence().length).toBe(130);
+    expect(new Set(evidence().flatMap(({ filter }) => filter["#h"])).size).toBe(
+      130,
+    );
+    for (const hold of app.report.unreadHolds)
+      expect(hold).toEqual({ pending: false, aborted: false });
     expect(app.report.readPublications).toEqual([]);
   } finally {
     app.relay.releaseEose("alpha");

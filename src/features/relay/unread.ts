@@ -3,7 +3,7 @@ import { workflowOwner } from "./workflow-attribution";
 import { agentAudience } from "./audience";
 import type { InboxItem, InboxSnapshot } from "./inbox";
 import type { ChannelQueries } from "./contracts";
-import type { RelayEvent } from "./events";
+import type { ReadFilter, RelayEvent } from "./events";
 import {
   effectiveFrontier,
   overrideActive,
@@ -18,7 +18,6 @@ import type {
 } from "./read-state";
 import type { ReadJournal } from "./read-state-storage";
 import { markMessage } from "./read-state-retention";
-import { LIVE_RESUME_LAG } from "./live";
 import type { Priority, RelayReader } from "./reader";
 import { foldMessages, deletionApplies, messageAuthor } from "./fold";
 import { eventMs } from "./message-order";
@@ -29,6 +28,11 @@ import {
   type ThreadFollows,
   type ThreadFollowStorage,
 } from "./thread-follows";
+import {
+  memoryThreadParticipation,
+  THREAD_PARTICIPATION_LIMIT,
+  type ThreadParticipationStorage,
+} from "./thread-participation";
 
 export type UnreadSnapshot = Readonly<{
   target: ReadTarget;
@@ -146,13 +150,6 @@ export interface UnreadCapability {
   clearUnreadLocal(target: ReadTarget): Promise<ReadMutationResult>;
   readonly syncedManualUnread: false;
 }
-/** How far before the newest event a batch already returned a repair reads
- * again (seconds): the relay accepts a created_at up to 900s from its clock, so
- * an event stored after that read can be older than the newest one it returned. */
-const REPAIR_OVERLAP = LIVE_RESUME_LAG;
-/** Rows one repair read asks for per batch. A read that returns this many may
- * have been cut off, and says nothing about what lay beyond the cut. */
-const REPAIR_LIMIT = 500;
 /** Rendered message order: effective ms, then event id. */
 const order = (a: RelayEvent, b: RelayEvent) =>
   eventMs(a) - eventMs(b) || a.id.localeCompare(b.id);
@@ -217,6 +214,8 @@ export function createUnread({
   profiles,
   notify = (listener) => listener(),
   follows = memoryThreadFollows(),
+  participation = memoryThreadParticipation(),
+  now = () => Date.now(),
 }: {
   reads: ReturnType<typeof createReadState>;
   channels: ChannelQueries;
@@ -228,31 +227,22 @@ export function createUnread({
   profiles?: ProfileQueries;
   notify?: (listener: () => void) => void;
   follows?: ThreadFollowStorage;
+  participation?: ThreadParticipationStorage;
+  /** Only for the never-read channel window floor; reading never uses the clock. */
+  now?: () => number;
 }) {
   let closed = false,
     epoch = 0;
   let requested = false;
   let repairAgain = false;
   let freshness: UnreadSnapshot["freshness"] = "unknown";
-  /** A repair failed, the evidence overflowed or the stream dropped, and no
-   * repair has completed since. Live traffic marks evidence observed again
-   * but does not pay this. */
+  /** A repair failed or the stream dropped, and no repair has completed
+   * since. Live traffic marks evidence observed again but does not pay this. */
   let owing = false;
   let error: string | undefined;
   let refresh: Promise<void> | undefined;
   const lifetime = new AbortController();
   const events = new Map<string, RelayEvent>();
-  // Per repair batch (its channel IDs): the newest created_at a complete read of
-  // it returned. `events` only grows until a reset below, so a later repair needs
-  // just what is newer; every path that empties or shrinks `events` clears this,
-  // and the next repair of every batch reads unbounded again. A repair whose
-  // read spans a reset (`resets` moved) must not answer for the cleared evidence.
-  const repaired = new Map<string, number>();
-  let resets = 0;
-  function forget() {
-    repaired.clear();
-    resets++;
-  }
   const known = new Set<string>();
   const listeners = new Map<string, Set<() => void>>();
   const snapshots = new Map<string, UnreadSnapshot>();
@@ -363,9 +353,23 @@ export function createUnread({
   // `channel:root` of every thread the viewer wrote or replied in, from
   // retained messages and lookup witnesses: the automatic follow.
   const ownThreads = new Set<string>();
-  // Relay lookups for parents the sampled window cannot decide. They are kept
+  // `channel:root` of the threads the viewer is part of, with the newest
+  // message time seen in each (see thread-participation.ts). Read from storage
+  // by the first repair, extended and refetched by every repair, and evicted
+  // last when retained evidence overflows.
+  let remembered: Map<string, number> | undefined;
+  const pinned = (event: RelayEvent) => {
+    const channel = channelOf(event);
+    return (
+      channel !== undefined &&
+      !!remembered?.has(
+        conversationKey(channel, threadReference(event)?.rootId ?? event.id),
+      )
+    );
+  };
+  // Relay lookups for parents the sampled windows cannot decide. They are kept
   // apart from counted evidence: fetched events never count, never fill the
-  // window and survive its overflow reset, because whether the viewer wrote or
+  // windows and survive their eviction, because whether the viewer wrote or
   // answered a message does not change with the sample. Bounded, oldest first.
   // Keyed by channel and parent, like `joined`. `evidence` is one of the
   // viewer's messages that make the viewer a member (the parent itself, or a
@@ -726,7 +730,8 @@ export function createUnread({
     const dm = isDm(channelId);
     const kind = category(entry, dm);
     // A queued or running lookup may still make this reply thread attention.
-    // A read reply is never looked up, so it is undecided but not pending.
+    // A read reply under a retained root is never looked up, so it is
+    // undecided but not pending.
     const open = undecided(entry, dm);
     if (open) want(entry, dm);
     const pending =
@@ -1243,7 +1248,6 @@ export function createUnread({
   function purge() {
     // A revoke/regrant must not revive a transaction accepted under the old access epoch.
     epoch++;
-    forget();
     for (const channelId of channelReadGenerations.keys())
       if (!allowed(channelId)) channelReadGenerations.delete(channelId);
     for (const [key, lookup] of lookups)
@@ -1349,34 +1353,40 @@ export function createUnread({
       }
     }
   });
-  // Conversation membership for unread replies whose parent conversation is
-  // not decided by retained evidence: the parent may be the viewer's own older
-  // message, or the viewer may have replied to it outside the sampled window.
-  // A selector that evaluates an otherwise-unread reply asks the relay once per
-  // parent. Selectors only queue the parent; the fetch starts in a microtask,
-  // so channels nobody observes cost nothing. Fetched events are structure
-  // only: they never count and never start another lookup, so a lookup cannot
-  // walk up an old thread.
+  // Conversation membership for replies whose parent conversation is not
+  // decided by retained evidence: the parent may be the viewer's own older
+  // message, or the viewer may have replied to it outside the sampled windows.
+  // A selector that evaluates an otherwise-unread reply, or a read reply whose
+  // root is not retained, asks the relay once per parent. Selectors only queue
+  // the parent; the fetch starts in a microtask, so channels nobody observes
+  // cost nothing. Fetched events are structure only: they never count and
+  // never start another lookup, so a lookup cannot walk up an old thread.
   function want(entry: Evidence, dm: boolean) {
     const { event, channelId, parentId, threadRootId } = entry;
     if (!parentId || event.pubkey === viewer) return;
-    // Activity groups unread thread replies by root, so fetch a root the
-    // sampled window dropped for a followed thread or an unread reply in it.
+    // Activity and the Inbox group thread replies by root, so fetch a root the
+    // sampled windows dropped for a followed thread or a relevant reply in it,
+    // read or not: a read mention without its root would be its own row.
     const structuralRootId =
       !entry.rootId &&
       (chosen(entry) === true ||
-        ((entry.mentioned || entry.broadcast || conversation(entry)) &&
-          isUnread(entry, reads.state(), dm)))
+        entry.mentioned ||
+        entry.broadcast ||
+        conversation(entry))
         ? threadRootId
         : undefined;
     const structuralRecovery = structuralRootId !== undefined;
     const key = structuralRecovery
       ? `${conversationKey(channelId, structuralRootId)}:structure`
       : conversationKey(channelId, parentId);
+    // A read reply is looked up only while its root is not retained: the
+    // lookup fetches the root too, so the reply groups under it either way.
     if (
       lookups.has(key) ||
       (!structuralRecovery &&
-        (!undecided(entry, dm) || !afterFrontier(entry, reads.state(), dm)))
+        (!undecided(entry, dm) ||
+          (entry.rootId !== undefined &&
+            !afterFrontier(entry, reads.state(), dm))))
     )
       return;
     lookups.set(key, {
@@ -1638,6 +1648,213 @@ export function createUnread({
       resolving = false;
     }
   }
+  // Per-channel evidence: the newest WINDOW_LIMIT content events of each
+  // member channel at or after its older read mark (the explicit channel
+  // frontier or the catch-up `activity:` mark, whichever is older, so unread
+  // replies between them are seen), or after the last week for a channel
+  // never read on any device, whose dormant history would otherwise fill the
+  // budget to show nothing new. The limit is one page of evidence per
+  // channel: counts and rows beyond it are bounded, as under the former global
+  // sample, but a busy channel can no longer push a quiet channel's thread out
+  // of the sample. Single-channel filters ride WINDOW_FILTERS per request (the
+  // relay honours per-filter limits; the reader and hosts allow four filters
+  // per read), with WINDOW_CONCURRENCY requests in flight: the reader runs
+  // three reads at once, and the third slot stays free for the channel the
+  // viewer opens meanwhile. Each landed request publishes.
+  const WINDOW_LIMIT = 100;
+  const WINDOW_FILTERS = 4;
+  const WINDOW_CONCURRENCY = 2;
+  const WINDOW_FLOOR_SECONDS = 7 * 24 * 60 * 60;
+  // The participation pass refetches each remembered thread whole, one filter
+  // per channel naming its roots, riding the same requests as the windows do;
+  // a full page splits a filter's roots, as `viewerReplies` does. Across
+  // threads, only the newest PARTICIPATION_BUDGET replies are admitted per
+  // repair: pinned evidence must leave the channel windows at least three
+  // quarters of the retained budget.
+  const THREAD_LIMIT = 200;
+  const PARTICIPATION_BUDGET = 1024;
+  const deadline = () =>
+    AbortSignal.any([lifetime.signal, AbortSignal.timeout(10000)]);
+  const chunk = <T>(items: readonly T[], size: number) =>
+    Array.from({ length: Math.ceil(items.length / size) }, (_, i) =>
+      items.slice(i * size, (i + 1) * size),
+    );
+  /** Reads `requests` WINDOW_CONCURRENCY at a time, workers pulling the next
+   * as one lands; `landed` sees each result and may push follow-up requests.
+   * Evidence beside a failed request is kept; the failure then stops the
+   * pass and is thrown, with no automatic retry. False when the repair was
+   * retired meanwhile or `landed` declined. */
+  async function pool(
+    requests: ReadFilter[][],
+    generation: number,
+    priority: Priority,
+    landed: (
+      request: readonly ReadFilter[],
+      result: readonly RelayEvent[],
+    ) => boolean,
+  ) {
+    let failure: { cause: unknown } | undefined;
+    let retired = false;
+    const worker = async () => {
+      for (
+        let request = requests.shift();
+        request && !failure && !retired && !closed && generation === epoch;
+        request = requests.shift()
+      ) {
+        let result: readonly RelayEvent[];
+        try {
+          result = await reader.read(request, {
+            signal: deadline(),
+            priority,
+          });
+        } catch (cause) {
+          failure ??= { cause };
+          return;
+        }
+        if (closed || generation !== epoch || !landed(request, result))
+          retired = true;
+      }
+    };
+    await Promise.all(
+      Array.from({ length: WINDOW_CONCURRENCY }, () => worker()),
+    );
+    if (closed || generation !== epoch || retired) return false;
+    if (failure) throw failure.cause;
+    return true;
+  }
+  async function rememberedRoots() {
+    if (remembered) return remembered;
+    try {
+      remembered = new Map(await participation.read());
+    } catch {
+      // Unreadable storage forgets nothing durable: this repair relearns what
+      // the relay still shows and saves that.
+      remembered = new Map();
+    }
+    return remembered;
+  }
+  /** Threads the viewer is part of stay retained whatever the windows hold.
+   * Roots come from storage, explicit follows, and this repair's evidence:
+   * the viewer's own messages (read beside the windows, which start at read
+   * marks the viewer's replies usually precede) and replies that mention the
+   * viewer. Unfollowed threads and left channels are skipped; the union,
+   * newest activity first and capped, is remembered. */
+  async function participate(
+    members: ReadonlySet<string>,
+    generation: number,
+    priority: Priority,
+  ) {
+    indexEvidence();
+    const roots = new Map(await rememberedRoots());
+    const learn = (key: string, at: number) =>
+      roots.set(key, Math.max(roots.get(key) ?? 0, at));
+    for (const [key, following] of choices())
+      if (following && !roots.has(key)) roots.set(key, 0);
+    for (const rows of byChannel.values())
+      for (const entry of rows) {
+        const key = conversationKey(
+          entry.channelId,
+          entry.threadRootId ?? entry.event.id,
+        );
+        if (entry.event.pubkey === viewer || entry.mentioned || roots.has(key))
+          learn(key, entry.event.created_at);
+      }
+    const active = [...roots]
+      .filter(
+        ([key]) =>
+          members.has(key.slice(0, key.indexOf(":"))) &&
+          choices().get(key) !== false,
+      )
+      .sort(([, a], [, b]) => b - a)
+      .slice(0, THREAD_PARTICIPATION_LIMIT);
+    const previous = remembered;
+    remembered = new Map(active);
+    if (
+      !previous ||
+      previous.size !== remembered.size ||
+      [...remembered].some(([key, at]) => previous.get(key) !== at)
+    )
+      void participation.write(remembered).catch(() => {});
+    const groups = new Map<string, string[]>();
+    for (const [key] of active) {
+      const separator = key.indexOf(":");
+      const channelId = key.slice(0, separator);
+      groups.set(channelId, [
+        ...(groups.get(channelId) ?? []),
+        key.slice(separator + 1),
+      ]);
+    }
+    const threads = (channelId: string, rootIds: readonly string[]) => ({
+      kinds: contentKinds,
+      "#h": [channelId],
+      "#e": [...rootIds],
+      include_aux: true,
+      limit: THREAD_LIMIT,
+    });
+    // Roots the windows did not carry, so replies group and open under them;
+    // the viewer's own roots arrived with the authored read.
+    const missing = [...groups.values()]
+      .flat()
+      .filter((rootId) => !structural(rootId));
+    const requests = chunk(
+      [
+        ...[...groups].map(([channelId, rootIds]) =>
+          threads(channelId, rootIds),
+        ),
+        ...chunk(missing, 100).map((ids) => ({
+          kinds: contentKinds,
+          ids,
+          include_aux: true,
+          limit: ids.length,
+        })),
+      ],
+      WINDOW_FILTERS,
+    );
+    const rows = new Map<string, RelayEvent>();
+    const complete = await pool(
+      requests,
+      generation,
+      priority,
+      (request, result) => {
+        for (const event of result) rows.set(event.id, event);
+        // A full page may hide replies under a filter's other roots.
+        for (const filter of request) {
+          const channelId = filter["#h"]?.[0];
+          const rootIds = filter["#e"];
+          if (!channelId || !rootIds || rootIds.length < 2) continue;
+          const page = result.filter(
+            (event) =>
+              contentKind(event) &&
+              channelOf(event) === channelId &&
+              event.tags.some(
+                ([name, id]) => name === "e" && rootIds.includes(id ?? ""),
+              ),
+          ).length;
+          if (page < THREAD_LIMIT) continue;
+          const half = Math.ceil(rootIds.length / 2);
+          requests.push([
+            threads(channelId, rootIds.slice(0, half)),
+            threads(channelId, rootIds.slice(half)),
+          ]);
+        }
+        return true;
+      },
+    );
+    if (!complete) return false;
+    const replies = [...rows.values()]
+      .filter((event) => contentKind(event) && threadReference(event))
+      .sort((a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id))
+      .slice(0, PARTICIPATION_BUDGET);
+    const admitted = new Set(replies.map((event) => event.id));
+    return accept([
+      ...replies,
+      ...[...rows.values()].filter(
+        (event) =>
+          !admitted.has(event.id) &&
+          !(contentKind(event) && threadReference(event)),
+      ),
+    ]);
+  }
   async function repair(priority: Priority = "foreground") {
     requested = true;
     if (closed) return;
@@ -1645,19 +1862,17 @@ export function createUnread({
     repairAgain = false;
     inboxLoading = true;
     const generation = epoch;
-    const reset = resets;
-    const current = () => !closed && generation === epoch && reset === resets;
     refresh = (async () => {
       await reads.ensure();
-      if (!current()) return;
+      if (closed || generation !== epoch) return;
+      await rememberedRoots();
+      if (closed || generation !== epoch) return;
       const ids = channels
         .list()
         .channels.filter(
           (channel) => !channel.cached && channel.members?.includes(viewer),
         )
-        .map((channel) => channel.id)
-        // Batches key their marks, so they must not move when a channel is renamed.
-        .sort();
+        .map((channel) => channel.id);
       if (!ids.length) {
         freshness = "observed";
         owing = false;
@@ -1665,61 +1880,75 @@ export function createUnread({
         return;
       }
       try {
-        // The relay caps aggregate explicit #h values at 128 per request.
-        // Keep roster scope: an unscoped read also includes unjoined open channels.
-        // Each bounded batch owns its queue-inclusive deadline after marker sync;
-        // optional profiles must not block the initial user-visible observation.
-        for (let offset = 0; offset < ids.length; offset += 128) {
-          const batch = ids.slice(offset, offset + 128);
-          const key = batch.join(",");
-          const mark = repaired.get(key);
-          const asked = Math.floor(Date.now() / 1000);
-          const signal = AbortSignal.any([
-            lifetime.signal,
-            AbortSignal.timeout(10000),
-          ]);
-          const result = await reader.read(
-            [
-              {
-                kinds: [9, 40002, 40008],
-                "#h": batch,
-                include_aux: true,
-                limit: REPAIR_LIMIT,
-                ...(mark === undefined
-                  ? {}
-                  : { since: Math.max(0, mark - REPAIR_OVERLAP) }),
-              },
-            ],
-            { signal, priority },
+        // Keep roster scope: an unscoped read also includes unjoined open
+        // channels. Each bounded request owns its queue-inclusive deadline
+        // after marker sync; optional profiles must not block the initial
+        // user-visible observation.
+        const { frontiers } = reads.state();
+        const floor = Math.floor(now() / 1000) - WINDOW_FLOOR_SECONDS;
+        const windows = ids.map((id) => {
+          const marks = [frontiers[id], frontiers[`activity:${id}`]].filter(
+            (mark): mark is number => mark !== undefined,
           );
-          // An overflow or refresh while this read was out discarded what the
-          // mark stands for: an overflow waits for refresh, a refresh reads again.
-          if (!current()) return;
-          // Accepting notifies subscribers, and one may refresh from there.
-          if (!accept(result) || !current()) return;
-          // The mark is anchored on what the relay returned, not the clock: a
-          // skewed clock or a future-dated event cannot move the window past
-          // unseen history. Only a read that returned fewer than its limit saw
-          // everything in its window, so only it installs or advances the mark;
-          // the earlier mark was itself such a read, so coverage chains. A read
-          // that filled its limit may have cut off older rows (a deletion would
-          // later free a slot for one), so it drops the mark and the next repair
-          // reads unbounded. An empty read sets nothing either.
-          const newest = Math.max(
-            0,
-            ...result.map((event) => event.created_at),
+          return { id, since: marks.length ? Math.min(...marks) : undefined };
+        });
+        const marked = new Set(
+          windows.flatMap(({ id, since }) => (since === undefined ? [] : [id])),
+        );
+        // The viewer's newest messages, for the participation pass, ride
+        // the last request.
+        const requests = chunk(
+          [
+            ...windows.map(({ id, since }) => ({
+              kinds: contentKinds,
+              "#h": [id],
+              since: since ?? floor,
+              include_aux: true,
+              limit: WINDOW_LIMIT,
+            })),
+            {
+              kinds: contentKinds,
+              authors: [viewer],
+              include_aux: true,
+              limit: WINDOW_LIMIT,
+            },
+          ],
+          WINDOW_FILTERS,
+        );
+        // A failed window still leaves the viewer's threads to the
+        // participation pass; the failure is then reported.
+        let failed: { cause: unknown } | undefined;
+        let complete = false;
+        try {
+          complete = await pool(
+            requests,
+            generation,
+            priority,
+            (request, result) => {
+              // A read channel with nothing since its mark is observed with
+              // nothing unread; a never-read channel with no recent history
+              // stays unknown rather than claiming zero.
+              for (const filter of request) {
+                const id = filter["#h"]?.[0];
+                if (id && marked.has(id)) known.add(id);
+              }
+              return accept(result);
+            },
           );
-          if (result.length >= REPAIR_LIMIT) repaired.delete(key);
-          else if (newest)
-            repaired.set(key, Math.max(mark ?? 0, Math.min(newest, asked)));
+        } catch (cause) {
+          failed = { cause };
+          complete = true;
         }
+        if (!complete) return;
+        if (!(await participate(new Set(ids), generation, priority))) return;
+        if (failed) throw failed.cause;
         freshness = "observed";
         owing = false;
         error = undefined;
         publish();
         void findHomes(generation);
       } catch (cause) {
-        if (!current()) return;
+        if (closed || generation !== epoch) return;
         freshness = "stale";
         owing = true;
         error =
@@ -1843,6 +2072,15 @@ export function createUnread({
     }
     if (changed.size) publish(changed);
   }
+  const sizeOf = (event: RelayEvent) =>
+    new TextEncoder().encode(JSON.stringify(event)).byteLength;
+  /** Eviction order once retained evidence is full: evidence of the viewer's
+   * threads goes last, otherwise the oldest first, so a busy channel can push
+   * out old ordinary evidence but not a participated thread. */
+  const byEviction = (a: RelayEvent, b: RelayEvent) =>
+    Number(pinned(a)) - Number(pinned(b)) ||
+    a.created_at - b.created_at ||
+    a.id.localeCompare(b.id);
   function accept(batch: readonly RelayEvent[]) {
     if (closed) return false;
     retract(batch);
@@ -1850,6 +2088,9 @@ export function createUnread({
     indexed = false;
     const incoming = new Map(batch.map((event) => [event.id, event]));
     const owners = channelOwnership((id) => incoming.get(id) ?? events.get(id));
+    // Retained content in eviction order, built once a batch needs room.
+    let order: RelayEvent[] | undefined;
+    let evicted = false;
     for (const event of batch) {
       if (
         ![9, 40002, 40008, 40003, 5, 9005].includes(event.kind) ||
@@ -1859,18 +2100,28 @@ export function createUnread({
       const channels = owners(event);
       if (!channels || [...channels].some((channel) => !allowed(channel)))
         continue;
-      const size = new TextEncoder().encode(JSON.stringify(event)).byteLength;
-      if (events.size >= 4096 || bytes + size > 8 * 1024 * 1024) {
-        events.clear();
-        forget();
-        known.clear();
-        bytes = 0;
-        error = "Unread observation capacity reached; refresh available";
-        freshness = "stale";
-        owing = true;
-        publish();
-        return false;
+      const size = sizeOf(event);
+      // Full: make room by evicting what goes first, unless this event would
+      // go before all of it. The channel stays observed; like any sample,
+      // the count is of what is retained.
+      let admitted = true;
+      while (events.size >= 4096 || bytes + size > 8 * 1024 * 1024) {
+        order ??= [...events.values()]
+          .filter((retained) => contentKind(retained))
+          .sort(byEviction);
+        const oldest = order[0];
+        if (!oldest || byEviction(event, oldest) <= 0) {
+          admitted = false;
+          break;
+        }
+        order.shift();
+        events.delete(oldest.id);
+        bytes -= sizeOf(oldest);
+        evicted = true;
+        const channel = channelOf(oldest);
+        if (channel) changed.add(channel);
       }
+      if (!admitted) continue;
       events.set(event.id, event);
       bytes += size;
       for (const channel of channels) {
@@ -1880,6 +2131,18 @@ export function createUnread({
       // The recursively resolved owner set already includes every activity
       // projection affected by a deletion, including delete-of-edit chains.
     }
+    // Edits and deletions stay only while one of their targets does.
+    if (evicted)
+      for (const [id, event] of events) {
+        if (!auxiliaryKind(event)) continue;
+        const targets = event.tags.flatMap(([name, target]) =>
+          name === "e" && target ? [target] : [],
+        );
+        if (targets.length && targets.every((target) => !events.has(target))) {
+          events.delete(id);
+          bytes -= sizeOf(event);
+        }
+      }
     if (changed.size) {
       // The session admits profiles from this same batch after unread evidence.
       if (profiles)
@@ -2037,12 +2300,7 @@ export function createUnread({
     },
     ensure: () => refresh ?? (requested ? Promise.resolve() : repair()),
     refresh: async () => {
-      // An explicit refresh re-observes everything. The reset fences a running
-      // repair, which the refresh waits out rather than joins.
-      forget();
-      const running = refresh;
       await reads.refresh("foreground");
-      await running?.catch(() => undefined);
       await repair();
     },
     revision: reads.revision,
@@ -2595,8 +2853,8 @@ export function createUnread({
       resetLookups();
       repairAgain = false;
       indexed = false;
+      remembered = undefined;
       events.clear();
-      forget();
       known.clear();
       forcedMessages.clear();
       entered.clear();
@@ -2629,6 +2887,7 @@ export function createUnread({
       inboxListeners.clear();
       forcedMessages.clear();
       entered.clear();
+      participation.close();
       reads.dispose();
     },
   };
