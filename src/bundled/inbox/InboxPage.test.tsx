@@ -1608,7 +1608,7 @@ function fixture(
   let rosterStarted = false;
   let evidenceReads = 0;
   let unreadGate: Promise<void> | undefined;
-  let unreadFails = false;
+  let unreadFails: boolean | "all" = false;
   let unreadStarted = false;
   const historyRequests: string[] = [];
   const threadRequests: string[] = [];
@@ -1775,10 +1775,12 @@ function fixture(
         ) {
           unreadStarted = true;
           await unreadGate;
-          // Only the channel windows fail; the remembered thread reads land.
+          // Only the channel windows fail, so the remembered thread reads
+          // land and the pass is partial; "all" fails the repair outright.
           if (
-            unreadFails &&
-            filters.some((filter) => filter.since !== undefined)
+            unreadFails === "all" ||
+            (unreadFails &&
+              filters.some((filter) => filter.since !== undefined))
           )
             throw new Error("unread window unavailable");
         }
@@ -1971,7 +1973,7 @@ function fixture(
     evidenceReads: () => evidenceReads,
     historyRequests,
     unreadStarted: () => unreadStarted,
-    failUnread(value: boolean) {
+    failUnread(value: boolean | "all") {
       unreadFails = value;
     },
     holdUnread() {
@@ -2678,6 +2680,73 @@ it("a window dropped after its retry shows a soft notice with Refresh, not the f
     ).not.toBeInTheDocument(),
   );
   expect(h.owner.session.unread.inbox().partial).toBeUndefined();
+});
+
+async function partialNotice(h: ReturnType<typeof fixture>) {
+  render(h.view);
+  await waitFor(() =>
+    expect(h.owner.session.unread.inbox().status).toBe("ready"),
+  );
+  h.failUnread(true);
+  await act(() => h.owner.session.unread.refresh());
+  const refresh = await screen.findByRole("button", { name: "Refresh" });
+  expect(h.owner.session.unread.inbox().partial).toBe(true);
+  return refresh;
+}
+
+it.each(["refresh", "other"] as const)(
+  "the partial notice's Refresh hands off focus when recovery removes it (focus owner: %s)",
+  async (focusOwner) => {
+    const h = fixture();
+    const user = userEvent.setup();
+    const refresh = await partialNotice(h);
+    h.failUnread(false);
+    const other = screen.getByRole("button", { name: "Unread only" });
+    const release = h.holdUnread();
+    try {
+      refresh.focus();
+      await user.keyboard("{Enter}");
+      await waitFor(() => expect(h.unreadStarted()).toBe(true));
+      // The control stays mounted and focused while its refresh runs.
+      expect(refresh).toHaveFocus();
+      expect(refresh).toHaveAttribute("aria-disabled", "true");
+      if (focusOwner === "other") other.focus();
+    } finally {
+      await act(async () => release());
+    }
+    await waitFor(() =>
+      expect(
+        screen.queryByText("Some channels could not be checked."),
+      ).not.toBeInTheDocument(),
+    );
+    // Focus the retired Refresh owned moves to a stable Inbox control; focus
+    // the person moved meanwhile stays where they put it.
+    await waitFor(() =>
+      expect(
+        focusOwner === "refresh"
+          ? screen.getByRole("button", { name: "Inbox filters" })
+          : other,
+      ).toHaveFocus(),
+    );
+  },
+);
+
+it("the partial notice's Refresh hands focus to the alert's Retry when the refresh fails", async () => {
+  const h = fixture();
+  const user = userEvent.setup();
+  const refresh = await partialNotice(h);
+  h.failUnread("all");
+  refresh.focus();
+  await user.keyboard("{Enter}");
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "unread window unavailable",
+  );
+  expect(
+    screen.queryByText("Some channels could not be checked."),
+  ).not.toBeInTheDocument();
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Retry inbox" })).toHaveFocus(),
+  );
 });
 
 it.each([false, true])(

@@ -18,7 +18,12 @@ import type {
 } from "./read-state";
 import type { ReadJournal } from "./read-state-storage";
 import { markMessage } from "./read-state-retention";
-import type { Priority, RelayReader } from "./reader";
+import {
+  READ_BUDGET_EXCEEDED,
+  type Priority,
+  type RelayReader,
+} from "./reader";
+import { ReadError } from "./errors";
 import { foldMessages, deletionApplies, messageAuthor } from "./fold";
 import { eventMs } from "./message-order";
 import { threadReference } from "./thread-reference";
@@ -1395,7 +1400,10 @@ export function createUnread({
     // Activity and the Inbox group thread replies by root, so fetch a root the
     // sampled windows dropped for a followed thread or a relevant reply in it,
     // or for a read reply, which would otherwise be its own row. Membership
-    // of read replies is answered by the participation pass, not a lookup.
+    // of read replies is answered by the participation pass, not a lookup,
+    // except in a remembered thread: the viewer's reply may be older than the
+    // thread page and the authored page both reach, so the lookup recovers
+    // that verified witness, or finds it deleted and leaves the thread.
     const read = () => !afterFrontier(entry, reads.state(), dm);
     const structuralRootId =
       !entry.rootId &&
@@ -1412,7 +1420,8 @@ export function createUnread({
       : conversationKey(channelId, parentId);
     if (
       lookups.has(key) ||
-      (!structuralRecovery && (!undecided(entry, dm) || read()))
+      (!structuralRecovery &&
+        (!undecided(entry, dm) || (read() && !pinned(event))))
     )
       return;
     lookups.set(key, {
@@ -1712,6 +1721,36 @@ export function createUnread({
   /** One repair's reads: whether any landed, whether one was dropped, and
    * the last failure, which is the repair's error when nothing landed. */
   type Pass = { landed: boolean; dropped: boolean; failure: unknown };
+  /** A response over the reader's byte budget fails the same way every time,
+   * so the request is split, not retried: its filters in two halves, a lone
+   * filter's `ids` in two, or a lone filter's limit halved. A lone filter at
+   * limit 1 cannot shrink and is dropped. */
+  const oversized = (cause: unknown) =>
+    cause instanceof ReadError && cause.message === READ_BUDGET_EXCEEDED;
+  function split(request: readonly ReadFilter[]): ReadFilter[][] {
+    if (request.length > 1) {
+      const half = Math.ceil(request.length / 2);
+      return [request.slice(0, half), request.slice(half)];
+    }
+    const [filter] = request;
+    if (!filter) return [];
+    if (filter.ids && filter.ids.length > 1) {
+      const half = Math.ceil(filter.ids.length / 2);
+      return [
+        [{ ...filter, ids: filter.ids.slice(0, half), limit: half }],
+        [
+          {
+            ...filter,
+            ids: filter.ids.slice(half),
+            limit: filter.ids.length - half,
+          },
+        ],
+      ];
+    }
+    return filter.limit > 1
+      ? [[{ ...filter, limit: Math.floor(filter.limit / 2) }]]
+      : [];
+  }
   /** Reads `requests` WINDOW_CONCURRENCY at a time, workers pulling the next
    * as one lands; `landed` sees each result (undefined for a dropped request)
    * and may push follow-up requests. A request that fails is read once more
@@ -1719,8 +1758,10 @@ export function createUnread({
    * past it alone); failing again, it is dropped and the rest still land.
    * Once a request has been dropped, a failing request is dropped at once —
    * a second stall is the relay, not the request — so a dead relay holds a
-   * pass for one deadline per request beyond the two the first costs. False
-   * when the repair was retired meanwhile or `landed` declined. */
+   * pass for one deadline per request beyond the two the first costs. An
+   * oversized response splits the request (see `split`); `divided` sees the
+   * parts, which are read next. False when the repair was retired meanwhile
+   * or `landed` declined. */
   async function pool(
     requests: ReadFilter[][],
     generation: number,
@@ -1731,16 +1772,23 @@ export function createUnread({
       result: readonly RelayEvent[] | undefined,
       requests: ReadFilter[][],
     ) => boolean,
+    divided: (
+      request: readonly ReadFilter[],
+      parts: readonly (readonly ReadFilter[])[],
+    ) => void = () => {},
   ) {
     let retired = false;
     const worker = async () => {
-      for (
-        let request = requests.shift();
-        request && !retired && !closed && generation === epoch;
-        request = requests.shift()
-      ) {
+      while (!retired && !closed && generation === epoch) {
+        const request = requests.shift();
+        if (!request) return;
         let result: readonly RelayEvent[] | undefined;
-        for (let attempt = 0; attempt < (pass.dropped ? 1 : 2); attempt++)
+        let parts: ReadFilter[][] | undefined;
+        for (
+          let attempt = 0;
+          attempt < (pass.dropped ? 1 : 2) && !parts;
+          attempt++
+        )
           try {
             result = await reader.read(request, {
               signal: deadline(),
@@ -1750,7 +1798,13 @@ export function createUnread({
           } catch (cause) {
             if (closed || generation !== epoch) return;
             pass.failure = cause;
+            if (oversized(cause)) parts = split(request);
           }
+        if (parts?.length) {
+          requests.unshift(...parts);
+          divided(request, parts);
+          continue;
+        }
         if (result) pass.landed = true;
         else pass.dropped = true;
         if (
@@ -1805,10 +1859,12 @@ export function createUnread({
         .sort(([, a], [, b]) => b - a)
         .slice(0, THREAD_PARTICIPATION_LIMIT)
         .map(([key]) => key);
-    // Roots asked for this repair, and every event the thread reads returned.
+    // Roots asked for this repair, every event the thread reads returned, and
+    // the replies admitted so far by ID: a full page's split rereads replies
+    // the page already admitted, which count once.
     const fetched = new Set<string>();
     const rows = new Map<string, RelayEvent>();
-    let admitted = 0;
+    const admitted = new Set<string>();
     const threads = (channelId: string, rootIds: readonly string[]) => ({
       kinds: contentKinds,
       "#h": [channelId],
@@ -1870,7 +1926,7 @@ export function createUnread({
                 ([name, id]) => name === "e" && rootIds.includes(id ?? ""),
               ),
           ).length;
-          if (page < THREAD_LIMIT) continue;
+          if (page < filter.limit) continue;
           // The split stays ahead of the windows, as the thread read was.
           const half = Math.ceil(rootIds.length / 2);
           requests.unshift([
@@ -1881,15 +1937,14 @@ export function createUnread({
         const reply = (event: RelayEvent) =>
           contentKind(event) && !!threadReference(event);
         const replies = result
-          .filter(reply)
+          .filter((event) => reply(event) && !admitted.has(event.id))
           .sort(
             (a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id),
           )
-          .slice(0, Math.max(0, PARTICIPATION_BUDGET - admitted));
-        admitted += replies.length;
-        const chosen = new Set(replies.map((event) => event.id));
+          .slice(0, Math.max(0, PARTICIPATION_BUDGET - admitted.size));
+        for (const event of replies) admitted.add(event.id);
         return accept(
-          result.filter((event) => chosen.has(event.id) || !reply(event)),
+          result.filter((event) => admitted.has(event.id) || !reply(event)),
         );
       },
       /** Learns roots and their newest times from retained evidence and the
@@ -2055,12 +2110,34 @@ export function createUnread({
           }
           return ok;
         };
-        if (!(await pool(requests, generation, priority, progress, landed)))
+        const divided = (
+          request: readonly ReadFilter[],
+          parts: readonly (readonly ReadFilter[])[],
+        ) => {
+          if (first.delete(request)) for (const part of parts) first.add(part);
+        };
+        if (
+          !(await pool(
+            requests,
+            generation,
+            priority,
+            progress,
+            landed,
+            divided,
+          ))
+        )
           return;
         // Threads the windows newly taught, usually none.
         pass.learn();
         if (
-          !(await pool(pass.requests(), generation, priority, progress, landed))
+          !(await pool(
+            pass.requests(),
+            generation,
+            priority,
+            progress,
+            landed,
+            divided,
+          ))
         )
           return;
         // Nothing landed: nothing was observed, so the repair failed.
@@ -2200,15 +2277,87 @@ export function createUnread({
     }
     if (changed.size) publish(changed);
   }
-  const sizeOf = (event: RelayEvent) =>
-    new TextEncoder().encode(JSON.stringify(event)).byteLength;
-  /** Eviction order once retained evidence is full: evidence of the viewer's
-   * threads goes last, otherwise the oldest first, so a busy channel can push
-   * out old ordinary evidence but not a participated thread. */
-  const byEviction = (a: RelayEvent, b: RelayEvent) =>
-    Number(pinned(a)) - Number(pinned(b)) ||
-    a.created_at - b.created_at ||
-    a.id.localeCompare(b.id);
+  // Verified events never change; each is measured once.
+  const sizes = new WeakMap<RelayEvent, number>();
+  const sizeOf = (event: RelayEvent) => {
+    let size = sizes.get(event);
+    if (size === undefined) {
+      size = new TextEncoder().encode(JSON.stringify(event)).byteLength;
+      sizes.set(event, size);
+    }
+    return size;
+  };
+  const older = (a: RelayEvent, b: RelayEvent) =>
+    a.created_at - b.created_at || a.id.localeCompare(b.id);
+  /** `a` outlasts `b`: pinned after ordinary, then the newer. */
+  const outlasts = (a: RelayEvent, b: RelayEvent) =>
+    (Number(pinned(a)) - Number(pinned(b)) || older(a, b)) > 0;
+  /** Retained content once evidence is full, in eviction order: ordinary
+   * evidence goes first, the oldest of the channel holding the most of the
+   * exhausted budget (events, or bytes), so a busy channel's traffic pushes
+   * out its own older evidence and never a quiet channel's only message,
+   * whose count would otherwise become a confident zero; evidence of the
+   * viewer's threads goes last, oldest first. */
+  type Pool = { rows: RelayEvent[]; bytes: number };
+  type Pools = { unpinned: Map<string, Pool>; pinned: Pool };
+  const EVENT_BUDGET = 4096;
+  const BYTE_BUDGET = 8 * 1024 * 1024;
+  function pools(): Pools {
+    const unpinned = new Map<string, Pool>();
+    const pinnedPool: Pool = { rows: [], bytes: 0 };
+    for (const event of events.values()) {
+      const channel = contentKind(event) ? channelOf(event) : undefined;
+      if (channel === undefined) continue;
+      const pool = pinned(event)
+        ? pinnedPool
+        : (unpinned.get(channel) ?? { rows: [], bytes: 0 });
+      pool.rows.push(event);
+      pool.bytes += sizeOf(event);
+      if (pool !== pinnedPool) unpinned.set(channel, pool);
+    }
+    pinnedPool.rows.sort(older);
+    for (const pool of unpinned.values()) pool.rows.sort(older);
+    return { unpinned, pinned: pinnedPool };
+  }
+  /** The pool whose first event goes next, holding the most of `measure`. */
+  const next = ({ unpinned, pinned }: Pools, measure: keyof Pool) => {
+    const held = (pool: Pool) =>
+      measure === "rows" ? pool.rows.length : pool.bytes;
+    let chosen: Pool | undefined;
+    for (const pool of unpinned.values()) {
+      const first = pool.rows[0];
+      const best = chosen?.rows[0];
+      if (
+        first &&
+        (!best ||
+          held(pool) > held(chosen as Pool) ||
+          (held(pool) === held(chosen as Pool) && older(first, best) < 0))
+      )
+        chosen = pool;
+    }
+    return chosen ?? pinned;
+  };
+  const place = (pool: Pool, event: RelayEvent) => {
+    const { rows } = pool;
+    let low = 0,
+      high = rows.length;
+    while (low < high) {
+      const mid = (low + high) >> 1;
+      const row = rows[mid];
+      if (row && older(row, event) < 0) low = mid + 1;
+      else high = mid;
+    }
+    rows.splice(low, 0, event);
+    pool.bytes += sizeOf(event);
+  };
+  /** Whether incoming content would be evicted before the retained `oldest`:
+   * ordinary before pinned; pinned by age; ordinary by age within the channel
+   * going next, since another channel holds no more than it. */
+  const before = (event: RelayEvent, oldest: RelayEvent) =>
+    pinned(event) !== pinned(oldest)
+      ? !pinned(event)
+      : (pinned(event) || channelOf(event) === channelOf(oldest)) &&
+        older(event, oldest) < 0;
   function accept(batch: readonly RelayEvent[]) {
     if (closed) return false;
     retract(batch);
@@ -2216,9 +2365,24 @@ export function createUnread({
     indexed = false;
     const incoming = new Map(batch.map((event) => [event.id, event]));
     const owners = channelOwnership((id) => incoming.get(id) ?? events.get(id));
-    // Retained content in eviction order, built once a batch needs room.
-    let order: RelayEvent[] | undefined;
+    // An edit or deletion is kept with its newest-ranked content target,
+    // retained or in this batch, so an overlay on a pinned message is admitted
+    // while the message is. Without one it ranks as itself.
+    const overlaid = (event: RelayEvent) => {
+      let best: RelayEvent | undefined;
+      for (const [name, id] of event.tags) {
+        const target =
+          name === "e" && id ? (events.get(id) ?? incoming.get(id)) : undefined;
+        if (target && contentKind(target) && (!best || outlasts(target, best)))
+          best = target;
+      }
+      return best ?? event;
+    };
+    // Retained content in eviction order, built once a batch needs room, and
+    // the channels room was taken from or refused to.
+    let retained: Pools | undefined;
     let evicted = false;
+    const unsettled = new Set<string>();
     for (const event of batch) {
       if (
         ![9, 40002, 40008, 40003, 5, 9005].includes(event.kind) ||
@@ -2229,29 +2393,54 @@ export function createUnread({
       if (!channels || [...channels].some((channel) => !allowed(channel)))
         continue;
       const size = sizeOf(event);
+      const subject = auxiliaryKind(event) ? overlaid(event) : event;
       // Full: make room by evicting what goes first, unless this event would
       // go before all of it. The channel stays observed; like any sample,
-      // the count is of what is retained.
+      // the count is of what is retained. An overlay whose own target goes
+      // first retires with it: a deleted or superseded body is not kept
+      // counted for want of room.
       let admitted = true;
-      while (events.size >= 4096 || bytes + size > 8 * 1024 * 1024) {
-        order ??= [...events.values()]
-          .filter((retained) => contentKind(retained))
-          .sort(byEviction);
-        const oldest = order[0];
-        if (!oldest || byEviction(event, oldest) <= 0) {
+      while (events.size >= EVENT_BUDGET || bytes + size > BYTE_BUDGET) {
+        retained ??= pools();
+        const pool = next(
+          retained,
+          events.size >= EVENT_BUDGET ? "rows" : "bytes",
+        );
+        const oldest = pool.rows[0];
+        if (!oldest || (!events.has(subject.id) && before(subject, oldest))) {
           admitted = false;
+          for (const channel of channels) unsettled.add(channel);
           break;
         }
-        order.shift();
+        pool.rows.shift();
+        pool.bytes -= sizeOf(oldest);
         events.delete(oldest.id);
         bytes -= sizeOf(oldest);
         evicted = true;
         const channel = channelOf(oldest);
-        if (channel) changed.add(channel);
+        if (channel) {
+          changed.add(channel);
+          unsettled.add(channel);
+        }
+        if (oldest.id === subject.id) {
+          admitted = false;
+          break;
+        }
       }
       if (!admitted) continue;
       events.set(event.id, event);
       bytes += size;
+      // Later events in this batch see this one as retained.
+      const channel =
+        retained && contentKind(event) ? channelOf(event) : undefined;
+      if (retained && channel !== undefined) {
+        if (pinned(event)) place(retained.pinned, event);
+        else {
+          const pool = retained.unpinned.get(channel) ?? { rows: [], bytes: 0 };
+          place(pool, event);
+          retained.unpinned.set(channel, pool);
+        }
+      }
       for (const channel of channels) {
         known.add(channel);
         changed.add(channel);
@@ -2259,6 +2448,15 @@ export function createUnread({
       // The recursively resolved owner set already includes every activity
       // projection affected by a deletion, including delete-of-edit chains.
     }
+    // A channel left with no retained content is no longer observed: what
+    // room took or refused is not a count of nothing.
+    for (const channel of unsettled)
+      if (
+        !retained?.unpinned.get(channel)?.rows.length &&
+        !retained?.pinned.rows.some((event) => channelOf(event) === channel) &&
+        known.delete(channel)
+      )
+        changed.add(channel);
     // Edits and deletions stay only while one of their targets does.
     if (evicted)
       for (const [id, event] of events) {

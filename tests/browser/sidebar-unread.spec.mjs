@@ -147,9 +147,15 @@ test("channel establishment preserves an in-flight unread batch and its sidebar 
   app.relay.holdUnread();
   const opening = open(page, app);
   try {
-    // Per-channel windows, several requests in flight, all held.
-    await expect.poll(() => app.report.unreadHolds.length).toBeGreaterThan(0);
-    expect(evidence()[0].filter["#h"]).toEqual(["alpha"]);
+    // Per-channel windows, several requests in flight, all held. Two requests
+    // are in flight at once and either may be recorded first; wait until the
+    // one carrying Alpha's window is held before establishing the channel.
+    await expect
+      .poll(() =>
+        evidence().some(({ filter }) => filter["#h"]?.[0] === "alpha"),
+      )
+      .toBe(true);
+    expect(app.report.unreadHolds.length).toBeGreaterThan(0);
     await expect.poll(() => alphaHeads().length).toBe(1);
 
     // Establish only after unread is in flight; observe the real finite catch-up

@@ -33,6 +33,7 @@ import {
   summary,
 } from "../../src/features/relay/testing";
 import { profileTarget } from "../../src/features/profiles/target";
+import { isUnreadWindowBatch } from "../../src/features/relay/unread-window-batch";
 import { ToastProvider } from "../../src/shared/design-system/ui/Toast";
 import "../../src/shared/styles/globals.css";
 import { createAppearance } from "../../src/shared/theme/service";
@@ -293,6 +294,10 @@ function session() {
               filter.ids?.includes(event.id),
             );
           if (filter.depth_limit) return [reply];
+          // The unread repair's channel windows, authored page and thread
+          // reads find no activity here, as its former single evidence query
+          // did not: the fixture's channels carry no unread badge.
+          if (isUnreadWindowBatch([filter])) return [];
           if (filter.kinds?.includes(9))
             return filter["#h"]?.includes("two")
               ? [

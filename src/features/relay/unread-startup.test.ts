@@ -1,3 +1,4 @@
+import { verifiedSymbol } from "nostr-tools";
 import { afterEach, assert, expect, it, vi } from "vitest";
 import type { ReadFilter, RelayEvent } from "./events";
 import type { LiveCallbacks } from "./live";
@@ -1252,6 +1253,71 @@ it("a full budget evicts the oldest evidence and the observation still completes
   expect(h.snapshot().error).toBeUndefined();
   expect(h.session.unread.attention("other", overflow.id).unread).toBe(true);
   expect(h.session.unread.attention("other", oldest.id).unread).toBe(false);
+});
+
+it("a response over the reader's byte budget splits the request and the repair completes", async () => {
+  const h = setup(40);
+  // 40 channels of 76 messages of 3,000 bytes: the roster's windows ride one
+  // request, whose response is ~10 MB, over the 8 MiB the real reader admits.
+  // Events are marked verified, as the transport would have, and recent, so
+  // the never-read channels' week-long windows reach them.
+  let sequence = 0;
+  const recent = Math.floor(Date.now() / 1000) - 3600;
+  const rows = new Map(
+    h.ids.map((id) => [
+      id,
+      Array.from(
+        { length: 76 },
+        (_, i): RelayEvent => ({
+          id: (sequence++).toString(16).padStart(64, "0"),
+          pubkey: h.peer.pubkey,
+          kind: 9,
+          created_at: recent + i,
+          content: "x".repeat(3000),
+          tags: [["h", id]],
+          sig: "0".repeat(128),
+          [verifiedSymbol]: true,
+        }),
+      ),
+    ]),
+  );
+  h.query.mockImplementation(async (filters) =>
+    filters.flatMap((filter) => {
+      const channel = filter["#h"]?.[0];
+      const since = filter.since;
+      if (!filter.kinds?.includes(9) || !channel || since === undefined)
+        return [];
+      return (rows.get(channel) ?? [])
+        .filter((event) => event.created_at >= since)
+        .slice(-filter.limit);
+    }),
+  );
+  await h.session.unread.ensure();
+  // The 41-filter request is split in two, each within the budget.
+  const windowed = h.query.mock.calls
+    .map(([filters]) => filters)
+    .filter((filters) => filters.some((filter) => filter.kinds?.includes(9)));
+  expect(windowed.map((filters) => filters.length)).toEqual([41, 21, 20]);
+  // The evidence lands, trimmed to the 8 MiB retained budget channel by
+  // channel, rather than failing the repair with nothing observed.
+  for (const id of h.ids) {
+    const snapshot = h.session.unread.snapshot({
+      kind: "channel",
+      channelId: id,
+    });
+    expect(snapshot).toMatchObject({
+      coverage: "observed",
+      freshness: "observed",
+    });
+    expect(snapshot.error).toBeUndefined();
+    expect(snapshot.observedCount).toBeGreaterThanOrEqual(50);
+    expect(snapshot.observedCount).toBeLessThanOrEqual(76);
+  }
+  expect(h.session.unread.inbox()).toMatchObject({
+    status: "ready",
+    freshness: "observed",
+  });
+  expect(h.session.unread.inbox().partial).toBeUndefined();
 });
 
 it.each(["clear", "dispose", "revoke"])(

@@ -83,7 +83,7 @@ async function setup({
         throw new DOMException("Relay read timed out", "TimeoutError");
       return filters.flatMap((filter) => {
         if (filter.authors && !filter["#e"] && !authoredPage) return [];
-        return store
+        const matched = store
           .filter(
             (item) =>
               (!filter.kinds || filter.kinds.includes(item.kind)) &&
@@ -96,6 +96,16 @@ async function setup({
           )
           .sort((a, b) => b.created_at - a.created_at)
           .slice(0, filter.limit);
+        // `include_aux`: the relay adds the deletions of what matched.
+        const ids = matched.map((item) => item.id);
+        return filter.include_aux
+          ? [
+              ...matched,
+              ...store.filter(
+                (item) => item.kind === 5 && tagged(item, "e", ids),
+              ),
+            ]
+          : matched;
       });
     }),
   };
@@ -218,46 +228,122 @@ it("a read reply whose root the windows dropped groups under its fetched root", 
   ).toHaveLength(1);
 });
 
-it("a full budget evicts the oldest unpinned evidence and keeps the viewer's thread", async () => {
+it("a full budget evicts the busiest channel's oldest ordinary evidence, never a quiet channel's only message or the viewer's thread", async () => {
   const h = await setup({
-    channels: ["quiet", "busy"],
-    frontiers: { quiet: 1015, busy: 1500 },
+    channels: ["quiet", "lone", "busy"],
+    frontiers: { quiet: 1015, lone: 1500, busy: 1500 },
   });
   const root = event("quiet", peer, 1000);
   const mine = reply("quiet", viewer, 1010, root);
   const answer = reply("quiet", peer, 1020, root);
-  h.store.push(root, mine, answer, ...flood("quiet", 120, 1100));
+  const only = event("lone", peer, 1600);
+  h.store.push(root, mine, answer, ...flood("quiet", 120, 1100), only);
   const windowed = flood("busy", 10, 2000);
   h.store.push(...windowed);
   await h.owner.capability.ensure();
   const inbox = () => h.owner.capability.inbox();
+  const snapshot = (channelId: string) =>
+    h.owner.capability.snapshot({ kind: "channel", channelId });
+  const unread = (channelId: string, id: string | undefined) =>
+    h.owner.capability.attention(channelId, id ?? "").unread;
   expect(inbox().items).toContainEqual(
     expect.objectContaining({ rootId: root.id }),
   );
-  // Live traffic of large messages passes the 8 MiB budget. Only what goes
-  // first is evicted: the quiet channel's window rows, then the oldest of the
-  // large messages, never the viewer's thread.
-  const large = Array.from({ length: 20 }, (_, i) =>
-    event("busy", peer, 3000 + i, [], "x".repeat(450_000)),
-  );
-  h.owner.accept(large);
-  const snapshot = (channelId: string) =>
-    h.owner.capability.snapshot({ kind: "channel", channelId });
+  expect(snapshot("lone").observedCount).toBe(1);
+  expect(snapshot("quiet").observedCount).toBe(101);
+  // Live traffic fills the event budget. Only what goes first is evicted: the
+  // busy channel's own older traffic, since it holds the most — never the
+  // lone channel's one unread message, whose count would otherwise become a
+  // confident zero, nor the quiet channel's window or the viewer's thread.
+  const live = flood("busy", 4096, 3000);
+  h.owner.accept(live);
   expect(inbox().freshness).toBe("observed");
   expect(inbox().error).toBeUndefined();
   expect(inbox().items).toContainEqual(
     expect.objectContaining({ rootId: root.id, unreadCount: 1 }),
   );
-  expect(snapshot("quiet").observedCount).toBeLessThan(120);
-  const busy = snapshot("busy");
-  expect(busy.observedCount).toBeGreaterThan(0);
-  expect(busy.observedCount).toBeLessThan(30);
-  const newest = large.at(-1);
-  assert(newest);
-  expect(h.owner.capability.attention("busy", newest.id).unread).toBe(true);
-  expect(
-    h.owner.capability.attention("busy", windowed[0]?.id ?? "").unread,
-  ).toBe(false);
+  expect(snapshot("lone")).toMatchObject({
+    observedCount: 1,
+    coverage: "observed",
+  });
+  expect(snapshot("quiet").observedCount).toBe(101);
+  expect(snapshot("busy").observedCount).toBe(4096 - 103 - 1);
+  expect(unread("busy", live.at(-1)?.id)).toBe(true);
+  expect(unread("busy", windowed[0]?.id)).toBe(false);
+  expect(unread("lone", only.id)).toBe(true);
+  // The byte budget evicts the same way: large live messages push out the
+  // busy channel's oldest, not the other channels' evidence.
+  const large = Array.from({ length: 20 }, (_, i) =>
+    event("busy", peer, 9000 + i, [], "x".repeat(450_000)),
+  );
+  h.owner.accept(large);
+  expect(snapshot("lone").observedCount).toBe(1);
+  expect(snapshot("quiet").observedCount).toBe(101);
+  expect(snapshot("busy").observedCount).toBeLessThan(30);
+  expect(unread("busy", large.at(-1)?.id)).toBe(true);
+  expect(unread("busy", live.at(-1)?.id)).toBe(false);
+  // A refresh reads the windows again; what is retained stays known.
+  await h.owner.capability.refresh();
+  expect(snapshot("lone").observedCount).toBe(1);
+  expect(inbox().items).toContainEqual(
+    expect.objectContaining({ rootId: root.id, unreadCount: 1 }),
+  );
+});
+
+it("an edit or deletion of a pinned message is admitted once pinned evidence fills the budget", async () => {
+  const h = await setup({
+    channels: ["c0", "c1"],
+    frontiers: { c0: 1015, c1: 100 },
+  });
+  const lone = event("c1", peer, 500);
+  h.store.push(lone);
+  // Two of the viewer's threads: the older one's root and reply go first.
+  const older = event("c0", peer, 1000);
+  const mineOlder = reply("c0", viewer, 1010, older);
+  const root = event("c0", peer, 2000);
+  const mine = reply("c0", viewer, 2010, root);
+  const answers = Array.from({ length: 3 }, (_, i) =>
+    reply("c0", peer, 2020 + i, root),
+  );
+  h.store.push(older, mineOlder, root, mine, ...answers);
+  await h.owner.capability.ensure();
+  // Live replies in the viewer's thread fill the event budget: every retained
+  // message is pinned.
+  const live = Array.from({ length: 4096 - 7 }, (_, i) =>
+    reply("c0", peer, 3000 + i, root),
+  );
+  const snapshot = (channelId: string) =>
+    h.owner.capability.snapshot({ kind: "channel", channelId });
+  expect(snapshot("c1").observedCount).toBe(1);
+  h.owner.accept(live);
+  const row = () =>
+    h.owner.capability.inbox().items.find((item) => item.rootId === root.id);
+  expect(row()?.unreadCount).toBe(3 + live.length);
+  // The other channel's only message went first, as nothing else was
+  // ordinary; with nothing retained, it is unknown rather than zero.
+  expect(snapshot("c1")).toMatchObject({
+    observedCount: null,
+    coverage: "unknown",
+  });
+  const [edited, newest] = live.slice(-2);
+  assert(edited && newest);
+  // The peer deletes their newest reply: the deletion is kept with its
+  // target, making room ahead of it, so the reply no longer counts.
+  const deletion = { ...event("c0", peer, 8000, [["e", newest.id]]), kind: 5 };
+  h.owner.accept([deletion]);
+  expect(h.owner.capability.attention("c0", newest.id).unread).toBe(false);
+  expect(row()?.unreadCount).toBe(3 + live.length - 1);
+  // And edits the one before it: the row shows the edited body.
+  const edit = {
+    ...event("c0", peer, 8001, [["e", edited.id]], "edited"),
+    kind: 40003,
+  };
+  h.owner.accept([edit]);
+  expect(row()).toMatchObject({
+    previewMessageId: edited.id,
+    preview: "edited",
+  });
+  expect(h.owner.capability.inbox().freshness).toBe("observed");
 });
 
 it("a window that times out once is read again in its slot and the repair completes", async () => {
@@ -431,6 +517,42 @@ it("a thread read's full-page split goes ahead of the remaining windows", async 
       ),
     ),
   );
+});
+
+it("a full page's split rereads count each reply once against the participation budget", async () => {
+  const participation = memoryThreadParticipation();
+  const h = await setup({
+    channels: ["c0"],
+    frontiers: { c0: 5000 },
+    participation,
+  });
+  // Four remembered threads of 200 replies each, all read and outside the
+  // channel window. One read of the four pages full, as does each half, and
+  // each root's own read returns its 200: 1,400 rows across the split tree,
+  // 800 of them distinct, all within the 1,024-reply budget.
+  const roots = Array.from({ length: 4 }, (_, i) =>
+    event("c0", peer, 1000 + i),
+  );
+  await participation.write(
+    new Map(roots.map((root, i) => [`c0:${root.id}`, 3000 + i])),
+  );
+  for (const root of roots) {
+    h.store.push(root, reply("c0", viewer, 1010, root));
+    for (let i = 0; i < 199; i++)
+      h.store.push(reply("c0", peer, 1100 + i, root));
+  }
+  await h.owner.capability.ensure();
+  const items = h.owner.capability.inbox().items;
+  for (const root of roots)
+    expect(items).toContainEqual(
+      expect.objectContaining({
+        rootId: root.id,
+        unreadCount: 0,
+        messageIds: expect.toSatisfy(
+          (ids: readonly string[]) => ids.length === 199,
+        ),
+      }),
+    );
 });
 
 it("a dropped first request still lets the Inbox leave loading", async () => {
@@ -624,33 +746,84 @@ it("a read reply outside the viewer's conversations fetches only its root, never
 it("remembered participation is saved and refetches the thread after the authored page moves on", async () => {
   const participation = memoryThreadParticipation();
   const write = vi.spyOn(participation, "write");
-  const frontiers = { c0: 1015 };
-  const first = await setup({ channels: ["c0"], frontiers, participation });
+  const first = await setup({
+    channels: ["c0"],
+    frontiers: { c0: 1015 },
+    participation,
+  });
   const root = event("c0", peer, 1000);
   const mine = reply("c0", viewer, 1010, root);
-  const answer = reply("c0", peer, 1020, root);
-  first.store.push(root, mine, answer, ...flood("c0", 120, 1100));
+  // A thread page of later replies: the thread read reaches none older.
+  const answers = Array.from({ length: 200 }, (_, i) =>
+    reply("c0", peer, 1020 + i, root),
+  );
+  first.store.push(root, mine, ...answers);
   await first.owner.capability.ensure();
   expect(first.owner.capability.inbox().items).toContainEqual(
-    expect.objectContaining({ rootId: root.id, unreadCount: 1 }),
+    expect.objectContaining({ rootId: root.id, unreadCount: 200 }),
   );
   // Remembered with the newest time the thread read saw.
-  expect(write).toHaveBeenCalledWith(new Map([[`c0:${root.id}`, 1020]]));
+  expect(write).toHaveBeenCalledWith(new Map([[`c0:${root.id}`, 1219]]));
   first.owner.dispose();
   // A later session: the viewer has since written a page of newer messages
-  // elsewhere, so their authored page no longer reaches the old reply.
+  // elsewhere, so their authored page no longer reaches the old reply, which
+  // the thread page ends before as well; the replies have been read since.
   const second = await setup({
     channels: ["c0"],
-    frontiers,
+    frontiers: { c0: 1300 },
     participation,
     authoredPage: false,
   });
   second.store.push(...first.store);
   await second.owner.capability.ensure();
-  expect(second.owner.capability.inbox().items).toContainEqual(
-    expect.objectContaining({ rootId: root.id, unreadCount: 1 }),
-  );
   expect(second.filters()).toContainEqual(
     expect.objectContaining({ "#h": ["c0"], "#e": [root.id] }),
+  );
+  // The viewer's membership is looked up and verified, so the read thread
+  // stays in the Inbox.
+  await vi.waitFor(() =>
+    expect(second.owner.capability.inbox().items).toContainEqual(
+      expect.objectContaining({ rootId: root.id, unreadCount: 0 }),
+    ),
+  );
+  expect(second.filters()).toContainEqual(
+    expect.objectContaining({
+      authors: [viewer],
+      "#h": ["c0"],
+      "#e": expect.arrayContaining([root.id]),
+    }),
+  );
+});
+
+it("a remembered thread the viewer's deleted reply joined leaves the Inbox after restart", async () => {
+  const participation = memoryThreadParticipation();
+  const root = event("c0", peer, 1000);
+  await participation.write(new Map([[`c0:${root.id}`, 1219]]));
+  const h = await setup({
+    channels: ["c0"],
+    frontiers: { c0: 1300 },
+    participation,
+    authoredPage: false,
+  });
+  const mine = reply("c0", viewer, 1010, root);
+  const retraction = {
+    ...event("c0", viewer, 1015, [["e", mine.id]]),
+    kind: 5,
+  };
+  h.store.push(root, mine, retraction);
+  for (let i = 0; i < 200; i++) h.store.push(reply("c0", peer, 1020 + i, root));
+  await h.owner.capability.ensure();
+  // Projecting the read replies asks for the viewer's membership; the
+  // deletion rides the answer, so no witness is kept and the thread leaves.
+  await vi.waitFor(() => {
+    h.owner.capability.inbox();
+    expect(h.filters()).toContainEqual(
+      expect.objectContaining({ authors: [viewer], "#e": [root.id] }),
+    );
+  });
+  await vi.waitFor(() =>
+    expect(
+      h.owner.capability.inbox().items.find((item) => item.rootId === root.id),
+    ).toBeUndefined(),
   );
 });
