@@ -646,6 +646,15 @@ it("deleting one of the viewer's replies keeps the membership its other replies 
   const newer = reply(h.viewer, "my newer reply", 12, agentRoot, agentRoot);
   const sibling = reply(h.peer, "same level", 700, agentRoot, agentRoot);
   relay.store.push(agentRoot, older, newer, sibling, ...busy(h, 99));
+  // The thread's page, read once the lookup finds the viewer in it, reaches
+  // neither of their replies: membership rests on the lookup alone.
+  const answer = h.query.getMockImplementation();
+  assert(answer);
+  h.query.mockImplementation(async (filters) =>
+    filters.some((filter) => filter["#e"] && !filter.authors)
+      ? []
+      : answer(filters),
+  );
   await h.session.unread.ensure();
   h.snapshot();
   const attention = () => h.session.unread.attention("other", sibling.id);

@@ -232,26 +232,53 @@ it("a thread the viewer replied in outlives its channel's later traffic and a bu
   );
 });
 
-it("a read reply whose root the windows dropped groups under its fetched root", async () => {
-  const h = await setup({ channels: ["c0"], frontiers: { c0: 1100 } });
+it("a read mention whose root the windows dropped groups under its fetched root, and its thread is read in the same repair", async () => {
+  const participation = memoryThreadParticipation();
+  const write = vi.spyOn(participation, "write");
+  const h = await setup({
+    channels: ["c0", "own"],
+    // The catch-up mark is older than the read mark, so the window reaches
+    // the read mention; its root is older still.
+    frontiers: { c0: 1100, "activity:c0": 1010 },
+    participation,
+  });
   const root = event("c0", peer, 1000);
   const mention = reply("c0", peer, 1020, root, [["p", viewer]]);
-  h.store.push(root, mention, ...flood("c0", 120, 1100));
-  await h.owner.capability.ensure();
-  // The mention feed hands the read mention over; its root is not retained.
-  h.owner.accept([mention]);
-  await vi.waitFor(() =>
-    expect(h.owner.capability.inbox().items).toContainEqual(
-      expect.objectContaining({
-        rootId: root.id,
-        messageIds: [mention.id],
-        unreadCount: 0,
-      }),
-    ),
+  h.store.push(root, mention, ...flood("c0", 80, 1100));
+  // A full authored page keeps the walk, and so the repair, reading while
+  // the mention's structure lookup lands.
+  h.store.push(
+    ...Array.from({ length: 100 }, (_, i) => event("own", viewer, 3000 + i)),
   );
+  const release = h.hold("walk");
+  const done = h.owner.capability.ensure();
+  try {
+    await vi.waitFor(() =>
+      expect(h.owner.capability.inbox().items).toContainEqual(
+        expect.objectContaining({
+          rootId: root.id,
+          messageIds: [mention.id],
+          unreadCount: 0,
+        }),
+      ),
+    );
+  } finally {
+    release();
+  }
+  await done;
   expect(h.filters()).toContainEqual(
     expect.objectContaining({ ids: [root.id] }),
   );
+  // The fetched root hands the mention's thread to the repair, which reads
+  // it and remembers it before finishing: one save, the repair's own.
+  expect(h.filters()).toContainEqual(
+    expect.objectContaining({ "#h": ["c0"], "#e": [root.id] }),
+  );
+  expect(write).toHaveBeenCalledTimes(1);
+  expect((await participation.read()).roots.get(`c0:${root.id}`)).toEqual({
+    at: 1020,
+    newestId: mention.id,
+  });
   // A single row names the thread; the mention is not its own row as well.
   expect(
     h.owner.capability.inbox().items.filter((item) => item.channelId === "c0"),
@@ -1298,4 +1325,79 @@ it("a remembered thread in a channel the roster lacks is kept through a save and
   expect((await participation.read()).roots.get(`c1:${root.id}`)?.at).toBe(
     1100,
   );
+});
+
+it("a lookup that finds the viewer's reply while the windows read puts the thread's read ahead of the remaining windows", async () => {
+  const participation = memoryThreadParticipation();
+  const wide = Array.from({ length: 256 }, (_, i) => `w${i}`);
+  const h = await setup({
+    channels: ["c0", ...wide, "hx"],
+    frontiers: {
+      c0: 1100,
+      ...Object.fromEntries(wide.map((id) => [id, 1050])),
+    },
+    participation,
+    // The viewer's reply is older than their newest page reaches: only the
+    // membership lookup finds it.
+    authoredPage: false,
+  });
+  const root = event("c0", peer, 1000);
+  const mine = reply("c0", viewer, 1010, root);
+  const answer = reply("c0", peer, 1120, root);
+  h.store.push(root, mine, answer);
+  // A remembered thread in the never-read channel: its read, and that
+  // channel's window in the last request, wait on the same hold.
+  const hroot = event("hx", peer, 2000);
+  await participation.write({
+    roots: new Map([[`hx:${hroot.id}`, { at: 2000 }]]),
+  });
+  const write = vi.spyOn(participation, "write");
+  // Requests: the viewer's page with 127 windows, the remembered thread,
+  // 128 windows, then the last windows. Holding the thread read and a
+  // window of the third request leaves the fourth queued when the first
+  // lands and its reply's lookup finds the viewer's reply.
+  const releaseThread = h.hold("hx");
+  const releaseWindow = h.hold("w200");
+  const requests = () => h.reader.read.mock.calls.map(([filters]) => filters);
+  const threadRead = (request: readonly ReadFilter[]) =>
+    request.some(
+      (filter) =>
+        !filter.authors &&
+        filter["#h"]?.[0] === "c0" &&
+        !!filter["#e"]?.includes(root.id),
+    );
+  const done = h.owner.capability.ensure();
+  try {
+    await vi.waitFor(() =>
+      expect(h.owner.capability.attention("c0", answer.id)).toMatchObject({
+        category: "thread",
+        unread: true,
+      }),
+    );
+    expect(requests().some(threadRead)).toBe(false);
+    releaseWindow();
+    await vi.waitFor(() => expect(requests().some(threadRead)).toBe(true));
+  } finally {
+    releaseThread();
+    releaseWindow();
+  }
+  await done;
+  const thread = requests().findIndex(threadRead);
+  const last = requests().findIndex((request) =>
+    request.some((filter) => filter["#h"]?.[0] === "hx" && !filter["#e"]),
+  );
+  expect(thread).toBeGreaterThan(0);
+  expect(last).toBeGreaterThan(thread);
+  const inbox = h.owner.capability.inbox();
+  expect(inbox).toMatchObject({ status: "ready", freshness: "observed" });
+  expect(inbox.partial).toBeUndefined();
+  expect(inbox.items).toContainEqual(
+    expect.objectContaining({ rootId: root.id, unreadCount: 1 }),
+  );
+  // Learned by the repair, saved once with its result.
+  expect(write).toHaveBeenCalledTimes(1);
+  expect((await participation.read()).roots.get(`c0:${root.id}`)).toEqual({
+    at: 1120,
+    newestId: answer.id,
+  });
 });

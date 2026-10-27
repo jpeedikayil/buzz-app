@@ -410,6 +410,9 @@ export function createUnread({
       rootId: string | undefined;
       ids: Set<string>;
       structuralOnly: boolean;
+      /** The reply whose root this structure lookup fetches, when its thread
+       * is one the participation pass would learn from it. */
+      taught: { at: number; id: string } | undefined;
     }
   >();
   // The viewer's own deleted messages, so neither a stored lookup result nor
@@ -1446,6 +1449,13 @@ export function createUnread({
       rootId,
       ids,
       structuralOnly: structuralRecovery,
+      // A mention or a reply in the viewer's conversation teaches the pass
+      // its thread, as retained evidence does (see `participating().learn`);
+      // a read reply outside them only needs its root to group under.
+      taught:
+        structuralRecovery && (entry.mentioned || conversation(entry))
+          ? { at: event.created_at, id: event.id }
+          : undefined,
     });
     if (scheduled || retry) return;
     scheduled = true;
@@ -1639,6 +1649,15 @@ export function createUnread({
         const mine = replies.filter(
           (event) => event.pubkey === viewer && live(event),
         );
+        // What this batch teaches the repair's participation pass: a thread
+        // the viewer's reply was found in, or one a fetched root now holds.
+        // Its read goes ahead of the windows still queued, or runs as a
+        // follow-up once the repair's pool has finished.
+        const run = activePass?.generation === epoch ? activePass : undefined;
+        const taught: ReadFilter[][] = [];
+        const feed = (key: string, at: number, id: string) => {
+          if (run) taught.push(...run.pass.feed(key, at, id));
+        };
         for (const target of parents) {
           if (target.structuralOnly) {
             remember(
@@ -1650,6 +1669,12 @@ export function createUnread({
                 more: false,
               },
             );
+            if (target.taught && structural(target.parentId))
+              feed(
+                conversationKey(channelId, target.parentId),
+                target.taught.at,
+                target.taught.id,
+              );
             continue;
           }
           const found = mine.filter((event) => decides(event, target));
@@ -1675,7 +1700,18 @@ export function createUnread({
             undefined,
           );
           const chosen = authored[0] ?? newest;
-          if (chosen) witness(lookup, chosen);
+          if (chosen) {
+            witness(lookup, chosen);
+            feed(
+              conversationKey(channelId, target.rootId ?? target.parentId),
+              chosen.created_at,
+              chosen.id,
+            );
+          }
+        }
+        if (run && taught.length) {
+          run.queue.unshift(...taught);
+          if (!run.pooling) void followUp(run);
         }
         indexed = false;
         publish(new Set([channelId]));
@@ -2012,8 +2048,8 @@ export function createUnread({
       /** Whole reads of the newest roots not yet asked for, with roots the
        * retained evidence lacks fetched by ID so replies group and open under
        * them. */
-      hot() {
-        const groups = group(newest().slice(0, HOT_THREADS));
+      hot(keys = newest().slice(0, HOT_THREADS)) {
+        const groups = group(keys);
         const missing = [...groups.values()]
           .flat()
           .filter((rootId) => !structural(rootId));
@@ -2031,19 +2067,28 @@ export function createUnread({
        * replies since the newest time seen in it, inclusive: a reply in the
        * same second as that one is not passed over, and the one seen returns
        * too, to be passed over by ID. */
-      cold() {
+      cold(keys = newest().slice(HOT_THREADS)) {
         return chunk(
-          [...group(newest().slice(HOT_THREADS))].flatMap(
-            ([channelId, rootIds]) =>
-              rootIds.map((rootId) => {
-                const key = `${channelId}:${rootId}`;
-                const mark = roots.get(key);
-                if (mark?.newestId) boundary.set(key, mark.newestId);
-                return threads(channelId, [rootId], mark?.at ?? 0);
-              }),
+          [...group(keys)].flatMap(([channelId, rootIds]) =>
+            rootIds.map((rootId) => {
+              const key = `${channelId}:${rootId}`;
+              const mark = roots.get(key);
+              if (mark?.newestId) boundary.set(key, mark.newestId);
+              return threads(channelId, [rootId], mark?.at ?? 0);
+            }),
           ),
           UNREAD_WINDOW_BATCH,
         );
+      },
+      /** Learns a thread a lookup found the viewer in, or fetched the root
+       * of, and returns its read when not yet asked for: whole when it ranks
+       * among the hot threads, since its newest time otherwise. */
+      feed(key: string, at: number, id: string): ReadFilter[][] {
+        learn(key, at, id);
+        if (fetched.has(key)) return [];
+        const rank = newest().indexOf(key);
+        if (rank < 0) return [];
+        return rank < HOT_THREADS ? this.hot([key]) : this.cold([key]);
       },
       landed(
         request: readonly ReadFilter[],
@@ -2185,6 +2230,48 @@ export function createUnread({
       },
     };
   }
+  /** The newest repair's participation pass, with the queue its reads are
+   * pooled from and whether a pool is draining it. A lookup that lands while
+   * the repair reads puts the thread it taught at the queue's head, ahead of
+   * the remaining windows; one that lands later starts a follow-up. Retired
+   * with its access epoch; the next repair replaces it. */
+  type Run = {
+    pass: ReturnType<typeof participating>;
+    generation: number;
+    queue: ReadFilter[][];
+    pooling: boolean;
+  };
+  let activePass: Run | undefined;
+  /** Reads what lookups taught after the repair finished, in the background,
+   * each request once, and saves the threads learned; what a dropped read
+   * leaves is the next repair's. The Inbox's loading, freshness, partial
+   * notice and error are the repair's alone. A `landed` publish may queue
+   * more lookups, whose answers join the queue while it drains. A repair
+   * that starts meanwhile replaces the run and reads what it remembers. */
+  async function followUp(run: Run) {
+    if (run.pooling) return;
+    run.pooling = true;
+    const current = () =>
+      !closed && activePass === run && run.generation === epoch;
+    try {
+      while (run.queue.length && current()) {
+        await pool(
+          run.queue,
+          run.generation,
+          "background",
+          { landed: false, dropped: true, failure: undefined },
+          (request, result, queue) =>
+            current() &&
+            (result === undefined || run.pass.landed(request, result, queue)),
+        );
+        if (!current()) return;
+        run.pass.learn();
+        run.pass.save();
+      }
+    } finally {
+      run.pooling = false;
+    }
+  }
   async function repair(priority: Priority = "foreground") {
     requested = true;
     if (closed) return;
@@ -2257,6 +2344,8 @@ export function createUnread({
         requests.splice(1, 0, ...hot);
         requests.push(...pass.cold());
         remembered = pass.roots;
+        const run: Run = { pass, generation, queue: requests, pooling: true };
+        activePass = run;
         // Once those have landed, or were dropped, the Inbox is no longer
         // loading; the windows still reading show as `observing`.
         const first = new Set<readonly ReadFilter[]>(
@@ -2322,31 +2411,35 @@ export function createUnread({
         ) => {
           if (first.delete(request)) for (const part of parts) first.add(part);
         };
-        if (
-          !(await pool(
-            requests,
-            generation,
-            priority,
-            progress,
-            landed,
-            divided,
-          ))
-        )
-          return;
-        // Threads the windows and the walk newly taught: on a device's first
-        // repair, the threads the viewer replied in before their newest page.
-        pass.learn();
-        if (
-          !(await pool(
-            [...pass.hot(), ...pass.cold()],
-            generation,
-            priority,
-            progress,
-            landed,
-            divided,
-          ))
-        )
-          return;
+        // The queue is drained until it stays empty: a lookup may put a
+        // thread read at its head between a worker finding it empty and the
+        // pool returning.
+        const drain = async () => {
+          while (requests.length)
+            if (
+              !(await pool(
+                requests,
+                generation,
+                priority,
+                progress,
+                landed,
+                divided,
+              ))
+            )
+              return false;
+          return true;
+        };
+        try {
+          if (!(await drain())) return;
+          // Threads the windows and the walk newly taught: on a device's
+          // first repair, the threads the viewer replied in before their
+          // newest page.
+          pass.learn();
+          requests.push(...pass.hot(), ...pass.cold());
+          if (!(await drain())) return;
+        } finally {
+          run.pooling = false;
+        }
         // Nothing landed: nothing was observed, so the repair failed.
         if (!progress.landed) throw progress.failure;
         pass.learn();
@@ -3390,6 +3483,7 @@ export function createUnread({
       resetLookups();
       repairAgain = false;
       indexed = false;
+      activePass = undefined;
       remembered = undefined;
       persisted = undefined;
       partial = false;
@@ -3408,6 +3502,7 @@ export function createUnread({
       channelReadGenerations.clear();
       lifetime.abort();
       resetLookups();
+      activePass = undefined;
       membershipListeners.clear();
       for (const stop of [...handles]) stop();
       stopRead();

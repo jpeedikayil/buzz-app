@@ -151,8 +151,13 @@ same pass are dropped at once. A repair in which no read lands fails
 instead, keeping the previous evidence and its stale freshness. While a
 repair runs, a reply whose root is not yet retained is not shown as a row
 of its own; it appears under its root once the thread read or lookup brings
-it. When the budget is full, the oldest evidence outside those threads goes
-first; the observation completes rather than resetting. A lazy addressed query returns up to 50 kind-9/40002
+it. A lookup that finds the viewer's reply in a thread, or fetches the root
+of a thread they were mentioned or answered in, hands that thread to the
+running repair, which reads it ahead of the remaining windows; after the
+repair it is read in the background and remembered at once, so it stays in
+the Inbox without a refresh. When the budget is full, the oldest evidence
+outside those threads goes first; the observation completes rather than
+resetting. A lazy addressed query returns up to 50 kind-9/40002
 messages. For those exact IDs and unresolved failed targets, general `#e`
 queries page signed kind-40003 edits and kind-5/9005 deletions, then deletions
 of the edits; `include_aux` on an ordinary `#p` query is not a supported relay
