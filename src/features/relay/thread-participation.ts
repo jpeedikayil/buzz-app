@@ -1,6 +1,7 @@
-/** The newest message time seen in a thread and, when known, the ID of the
- * newest reply seen at that time: a read since the time is inclusive, and
- * the reply with that ID is the one already seen. */
+/** The newest time of a reply the viewer wrote or read in a thread (or of
+ * its root) and, when known, the ID of the newest reply at that time: a read
+ * since the time is inclusive, and the reply with that ID is the one already
+ * read. An unread reply advances neither, so it is read again until read. */
 export type ThreadMark = Readonly<{ at: number; newestId?: string }>;
 /** Threads the viewer is part of, keyed `channel:root` with the newest
  * message seen in each: written or replied in, mentioned in, or explicitly

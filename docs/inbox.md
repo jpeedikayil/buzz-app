@@ -132,16 +132,17 @@ was mentioned or answered in, or follows—are remembered per relay and viewer
 on this device, at most 1,000 threads, so they stay in the Inbox after their
 channel's window has moved on: the 50 most recently active are refetched
 whole on every repair, before the channel windows, and the rest are asked
-only for replies since the newest one last seen, behind the windows—that
-reply is remembered by ID and passed over when it returns, so a reply in the
-same second is not missed and a quiet thread costs nothing on later launches.
-A device's
-first repair also walks back through the viewer's own messages, behind the
-windows, to learn the threads they replied in before their most recent
-messages; later repairs read only what they wrote since. The windows, the
-viewer's own recent messages and the thread reads ride together, up to 128
-filters per request with two requests in flight, so a roster costs one or two
-round trips. The Inbox is ready once the viewer's own recent messages and the
+only for replies since the newest one the viewer wrote or read, behind the
+windows—that reply is remembered by ID and passed over when it returns, so a
+reply in the same second is not missed and a quiet thread costs nothing on
+later launches, while a thread's unread replies return on every repair until
+they are read. A device's first repair also walks back through the viewer's
+own messages, behind the windows, to learn the threads they replied in before
+their most recent messages; later repairs read only what they wrote since.
+The windows, the viewer's own recent messages and the thread reads ride
+together, up to 128 filters per request with two requests in flight, so a
+roster costs one or two round trips. The Inbox is ready once the viewer's own
+recent messages and the
 most recently active remembered threads have landed, or were dropped, and
 reports `observing` while further windows still read. A
 read that fails is tried once more; dropped after that, its channels stay as

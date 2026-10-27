@@ -412,7 +412,7 @@ export function createUnread({
       structuralOnly: boolean;
       /** The reply whose root this structure lookup fetches, when its thread
        * is one the participation pass would learn from it. */
-      taught: { at: number; id: string } | undefined;
+      taught: RelayEvent | undefined;
     }
   >();
   // The viewer's own deleted messages, so neither a stored lookup result nor
@@ -1454,7 +1454,7 @@ export function createUnread({
       // a read reply outside them only needs its root to group under.
       taught:
         structuralRecovery && (entry.mentioned || conversation(entry))
-          ? { at: event.created_at, id: event.id }
+          ? event
           : undefined,
     });
     if (scheduled || retry) return;
@@ -1655,8 +1655,8 @@ export function createUnread({
         // follow-up once the repair's pool has finished.
         const run = activePass?.generation === epoch ? activePass : undefined;
         const taught: ReadFilter[][] = [];
-        const feed = (key: string, at: number, id: string) => {
-          if (run) taught.push(...run.pass.feed(key, at, id));
+        const feed = (key: string, event: RelayEvent) => {
+          if (run) taught.push(...run.pass.feed(key, event));
         };
         for (const target of parents) {
           if (target.structuralOnly) {
@@ -1670,11 +1670,7 @@ export function createUnread({
               },
             );
             if (target.taught && structural(target.parentId))
-              feed(
-                conversationKey(channelId, target.parentId),
-                target.taught.at,
-                target.taught.id,
-              );
+              feed(conversationKey(channelId, target.parentId), target.taught);
             continue;
           }
           const found = mine.filter((event) => decides(event, target));
@@ -1704,8 +1700,7 @@ export function createUnread({
             witness(lookup, chosen);
             feed(
               conversationKey(channelId, target.rootId ?? target.parentId),
-              chosen.created_at,
-              chosen.id,
+              chosen,
             );
           }
         }
@@ -1752,12 +1747,15 @@ export function createUnread({
   // fetched by ID once a reply arrives. Across threads, only the newest
   // PARTICIPATION_BUDGET replies are admitted per repair, the most recently
   // active threads having been asked first and each thread asked its newest
-  // unread reply before the rest: pinned evidence must leave the channel
+  // unread reply before the rest, with at most PARTICIPATION_RESERVE slots
+  // kept for the reads still to land, so a large cold set (mostly empty) does
+  // not starve the hot landing: pinned evidence must leave the channel
   // windows at least three quarters of the retained budget.
   const THREAD_LIMIT = 200;
   const HOT_THREADS = 50;
   const COLD_LIMIT = 50;
   const PARTICIPATION_BUDGET = 1024;
+  const PARTICIPATION_RESERVE = PARTICIPATION_BUDGET / 4;
   // The walk over the viewer's authored history teaches the threads they
   // replied in. A device's first repair pages back from the authored page in
   // the first request, SEED_PAGE a page behind the windows, until a short
@@ -1890,12 +1888,14 @@ export function createUnread({
     };
   }
   /** One repair's view of the threads the viewer is part of, keyed
-   * `channel:root` with the newest time seen in each and the newest reply
-   * seen at it. Roots start as those remembered from earlier repairs and
-   * explicit follows (a follow carries no time, so one first seen here is as
-   * recent as this repair), and grow with what this repair's evidence and
-   * walk teach: the viewer's replies, replies that mention the viewer, and
-   * replies in the viewer's conversations.
+   * `channel:root` with the newest time of a reply the viewer wrote or read
+   * in each (or of its root) and the newest reply at it: an unread reply
+   * advances nothing, so it stays at or above its cold read's `since` and
+   * returns each repair until read. Roots start as those remembered from
+   * earlier repairs and explicit follows (a follow carries no time, so one
+   * first seen here is as recent as this repair), and grow with what this
+   * repair's evidence and walk teach: the viewer's replies, replies that
+   * mention the viewer, and replies in the viewer's conversations.
    * Unfollowed threads are forgotten; threads in channels the roster lacks
    * are neither read nor forgotten, since the walk mark advances past the
    * viewer's replies in them. The newest are read and remembered. */
@@ -1911,16 +1911,43 @@ export function createUnread({
     for (const [key, following] of choices())
       if (following && !roots.has(key) && active(key))
         roots.set(key, { at: seen });
-    // Of replies in the same second, the first by `byTime` is the newest.
-    const learn = (key: string, at: number, id: string) => {
+    /** A peer's reply the viewer has not read, by the marks the Inbox counts
+     * with: `msg:`, channel, `thread:` and `thread-activity:` frontiers. */
+    const unreadReply = (event: RelayEvent, key: string, state: ReadState) => {
+      const separator = key.indexOf(":");
+      const rootId = key.slice(separator + 1);
+      return (
+        event.pubkey !== viewer &&
+        event.created_at >
+          Math.max(
+            effectiveFrontier(
+              state,
+              `msg:${event.id}`,
+              key.slice(0, separator),
+              rootId,
+            ) ?? -1,
+            state.frontiers[`thread-activity:${rootId}`] ?? -1,
+          )
+      );
+    };
+    // Of replies in the same second, the first by `byTime` is the newest. A
+    // thread in a channel the roster lacks is learned, not read: the walk
+    // mark advances past the viewer's replies in it. A thread only an unread
+    // reply teaches is remembered as of its root, when that is held.
+    const learn = (key: string, event: RelayEvent) => {
+      if (!followed(key)) return;
+      if (threadReference(event) && unreadReply(event, key, reads.state())) {
+        const root = structural(key.slice(key.indexOf(":") + 1));
+        if (root && !threadReference(root) && !roots.has(key)) learn(key, root);
+        return;
+      }
+      const { created_at: at, id } = event;
       const mark = roots.get(key);
       if (
-        active(key) &&
-        (!mark ||
-          at > mark.at ||
-          (at === mark.at &&
-            (mark.newestId === undefined ||
-              id.localeCompare(mark.newestId) < 0)))
+        !mark ||
+        at > mark.at ||
+        (at === mark.at &&
+          (mark.newestId === undefined || id.localeCompare(mark.newestId) < 0))
       )
         roots.set(key, { at, newestId: id });
     };
@@ -2026,11 +2053,7 @@ export function createUnread({
             const channelId = channelOf(event);
             const reference = threadReference(event);
             if (channelId && reference)
-              learn(
-                conversationKey(channelId, reference.rootId),
-                event.created_at,
-                event.id,
-              );
+              learn(conversationKey(channelId, reference.rootId), event);
           }
           const oldest = page.at(-1);
           // Ending at SEED_PAGES with a full page is the one case the mark
@@ -2088,8 +2111,8 @@ export function createUnread({
       /** Learns a thread a lookup found the viewer in, or fetched the root
        * of, and returns its read when not yet asked for: whole when it ranks
        * among the hot threads, since its newest time otherwise. */
-      feed(key: string, at: number, id: string): ReadFilter[][] {
-        learn(key, at, id);
+      feed(key: string, event: RelayEvent): ReadFilter[][] {
+        learn(key, event);
         if (fetched.has(key)) return [];
         const rank = newest().indexOf(key);
         if (rank < 0) return [];
@@ -2114,7 +2137,10 @@ export function createUnread({
         });
         for (const key of asked) pending.delete(key);
         if (!result) return true;
-        const reserve = [...pending].filter((key) => !held.has(key)).length;
+        const reserve = Math.min(
+          [...pending].filter((key) => !held.has(key)).length,
+          PARTICIPATION_RESERVE,
+        );
         // A full page may hide replies under a filter's other roots, or
         // older than a lone root's `since` page reaches; the roots are asked
         // for again and keep their slots.
@@ -2144,8 +2170,10 @@ export function createUnread({
             { ...filter, "#e": rootIds.slice(half) },
           ]);
         }
-        // A cold read's boundary reply was seen by an earlier repair and is
-        // passed over. Replies already retained cost the budget nothing: one
+        // A cold read's boundary reply was read by an earlier repair and is
+        // passed over; one still unread (a record from before unread replies
+        // kept their place, or a thread marked unread since) is admitted.
+        // Replies already retained cost the budget nothing: one
         // a window read, or one this pass admitted. Of the rest, each root
         // holding no admitted reply yet is given its newest unread reply, or
         // its newest, most recently active threads first; then the rest are
@@ -2159,9 +2187,14 @@ export function createUnread({
           const rootId = threadReference(event)?.rootId;
           return channelId && rootId ? `${channelId}:${rootId}` : undefined;
         };
+        const state = reads.state();
         const seen = (event: RelayEvent) => {
           const key = keyOf(event);
-          return key !== undefined && boundary.get(key) === event.id;
+          return (
+            key !== undefined &&
+            boundary.get(key) === event.id &&
+            !unreadReply(event, key, state)
+          );
         };
         const fresh = result.filter((event) => !seen(event));
         const candidates = fresh
@@ -2175,24 +2208,6 @@ export function createUnread({
           const key = keyOf(event);
           if (key) byRoot.set(key, [...(byRoot.get(key) ?? []), event]);
         }
-        const state = reads.state();
-        const unread = (event: RelayEvent, key: string) => {
-          const separator = key.indexOf(":");
-          const rootId = key.slice(separator + 1);
-          return (
-            event.pubkey !== viewer &&
-            event.created_at >
-              Math.max(
-                effectiveFrontier(
-                  state,
-                  `msg:${event.id}`,
-                  key.slice(0, separator),
-                  rootId,
-                ) ?? -1,
-                state.frontiers[`thread-activity:${rootId}`] ?? -1,
-              )
-          );
-        };
         const room = () => PARTICIPATION_BUDGET - reserve - admitted.size;
         const replies: RelayEvent[] = [];
         const admit = (event: RelayEvent, key: string | undefined) => {
@@ -2205,7 +2220,10 @@ export function createUnread({
         )) {
           const [newest] = events;
           if (!newest || held.has(key) || room() <= 0) continue;
-          admit(events.find((event) => unread(event, key)) ?? newest, key);
+          admit(
+            events.find((event) => unreadReply(event, key, state)) ?? newest,
+            key,
+          );
         }
         for (const event of candidates) {
           if (room() <= 0) break;
@@ -2249,7 +2267,7 @@ export function createUnread({
               conversation(entry) ||
               roots.has(key)
             )
-              learn(key, entry.event.created_at, entry.event.id);
+              learn(key, entry.event);
           }
         for (const event of rows.values()) {
           const channelId = channelOf(event);
@@ -2258,7 +2276,7 @@ export function createUnread({
             : undefined;
           if (!channelId || !reference) continue;
           const key = conversationKey(channelId, reference.rootId);
-          if (roots.has(key)) learn(key, event.created_at, event.id);
+          if (roots.has(key)) learn(key, event);
         }
       },
       /** The newest roots become the remembered threads, with the walk mark
@@ -2278,7 +2296,6 @@ export function createUnread({
           roots: nextRoots,
           ...(walk ? { walk } : {}),
         };
-        remembered = nextRoots;
         if (
           persisted?.roots.size !== nextRoots.size ||
           [...nextRoots].some(([key, mark]) => {
