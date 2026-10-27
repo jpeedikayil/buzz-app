@@ -8,7 +8,10 @@ import {
   readJournal,
   type ReadJournal,
 } from "./read-state-storage";
-import { memoryThreadParticipation } from "./thread-participation";
+import {
+  memoryThreadParticipation,
+  type ThreadMark,
+} from "./thread-participation";
 import { createUnread } from "./unread";
 
 // Repair's evidence reads: per-channel windows since each channel's read mark
@@ -452,7 +455,9 @@ it("a window dropped after its retry leaves its channel unknown and the Inbox pa
 it("reads the viewer's page with 127 windows first, remembered and newly taught threads next, then the remaining windows", async () => {
   const participation = memoryThreadParticipation();
   const remembered = "f".repeat(64);
-  await participation.write({ roots: new Map([[`c1:${remembered}`, 1000]]) });
+  await participation.write({
+    roots: new Map([[`c1:${remembered}`, { at: 1000 }]]),
+  });
   const h = await setup({
     channels: ["never1", "c1", "c2", "c3", "never2", ...filler],
     frontiers: { c1: 1100, c2: 1300, c3: 1200, ...fillerFrontiers },
@@ -501,7 +506,7 @@ it("a thread read's full-page split goes ahead of the remaining windows", async 
   });
   const roots = [event("c1", peer, 1000), event("c1", peer, 1001)];
   await participation.write({
-    roots: new Map(roots.map((root, i) => [`c1:${root.id}`, 2000 + i])),
+    roots: new Map(roots.map((root, i) => [`c1:${root.id}`, { at: 2000 + i }])),
   });
   // Each root has a full page of replies, so one read of both overflows.
   for (const root of roots)
@@ -561,7 +566,7 @@ it("a full page's split rereads count each reply once against the participation 
     event("c0", peer, 1000 + i),
   );
   await participation.write({
-    roots: new Map(roots.map((root, i) => [`c0:${root.id}`, 3000 + i])),
+    roots: new Map(roots.map((root, i) => [`c0:${root.id}`, { at: 3000 + i }])),
   });
   for (const root of roots) {
     h.store.push(root, reply("c0", viewer, 1010, root));
@@ -690,8 +695,8 @@ it("remembers threads the viewer took part in, not every message they wrote", as
   // The walk mark is the newest message the viewer wrote.
   expect(await participation.read()).toEqual({
     roots: new Map([
-      [`c0:${asked.id}`, 1020],
-      [`c0:${theirs.id}`, 1040],
+      [`c0:${asked.id}`, { at: 1020, newestId: answer.id }],
+      [`c0:${theirs.id}`, { at: 1040, newestId: mine.id }],
     ]),
     walk: { since: 1040 },
   });
@@ -715,7 +720,7 @@ it("a followed thread is remembered as of the follow and refetched", async () =>
   h.owner.capability.follow("c0", root.id, true);
   await h.owner.capability.refresh();
   expect(await participation.read()).toEqual({
-    roots: new Map([[`c0:${root.id}`, NOW]]),
+    roots: new Map([[`c0:${root.id}`, { at: NOW }]]),
   });
   expect(h.filters()).toContainEqual(
     expect.objectContaining({ "#h": ["c0"], "#e": [root.id] }),
@@ -793,9 +798,11 @@ it("remembered participation is saved and refetches the thread after the authore
   expect(first.owner.capability.inbox().items).toContainEqual(
     expect.objectContaining({ rootId: root.id, unreadCount: 200 }),
   );
-  // Remembered with the newest time the thread read saw.
+  // Remembered with the newest reply the thread read saw.
   expect(write).toHaveBeenCalledWith({
-    roots: new Map([[`c0:${root.id}`, 1219]]),
+    roots: new Map([
+      [`c0:${root.id}`, { at: 1219, newestId: answers[199]?.id }],
+    ]),
     walk: { since: 1010 },
   });
   first.owner.dispose();
@@ -832,7 +839,9 @@ it("remembered participation is saved and refetches the thread after the authore
 it("a remembered thread the viewer's deleted reply joined leaves the Inbox after restart", async () => {
   const participation = memoryThreadParticipation();
   const root = event("c0", peer, 1000);
-  await participation.write({ roots: new Map([[`c0:${root.id}`, 1219]]) });
+  await participation.write({
+    roots: new Map([[`c0:${root.id}`, { at: 1219 }]]),
+  });
   const h = await setup({
     channels: ["c0"],
     frontiers: { c0: 1300 },
@@ -951,12 +960,12 @@ it("a device's first repair walks the viewer's history behind the windows, remem
     expect.objectContaining({ "#h": ["b"], "#e": [quiet.id], since: 2001 }),
   );
   // Each cold read is inclusive of the thread's newest time, which the walk
-  // taught from the viewer's reply without retaining it, so that reply
-  // returns and every root is fetched once.
+  // taught from the viewer's reply, so that reply returns and is passed over
+  // by ID: the hot roots and the answered thread's are the ones fetched.
   const fetched = h.filters().flatMap((filter) => filter.ids ?? []);
-  expect(fetched).toHaveLength(140);
+  expect(fetched).toHaveLength(51);
   expect(fetched).toContain(oldest.id);
-  expect(fetched).toContain(quiet.id);
+  expect(fetched).not.toContain(quiet.id);
   const inbox = () => h.owner.capability.inbox();
   expect(inbox()).toMatchObject({ status: "ready", freshness: "observed" });
   expect(inbox().partial).toBeUndefined();
@@ -982,7 +991,14 @@ it("a device's first repair walks the viewer's history behind the windows, remem
   ).toBe(0);
   const saved = await participation.read();
   expect(saved.roots.size).toBe(140);
-  expect(saved.roots.get(`a:${oldest.id}`)).toBe(9500);
+  expect(saved.roots.get(`a:${oldest.id}`)).toEqual({
+    at: 9500,
+    newestId: answer.id,
+  });
+  expect(saved.roots.get(`b:${quiet.id}`)).toEqual({
+    at: 2001,
+    newestId: h.store.find((item) => item.created_at === 2001)?.id,
+  });
   expect(saved.walk).toEqual({ since: 3479 });
   h.owner.dispose();
   // The next repair reads only what was authored since the walk — the mark
@@ -1056,13 +1072,17 @@ async function coldThread(
   channelId: string,
   root: RelayEvent,
   at: number,
+  newestId?: string,
 ) {
-  const newer = Array.from({ length: 50 }, (_, i): [string, number] => [
+  const newer = Array.from({ length: 50 }, (_, i): [string, ThreadMark] => [
     `${channelId}:${"f".repeat(60)}${i.toString(16).padStart(4, "0")}`,
-    5000 + i,
+    { at: 5000 + i },
   ]);
   await participation.write({
-    roots: new Map([...newer, [`${channelId}:${root.id}`, at]]),
+    roots: new Map([
+      ...newer,
+      [`${channelId}:${root.id}`, newestId ? { at, newestId } : { at }],
+    ]),
     walk: { since: 6000 },
   });
 }
@@ -1107,7 +1127,58 @@ it("a cold thread's read is inclusive of its newest time, so a peer reply in the
       }),
     ),
   );
-  expect((await participation.read()).roots.get(`c0:${root.id}`)).toBe(1010);
+  // Of the two replies in that second, the viewer's sorts first.
+  expect((await participation.read()).roots.get(`c0:${root.id}`)).toEqual({
+    at: 1010,
+    newestId: mine.id,
+  });
+});
+
+it("a cold thread's boundary reply returns to a warm repair and is passed over by ID, while a new reply in the same second is admitted", async () => {
+  const participation = memoryThreadParticipation();
+  const root = event("c0", peer, 1000);
+  const mine = reply("c0", viewer, 1005, root);
+  const boundary = reply("c0", peer, 1010, root);
+  await coldThread(participation, "c0", root, 1010, boundary.id);
+  const h = await setup({
+    channels: ["c0"],
+    frontiers: { c0: 1005 },
+    participation,
+  });
+  h.store.push(root, mine, boundary, ...flood("c0", 100, 2000));
+  await h.owner.capability.ensure();
+  const fetched = () => h.filters().flatMap((filter) => filter.ids ?? []);
+  const inbox = () => h.owner.capability.inbox();
+  // The read returned the boundary reply alone: no root fetched, no row.
+  expect(coldReads(h, root)).toEqual([
+    expect.objectContaining({ "#e": [root.id], since: 1010 }),
+  ]);
+  expect(inbox()).toMatchObject({ status: "ready", freshness: "observed" });
+  expect(fetched()).not.toContain(root.id);
+  expect(inbox().items.find((item) => item.rootId === root.id)).toBeUndefined();
+  expect((await participation.read()).roots.get(`c0:${root.id}`)).toEqual({
+    at: 1010,
+    newestId: boundary.id,
+  });
+  // Another peer reply in the same second is new, and shows under its root.
+  const another = reply("c0", peer, 1010, root);
+  h.store.push(another);
+  await h.owner.capability.refresh();
+  expect(coldReads(h, root)).toHaveLength(2);
+  expect(fetched()).toContain(root.id);
+  await vi.waitFor(() =>
+    expect(inbox().items).toContainEqual(
+      expect.objectContaining({
+        rootId: root.id,
+        messageIds: [another.id],
+        unreadCount: 1,
+      }),
+    ),
+  );
+  expect((await participation.read()).roots.get(`c0:${root.id}`)).toEqual({
+    at: 1010,
+    newestId: boundary.id,
+  });
 });
 
 it("a cold thread whose page comes back full is read whole, losing none of its replies", async () => {
@@ -1143,7 +1214,10 @@ it("a cold thread whose page comes back full is read whole, losing none of its r
       expect.objectContaining({ rootId: root.id, unreadCount: 60 }),
     ),
   );
-  expect((await participation.read()).roots.get(`c0:${root.id}`)).toBe(1079);
+  expect((await participation.read()).roots.get(`c0:${root.id}`)).toEqual({
+    at: 1079,
+    newestId: answers[59]?.id,
+  });
 });
 
 it("a dropped cold read leaves its thread to the next repair without marking channels unchecked", async () => {
@@ -1172,7 +1246,9 @@ it("a dropped cold read leaves its thread to the next repair without marking cha
   // channel's window is still observed.
   expect(coldReads(h, root)).toHaveLength(2);
   expect(inbox().items.find((item) => item.rootId === root.id)).toBeUndefined();
-  expect((await participation.read()).roots.get(`c0:${root.id}`)).toBe(1010);
+  expect((await participation.read()).roots.get(`c0:${root.id}`)).toEqual({
+    at: 1010,
+  });
   expect(
     h.owner.capability.snapshot({ kind: "channel", channelId: "c0" }).coverage,
   ).toBe("observed");
@@ -1189,7 +1265,7 @@ it("a remembered thread in a channel the roster lacks is kept through a save and
   const participation = memoryThreadParticipation();
   const root = event("c1", peer, 1000);
   await participation.write({
-    roots: new Map([[`c1:${root.id}`, 1010]]),
+    roots: new Map([[`c1:${root.id}`, { at: 1010 }]]),
     walk: { since: 6000 },
   });
   const channels = ["c0"];
@@ -1207,7 +1283,7 @@ it("a remembered thread in a channel the roster lacks is kept through a save and
   expect(h.filters().some((filter) => filter["#h"]?.[0] === "c1")).toBe(false);
   // Not read, not forgotten: the walk mark has passed the viewer's reply.
   expect((await participation.read()).roots).toEqual(
-    new Map([[`c1:${root.id}`, 1010]]),
+    new Map([[`c1:${root.id}`, { at: 1010 }]]),
   );
   channels.push("c1");
   await h.owner.capability.refresh();
@@ -1219,5 +1295,7 @@ it("a remembered thread in a channel the roster lacks is kept through a save and
       expect.objectContaining({ rootId: root.id, unreadCount: 0 }),
     ),
   );
-  expect((await participation.read()).roots.get(`c1:${root.id}`)).toBe(1100);
+  expect((await participation.read()).roots.get(`c1:${root.id}`)?.at).toBe(
+    1100,
+  );
 });

@@ -132,7 +132,10 @@ was mentioned or answered in, or follows—are remembered per relay and viewer
 on this device, at most 1,000 threads, so they stay in the Inbox after their
 channel's window has moved on: the 50 most recently active are refetched
 whole on every repair, before the channel windows, and the rest are asked
-only for replies newer than what was last seen, behind the windows. A device's
+only for replies since the newest one last seen, behind the windows—that
+reply is remembered by ID and passed over when it returns, so a reply in the
+same second is not missed and a quiet thread costs nothing on later launches.
+A device's
 first repair also walks back through the viewer's own messages, behind the
 windows, to learn the threads they replied in before their most recent
 messages; later repairs read only what they wrote since. The windows, the

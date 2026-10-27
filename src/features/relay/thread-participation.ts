@@ -1,13 +1,17 @@
+/** The newest message time seen in a thread and, when known, the ID of the
+ * newest reply seen at that time: a read since the time is inclusive, and
+ * the reply with that ID is the one already seen. */
+export type ThreadMark = Readonly<{ at: number; newestId?: string }>;
 /** Threads the viewer is part of, keyed `channel:root` with the newest
- * message time seen in each: written or replied in, mentioned in, or
- * explicitly followed. Unread reads these threads on every repair so a
- * participated thread stays in the Inbox after the per-channel windows and
- * the viewer's own recent messages no longer reach it. `walk` is the newest
- * time of the viewer's authored messages a repair has read through: the
- * first repair on a device walks the viewer's whole authored history to
- * learn their threads, later ones read only what was authored since. */
+ * message seen in each: written or replied in, mentioned in, or explicitly
+ * followed. Unread reads these threads on every repair so a participated
+ * thread stays in the Inbox after the per-channel windows and the viewer's
+ * own recent messages no longer reach it. `walk` is the newest time of the
+ * viewer's authored messages a repair has read through: the first repair on
+ * a device walks the viewer's whole authored history to learn their threads,
+ * later ones read only what was authored since. */
 export type ThreadParticipation = Readonly<{
-  roots: ReadonlyMap<string, number>;
+  roots: ReadonlyMap<string, ThreadMark>;
   walk?: Readonly<{ since: number }>;
 }>;
 export type ThreadParticipationStorage = Readonly<{
@@ -53,9 +57,11 @@ function openDatabase() {
       );
   });
 }
-/** Storage is untrusted: anything but a bounded list of `[key, time]` pairs
- * reads as nothing remembered, and anything but a time as no walk. The
- * record was the bare list before it carried the walk; that form still reads. */
+/** Storage is untrusted: anything but a bounded list of `[key, time,
+ * newestId?]` entries reads as nothing remembered, anything but an event ID
+ * as no newest reply known, and anything but a time as no walk. The record
+ * was the bare list before it carried the walk, and its entries `[key, time]`
+ * pairs before they carried the newest reply; both forms still read. */
 function parse(raw: unknown): ThreadParticipation {
   const record =
     raw && typeof raw === "object" && !Array.isArray(raw)
@@ -64,14 +70,20 @@ function parse(raw: unknown): ThreadParticipation {
   const roots = new Map(
     (Array.isArray(record.roots) ? record.roots : [])
       .filter(
-        (entry): entry is [string, number] =>
+        (entry): entry is [string, number, unknown?] =>
           Array.isArray(entry) &&
           typeof entry[0] === "string" &&
           entry[0].length <= 256 &&
           Number.isSafeInteger(entry[1]) &&
           entry[1] >= 0,
       )
-      .slice(0, THREAD_PARTICIPATION_LIMIT),
+      .slice(0, THREAD_PARTICIPATION_LIMIT)
+      .map(([key, at, newestId]): [string, ThreadMark] => [
+        key,
+        typeof newestId === "string" && newestId.length <= 64
+          ? { at, newestId }
+          : { at },
+      ]),
   );
   const since = record.walk?.since;
   return Number.isSafeInteger(since) && (since as number) >= 0
@@ -114,7 +126,11 @@ export function browserThreadParticipation(
         const tx = db.transaction("partitions", "readwrite");
         tx.objectStore("partitions").put(
           {
-            roots: [...roots].slice(0, THREAD_PARTICIPATION_LIMIT),
+            roots: [...roots]
+              .slice(0, THREAD_PARTICIPATION_LIMIT)
+              .map(([key, { at, newestId }]) =>
+                newestId === undefined ? [key, at] : [key, at, newestId],
+              ),
             ...(walk ? { walk: { since: walk.since } } : {}),
           },
           scope,

@@ -84,36 +84,53 @@ it("a blocked open is not held against the next read", async () => {
   // The read has reached its transaction once it listens for the result.
   await vi.waitFor(() => expect(get.onsuccess).not.toBe(idle));
   get.onsuccess();
-  await expect(read).resolves.toEqual({ roots: new Map([["c0:root", 1000]]) });
+  await expect(read).resolves.toEqual({
+    roots: new Map([["c0:root", { at: 1000 }]]),
+  });
 });
 
-it("the record round-trips with its walk mark, and the former bare list still reads", async () => {
+it("the record round-trips with its walk mark and newest replies, and the former forms still read", async () => {
   const { storage, read, put } = await opened({
-    roots: [["c0:root", 1000]],
+    roots: [
+      ["c0:root", 1000],
+      ["c0:other", 1200, "a".repeat(64)],
+    ],
     walk: { since: 1500 },
   });
   await expect(read()).resolves.toEqual({
-    roots: new Map([["c0:root", 1000]]),
+    roots: new Map([
+      ["c0:root", { at: 1000 }],
+      ["c0:other", { at: 1200, newestId: "a".repeat(64) }],
+    ]),
     walk: { since: 1500 },
   });
   await storage.write({
-    roots: new Map([["c0:root", 2000]]),
+    roots: new Map([
+      ["c0:root", { at: 2000, newestId: "b".repeat(64) }],
+      ["c0:other", { at: 2200 }],
+    ]),
     walk: { since: 2500 },
   });
   expect(put).toHaveBeenCalledWith(
-    { roots: [["c0:root", 2000]], walk: { since: 2500 } },
+    {
+      roots: [
+        ["c0:root", 2000, "b".repeat(64)],
+        ["c0:other", 2200],
+      ],
+      walk: { since: 2500 },
+    },
     "relay:viewer",
   );
   await storage.write({ roots: new Map() });
   expect(put).toHaveBeenLastCalledWith({ roots: [] }, "relay:viewer");
 });
 
-it("a malformed walk reads as no walk", async () => {
+it("a malformed walk reads as no walk, and a malformed newest reply as none known", async () => {
   const { read } = await opened({
-    roots: [["c0:root", 1000], "junk"],
+    roots: [["c0:root", 1000, 7], "junk"],
     walk: { since: -1 },
   });
   await expect(read()).resolves.toEqual({
-    roots: new Map([["c0:root", 1000]]),
+    roots: new Map([["c0:root", { at: 1000 }]]),
   });
 });
