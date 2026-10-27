@@ -254,6 +254,8 @@ export function createUnread({
   let inboxSnapshot: InboxSnapshot | undefined;
   let inboxDirty = true;
   let inboxLoading = false;
+  // The last repair dropped a request after its retry (see `pool`).
+  let partial = false;
   const handles = new Set<() => void>();
   const views = new Map<
     () => void,
@@ -358,6 +360,8 @@ export function createUnread({
   // by the first repair, extended and refetched by every repair, and evicted
   // last when retained evidence overflows.
   let remembered: Map<string, number> | undefined;
+  // What storage holds, so a repair writes only a changed set.
+  let persisted: ReadonlyMap<string, number> | undefined;
   const pinned = (event: RelayEvent) => {
     const channel = channelOf(event);
     return (
@@ -1166,7 +1170,9 @@ export function createUnread({
             ? "idle"
             : "ready",
       items: Object.freeze(items),
-      freshness,
+      // Evidence shown while a repair still reads the roster is `observing`.
+      freshness: freshness === "observed" && refresh ? "observing" : freshness,
+      ...(partial ? { partial: true } : {}),
       ...(error ? { error } : {}),
     });
     // Keep React's snapshot stable for irrelevant evidence and duplicate deliveries.
@@ -1366,27 +1372,25 @@ export function createUnread({
     if (!parentId || event.pubkey === viewer) return;
     // Activity and the Inbox group thread replies by root, so fetch a root the
     // sampled windows dropped for a followed thread or a relevant reply in it,
-    // read or not: a read mention without its root would be its own row.
+    // or for a read reply, which would otherwise be its own row. Membership
+    // of read replies is answered by the participation pass, not a lookup.
+    const read = () => !afterFrontier(entry, reads.state(), dm);
     const structuralRootId =
       !entry.rootId &&
       (chosen(entry) === true ||
         entry.mentioned ||
         entry.broadcast ||
-        conversation(entry))
+        conversation(entry) ||
+        read())
         ? threadRootId
         : undefined;
     const structuralRecovery = structuralRootId !== undefined;
     const key = structuralRecovery
       ? `${conversationKey(channelId, structuralRootId)}:structure`
       : conversationKey(channelId, parentId);
-    // A read reply is looked up only while its root is not retained: the
-    // lookup fetches the root too, so the reply groups under it either way.
     if (
       lookups.has(key) ||
-      (!structuralRecovery &&
-        (!undecided(entry, dm) ||
-          (entry.rootId !== undefined &&
-            !afterFrontier(entry, reads.state(), dm))))
+      (!structuralRecovery && (!undecided(entry, dm) || read()))
     )
       return;
     lookups.set(key, {
@@ -1648,29 +1652,33 @@ export function createUnread({
       resolving = false;
     }
   }
-  // Per-channel evidence: the newest WINDOW_LIMIT content events of each
-  // member channel at or after its older read mark (the explicit channel
-  // frontier or the catch-up `activity:` mark, whichever is older, so unread
-  // replies between them are seen), or after the last week for a channel
-  // never read on any device, whose dormant history would otherwise fill the
-  // budget to show nothing new. The limit is one page of evidence per
-  // channel: counts and rows beyond it are bounded, as under the former global
-  // sample, but a busy channel can no longer push a quiet channel's thread out
-  // of the sample. Single-channel filters ride WINDOW_FILTERS per request (the
-  // relay honours per-filter limits; the reader and hosts allow four filters
-  // per read), with WINDOW_CONCURRENCY requests in flight: the reader runs
-  // three reads at once, and the third slot stays free for the channel the
-  // viewer opens meanwhile. Each landed request publishes.
+  // Per-channel evidence: the newest content events of each member channel at
+  // or after its older read mark (the explicit channel frontier or the
+  // catch-up `activity:` mark, whichever is older, so unread replies between
+  // them are seen), or after the last week for a channel never read on any
+  // device, whose dormant history would otherwise fill the budget to show
+  // nothing new. Each channel gets one page of at most WINDOW_LIMIT events,
+  // sized so the roster's windows together stay within WINDOW_BUDGET, three
+  // quarters of the retained budget: counts and rows beyond a channel's page
+  // are bounded, as under the former global sample, but a busy channel can no
+  // longer push a quiet channel's thread out of the sample, not even on a
+  // first run with a large roster. Single-channel filters ride WINDOW_FILTERS
+  // per request (the relay honours per-filter limits; the reader and hosts
+  // allow four filters per read), with WINDOW_CONCURRENCY requests in flight:
+  // the reader runs three reads at once, and the third slot stays free for
+  // the channel the viewer opens meanwhile. Each landed request publishes.
   const WINDOW_LIMIT = 100;
+  const WINDOW_LEAST = 20;
+  const WINDOW_BUDGET = 3072;
   const WINDOW_FILTERS = 4;
   const WINDOW_CONCURRENCY = 2;
   const WINDOW_FLOOR_SECONDS = 7 * 24 * 60 * 60;
-  // The participation pass refetches each remembered thread whole, one filter
-  // per channel naming its roots, riding the same requests as the windows do;
-  // a full page splits a filter's roots, as `viewerReplies` does. Across
-  // threads, only the newest PARTICIPATION_BUDGET replies are admitted per
-  // repair: pinned evidence must leave the channel windows at least three
-  // quarters of the retained budget.
+  // The viewer's threads are refetched whole, one filter per channel naming
+  // its roots, riding the same requests as the windows do; a full page splits
+  // a filter's roots, as `viewerReplies` does. Across threads, only the
+  // newest PARTICIPATION_BUDGET replies are admitted per repair, the most
+  // recently active threads having been asked first: pinned evidence must
+  // leave the channel windows at least three quarters of the retained budget.
   const THREAD_LIMIT = 200;
   const PARTICIPATION_BUDGET = 1024;
   const deadline = () =>
@@ -1681,9 +1689,11 @@ export function createUnread({
     );
   /** Reads `requests` WINDOW_CONCURRENCY at a time, workers pulling the next
    * as one lands; `landed` sees each result and may push follow-up requests.
-   * Evidence beside a failed request is kept; the failure then stops the
-   * pass and is thrown, with no automatic retry. False when the repair was
-   * retired meanwhile or `landed` declined. */
+   * A request that fails is read once more in its slot with a fresh deadline
+   * (one window in five live runs stalled past it alone); failing again, it
+   * is dropped and the rest still land. True when every request landed,
+   * false when some were dropped, undefined when the repair was retired
+   * meanwhile or `landed` declined. */
   async function pool(
     requests: ReadFilter[][],
     generation: number,
@@ -1691,99 +1701,88 @@ export function createUnread({
     landed: (
       request: readonly ReadFilter[],
       result: readonly RelayEvent[],
+      requests: ReadFilter[][],
     ) => boolean,
   ) {
-    let failure: { cause: unknown } | undefined;
+    let complete = true;
     let retired = false;
     const worker = async () => {
       for (
         let request = requests.shift();
-        request && !failure && !retired && !closed && generation === epoch;
+        request && !retired && !closed && generation === epoch;
         request = requests.shift()
       ) {
-        let result: readonly RelayEvent[];
-        try {
-          result = await reader.read(request, {
-            signal: deadline(),
-            priority,
-          });
-        } catch (cause) {
-          failure ??= { cause };
-          return;
+        let result: readonly RelayEvent[] | undefined;
+        for (let attempt = 0; attempt < 2 && !result; attempt++)
+          try {
+            result = await reader.read(request, {
+              signal: deadline(),
+              priority,
+            });
+          } catch {
+            if (closed || generation !== epoch) return;
+          }
+        if (!result) {
+          complete = false;
+          continue;
         }
-        if (closed || generation !== epoch || !landed(request, result))
+        if (
+          closed ||
+          generation !== epoch ||
+          !landed(request, result, requests)
+        )
           retired = true;
       }
     };
     await Promise.all(
       Array.from({ length: WINDOW_CONCURRENCY }, () => worker()),
     );
-    if (closed || generation !== epoch || retired) return false;
-    if (failure) throw failure.cause;
-    return true;
+    if (closed || generation !== epoch || retired) return undefined;
+    return complete;
   }
   async function rememberedRoots() {
     if (remembered) return remembered;
     try {
-      remembered = new Map(await participation.read());
+      persisted = await participation.read();
     } catch {
       // Unreadable storage forgets nothing durable: this repair relearns what
       // the relay still shows and saves that.
-      remembered = new Map();
+      persisted = new Map();
     }
+    remembered = new Map(persisted);
     return remembered;
   }
-  /** Threads the viewer is part of stay retained whatever the windows hold.
-   * Roots come from storage, explicit follows, and this repair's evidence:
-   * the viewer's own messages (read beside the windows, which start at read
-   * marks the viewer's replies usually precede) and replies that mention the
-   * viewer. Unfollowed threads and left channels are skipped; the union,
-   * newest activity first and capped, is remembered. */
-  async function participate(
+  /** One repair's view of the threads the viewer is part of, keyed
+   * `channel:root` with the newest time seen in each. Roots start as those
+   * remembered from earlier repairs and explicit follows (a follow carries no
+   * time, so one first seen here is as recent as this repair), and grow with
+   * what this repair's evidence teaches: the viewer's replies, replies that
+   * mention the viewer, and replies in the viewer's conversations. Unfollowed
+   * threads and left channels are skipped. The newest are refetched whole and
+   * remembered. */
+  function participating(
     members: ReadonlySet<string>,
-    generation: number,
-    priority: Priority,
+    stored: ReadonlyMap<string, number>,
   ) {
-    indexEvidence();
-    const roots = new Map(await rememberedRoots());
-    const learn = (key: string, at: number) =>
-      roots.set(key, Math.max(roots.get(key) ?? 0, at));
+    const active = (key: string) =>
+      members.has(key.slice(0, key.indexOf(":"))) &&
+      choices().get(key) !== false;
+    const roots = new Map([...stored].filter(([key]) => active(key)));
+    const seen = Math.floor(now() / 1000);
     for (const [key, following] of choices())
-      if (following && !roots.has(key)) roots.set(key, 0);
-    for (const rows of byChannel.values())
-      for (const entry of rows) {
-        const key = conversationKey(
-          entry.channelId,
-          entry.threadRootId ?? entry.event.id,
-        );
-        if (entry.event.pubkey === viewer || entry.mentioned || roots.has(key))
-          learn(key, entry.event.created_at);
-      }
-    const active = [...roots]
-      .filter(
-        ([key]) =>
-          members.has(key.slice(0, key.indexOf(":"))) &&
-          choices().get(key) !== false,
-      )
-      .sort(([, a], [, b]) => b - a)
-      .slice(0, THREAD_PARTICIPATION_LIMIT);
-    const previous = remembered;
-    remembered = new Map(active);
-    if (
-      !previous ||
-      previous.size !== remembered.size ||
-      [...remembered].some(([key, at]) => previous.get(key) !== at)
-    )
-      void participation.write(remembered).catch(() => {});
-    const groups = new Map<string, string[]>();
-    for (const [key] of active) {
-      const separator = key.indexOf(":");
-      const channelId = key.slice(0, separator);
-      groups.set(channelId, [
-        ...(groups.get(channelId) ?? []),
-        key.slice(separator + 1),
-      ]);
-    }
+      if (following && !roots.has(key) && active(key)) roots.set(key, seen);
+    const learn = (key: string, at: number) => {
+      if (active(key)) roots.set(key, Math.max(roots.get(key) ?? 0, at));
+    };
+    const newest = () =>
+      [...roots]
+        .sort(([, a], [, b]) => b - a)
+        .slice(0, THREAD_PARTICIPATION_LIMIT)
+        .map(([key]) => key);
+    // Roots asked for this repair, and every event the thread reads returned.
+    const fetched = new Set<string>();
+    const rows = new Map<string, RelayEvent>();
+    let admitted = 0;
     const threads = (channelId: string, rootIds: readonly string[]) => ({
       kinds: contentKinds,
       "#h": [channelId],
@@ -1791,31 +1790,46 @@ export function createUnread({
       include_aux: true,
       limit: THREAD_LIMIT,
     });
-    // Roots the windows did not carry, so replies group and open under them;
-    // the viewer's own roots arrived with the authored read.
-    const missing = [...groups.values()]
-      .flat()
-      .filter((rootId) => !structural(rootId));
-    const requests = chunk(
-      [
-        ...[...groups].map(([channelId, rootIds]) =>
-          threads(channelId, rootIds),
-        ),
-        ...chunk(missing, 100).map((ids) => ({
-          kinds: contentKinds,
-          ids,
-          include_aux: true,
-          limit: ids.length,
-        })),
-      ],
-      WINDOW_FILTERS,
-    );
-    const rows = new Map<string, RelayEvent>();
-    const complete = await pool(
-      requests,
-      generation,
-      priority,
-      (request, result) => {
+    return {
+      roots,
+      /** Thread reads for the newest roots not yet asked for, with roots the
+       * retained evidence lacks fetched by ID so replies group and open under
+       * them. */
+      requests() {
+        const groups = new Map<string, string[]>();
+        for (const key of newest()) {
+          if (fetched.has(key)) continue;
+          fetched.add(key);
+          const separator = key.indexOf(":");
+          const channelId = key.slice(0, separator);
+          groups.set(channelId, [
+            ...(groups.get(channelId) ?? []),
+            key.slice(separator + 1),
+          ]);
+        }
+        const missing = [...groups.values()]
+          .flat()
+          .filter((rootId) => !structural(rootId));
+        return chunk<ReadFilter>(
+          [
+            ...[...groups].map(([channelId, rootIds]) =>
+              threads(channelId, rootIds),
+            ),
+            ...chunk(missing, 100).map((ids) => ({
+              kinds: contentKinds,
+              ids,
+              include_aux: true,
+              limit: ids.length,
+            })),
+          ],
+          WINDOW_FILTERS,
+        );
+      },
+      landed(
+        request: readonly ReadFilter[],
+        result: readonly RelayEvent[],
+        requests: ReadFilter[][],
+      ) {
         for (const event of result) rows.set(event.id, event);
         // A full page may hide replies under a filter's other roots.
         for (const filter of request) {
@@ -1837,23 +1851,65 @@ export function createUnread({
             threads(channelId, rootIds.slice(half)),
           ]);
         }
-        return true;
+        const reply = (event: RelayEvent) =>
+          contentKind(event) && !!threadReference(event);
+        const replies = result
+          .filter(reply)
+          .sort(
+            (a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id),
+          )
+          .slice(0, Math.max(0, PARTICIPATION_BUDGET - admitted));
+        admitted += replies.length;
+        const chosen = new Set(replies.map((event) => event.id));
+        return accept(
+          result.filter((event) => chosen.has(event.id) || !reply(event)),
+        );
       },
-    );
-    if (!complete) return false;
-    const replies = [...rows.values()]
-      .filter((event) => contentKind(event) && threadReference(event))
-      .sort((a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id))
-      .slice(0, PARTICIPATION_BUDGET);
-    const admitted = new Set(replies.map((event) => event.id));
-    return accept([
-      ...replies,
-      ...[...rows.values()].filter(
-        (event) =>
-          !admitted.has(event.id) &&
-          !(contentKind(event) && threadReference(event)),
-      ),
-    ]);
+      /** Learns roots and their newest times from retained evidence and the
+       * thread reads so far. */
+      learn() {
+        indexEvidence();
+        for (const entries of byChannel.values())
+          for (const entry of entries) {
+            const key = conversationKey(
+              entry.channelId,
+              entry.threadRootId ?? entry.event.id,
+            );
+            if (
+              (entry.event.pubkey === viewer && entry.parentId) ||
+              entry.mentioned ||
+              conversation(entry) ||
+              roots.has(key)
+            )
+              learn(key, entry.event.created_at);
+          }
+        for (const event of rows.values()) {
+          const channelId = channelOf(event);
+          const reference = contentKind(event)
+            ? threadReference(event)
+            : undefined;
+          if (!channelId || !reference) continue;
+          const key = conversationKey(channelId, reference.rootId);
+          if (roots.has(key)) learn(key, event.created_at);
+        }
+      },
+      /** The newest roots become the remembered threads. */
+      save() {
+        const next = new Map(
+          [...roots]
+            .sort(([, a], [, b]) => b - a)
+            .slice(0, THREAD_PARTICIPATION_LIMIT),
+        );
+        remembered = next;
+        if (
+          persisted?.size !== next.size ||
+          [...next].some(([key, at]) => persisted?.get(key) !== at)
+        ) {
+          persisted = next;
+          void participation.write(next).catch(() => {});
+        }
+      },
+    };
   }
   async function repair(priority: Priority = "foreground") {
     requested = true;
@@ -1863,9 +1919,7 @@ export function createUnread({
     inboxLoading = true;
     const generation = epoch;
     refresh = (async () => {
-      await reads.ensure();
-      if (closed || generation !== epoch) return;
-      await rememberedRoots();
+      const [, stored] = await Promise.all([reads.ensure(), rememberedRoots()]);
       if (closed || generation !== epoch) return;
       const ids = channels
         .list()
@@ -1886,62 +1940,104 @@ export function createUnread({
         // user-visible observation.
         const { frontiers } = reads.state();
         const floor = Math.floor(now() / 1000) - WINDOW_FLOOR_SECONDS;
-        const windows = ids.map((id) => {
-          const marks = [frontiers[id], frontiers[`activity:${id}`]].filter(
-            (mark): mark is number => mark !== undefined,
-          );
-          return { id, since: marks.length ? Math.min(...marks) : undefined };
-        });
+        const limit = Math.max(
+          WINDOW_LEAST,
+          Math.min(WINDOW_LIMIT, Math.floor(WINDOW_BUDGET / ids.length)),
+        );
+        // Most recently read channels first: the viewer is active there, and
+        // their windows are the smallest; never-read channels go last.
+        const windows = ids
+          .map((id) => {
+            const marks = [frontiers[id], frontiers[`activity:${id}`]].filter(
+              (mark): mark is number => mark !== undefined,
+            );
+            return {
+              id,
+              since: marks.length ? Math.min(...marks) : undefined,
+            };
+          })
+          .sort((a, b) => (b.since ?? -1) - (a.since ?? -1));
         const marked = new Set(
           windows.flatMap(({ id, since }) => (since === undefined ? [] : [id])),
         );
-        // The viewer's newest messages, for the participation pass, ride
-        // the last request.
-        const requests = chunk(
+        // The viewer's newest messages ride the first request, and the
+        // remembered threads are read right behind it, before the windows:
+        // the pinned rows are the ones the windows cannot show.
+        const pass = participating(new Set(ids), stored);
+        const requests = chunk<ReadFilter>(
           [
-            ...windows.map(({ id, since }) => ({
-              kinds: contentKinds,
-              "#h": [id],
-              since: since ?? floor,
-              include_aux: true,
-              limit: WINDOW_LIMIT,
-            })),
             {
               kinds: contentKinds,
               authors: [viewer],
               include_aux: true,
               limit: WINDOW_LIMIT,
             },
+            ...windows.map(({ id, since }) => ({
+              kinds: contentKinds,
+              "#h": [id],
+              since: since ?? floor,
+              include_aux: true,
+              limit,
+            })),
           ],
           WINDOW_FILTERS,
         );
-        // A failed window still leaves the viewer's threads to the
-        // participation pass; the failure is then reported.
-        let failed: { cause: unknown } | undefined;
-        let complete = false;
-        try {
-          complete = await pool(
-            requests,
-            generation,
-            priority,
-            (request, result) => {
-              // A read channel with nothing since its mark is observed with
-              // nothing unread; a never-read channel with no recent history
-              // stays unknown rather than claiming zero.
-              for (const filter of request) {
-                const id = filter["#h"]?.[0];
-                if (id && marked.has(id)) known.add(id);
-              }
-              return accept(result);
-            },
-          );
-        } catch (cause) {
-          failed = { cause };
-          complete = true;
-        }
-        if (!complete) return;
-        if (!(await participate(new Set(ids), generation, priority))) return;
-        if (failed) throw failed.cause;
+        const threads = pass.requests();
+        requests.splice(1, 0, ...threads);
+        remembered = pass.roots;
+        // Once those have landed the Inbox is no longer loading; the windows
+        // still reading show as `observing`.
+        const first = new Set<readonly ReadFilter[]>(
+          requests.slice(0, 1 + threads.length),
+        );
+        const landed = (
+          request: readonly ReadFilter[],
+          result: readonly RelayEvent[],
+          queue: ReadFilter[][],
+        ) => {
+          let ok: boolean;
+          if (request.some((filter) => filter["#e"] || filter.ids))
+            ok = pass.landed(request, result, queue);
+          else {
+            // A read channel with nothing since its mark is observed with
+            // nothing unread; a never-read channel with no recent history
+            // stays unknown rather than claiming zero.
+            for (const filter of request) {
+              const id = filter["#h"]?.[0];
+              if (id && marked.has(id)) known.add(id);
+            }
+            ok = accept(result);
+            // The authored page teaches the viewer's newest threads at once;
+            // their reads go ahead of the remaining windows.
+            if (ok && request.some((filter) => filter.authors)) {
+              pass.learn();
+              const taught = pass.requests();
+              queue.unshift(...taught);
+              for (const item of taught) first.add(item);
+            }
+          }
+          if (first.delete(request) && !first.size) {
+            inboxLoading = false;
+            publish();
+          }
+          return ok;
+        };
+        const windowed = await pool(requests, generation, priority, landed);
+        if (windowed === undefined) return;
+        // Threads the windows newly taught, usually none.
+        pass.learn();
+        const taught = await pool(
+          pass.requests(),
+          generation,
+          priority,
+          landed,
+        );
+        if (taught === undefined) return;
+        pass.learn();
+        pass.save();
+        // A dropped request leaves its channels as they were; the Inbox says
+        // so until the next repair, with no automatic retry.
+        partial = !(windowed && taught);
         freshness = "observed";
         owing = false;
         error = undefined;
@@ -2336,6 +2432,10 @@ export function createUnread({
       }
       follows.write(next);
       saved = next;
+      // A follow carries no time of its own: the thread joins the viewer's
+      // remembered threads as of now, and the next repair refetches it.
+      if (following && remembered && !remembered.has(key))
+        remembered.set(key, Math.floor(now() / 1000));
       followsChanged(changed);
     },
     reading(channelId) {
@@ -2854,6 +2954,8 @@ export function createUnread({
       repairAgain = false;
       indexed = false;
       remembered = undefined;
+      persisted = undefined;
+      partial = false;
       events.clear();
       known.clear();
       forcedMessages.clear();

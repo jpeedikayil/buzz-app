@@ -204,15 +204,16 @@ it("queries all 278 membership IDs in four-channel requests and publishes each l
   });
   h.query.mockImplementation(async (filters) => {
     if (!filters[0]?.kinds?.includes(9)) return [];
-    if (!filters[0]["#h"]) return [];
+    if (!filters.some((filter) => filter["#h"])) return [];
     expect(filters.length).toBeLessThanOrEqual(4);
-    // The viewer's authored page rides the last request.
+    // The viewer's authored page rides the first request. Windows are sized
+    // so a roster this large stays within the budget: the least, 20 each.
     const ids = filters.flatMap((filter) => {
       if (filter.authors) return [];
       expect(filter["#h"]).toHaveLength(1);
       expect(filter).toMatchObject({
         include_aux: true,
-        limit: 100,
+        limit: 20,
         since: expect.any(Number),
       });
       return [filter["#h"]?.[0] ?? ""];
@@ -235,7 +236,7 @@ it("queries all 278 membership IDs in four-channel requests and publishes each l
   expect(h.session.channels.window("room-277").rows).toEqual([]);
 });
 
-it("a full channel window does not starve later channels, and a failed request retains evidence until explicit retry", async () => {
+it("a full channel window does not starve later channels, and a dropped request leaves its channels unknown until explicit refresh", async () => {
   const h = setup(129);
   const rows = Array.from({ length: 100 }, (_, i) =>
     message(h.peer, "other", `busy ${i}`, 11 + i),
@@ -243,7 +244,8 @@ it("a full channel window does not starve later channels, and a failed request r
   let fail = true;
   const batches: string[][] = [];
   h.query.mockImplementation(async (filters) => {
-    if (!filters[0]?.kinds?.includes(9) || !filters[0]["#h"]) return [];
+    if (!filters[0]?.kinds?.includes(9) || !filters.some((f) => f["#h"]))
+      return [];
     const ids = filters.flatMap((filter) => filter["#h"] ?? []);
     batches.push(ids);
     if (ids.includes("other")) return rows;
@@ -251,15 +253,25 @@ it("a full channel window does not starve later channels, and a failed request r
     return ids.map((id) => message(h.peer, id, "quiet", 11));
   });
   await h.session.unread.ensure();
-  // The failure stops the pass once the requests in flight have landed.
+  // Each of the 32 failing requests is read once more, then dropped; the
+  // busy channel's request landed, so the Inbox is observed but partial.
   const attempted = batches.length;
-  expect(attempted).toBeGreaterThanOrEqual(2);
-  expect(attempted).toBeLessThan(33);
+  expect(attempted).toBe(1 + 2 * 32);
   expect(h.snapshot()).toMatchObject({
     observedCount: 100,
-    freshness: "stale",
-    error: "Later chunk unavailable",
+    freshness: "observed",
   });
+  expect(h.session.unread.inbox()).toMatchObject({
+    status: "ready",
+    freshness: "observed",
+    partial: true,
+  });
+  expect(h.session.unread.inbox().error).toBeUndefined();
+  const quiet = batches[1]?.[0];
+  assert(quiet);
+  const snapshot = () =>
+    h.session.unread.snapshot({ kind: "channel", channelId: quiet });
+  expect(snapshot().coverage).toBe("unknown");
   await h.session.unread.ensure();
   expect(batches).toHaveLength(attempted); // No automatic retry loop.
   fail = false;
@@ -269,13 +281,8 @@ it("a full channel window does not starve later channels, and a failed request r
     observedCount: 100,
     freshness: "observed",
   });
-  expect(h.snapshot().error).toBeUndefined();
-  const quiet = batches[1]?.[0];
-  assert(quiet);
-  expect(
-    h.session.unread.snapshot({ kind: "channel", channelId: quiet })
-      .observedCount,
-  ).toBe(1);
+  expect(h.session.unread.inbox().partial).toBeUndefined();
+  expect(snapshot()).toMatchObject({ observedCount: 1, freshness: "observed" });
 });
 
 function conversationRelay(h: ReturnType<typeof setup>) {
@@ -885,7 +892,15 @@ it("transient startup failure recovers on live reconnect without an automatic re
     return [h.row];
   });
   await h.session.unread.ensure();
-  expect(h.snapshot().error).toBe("Transient evidence failure");
+  // Dropped after its one retry: the channel stays unknown and the Inbox
+  // notes the partial pass instead of failing.
+  expect(h.snapshot().coverage).toBe("unknown");
+  expect(h.session.unread.inbox()).toMatchObject({
+    status: "ready",
+    freshness: "observed",
+    partial: true,
+  });
+  expect(h.session.unread.inbox().error).toBeUndefined();
   const count = h.query.mock.calls.length;
   await h.session.unread.ensure();
   expect(h.query).toHaveBeenCalledTimes(count);
@@ -897,7 +912,7 @@ it("transient startup failure recovers on live reconnect without an automatic re
       freshness: "observed",
     }),
   );
-  expect(h.snapshot().error).toBeUndefined();
+  expect(h.session.unread.inbox().partial).toBeUndefined();
 });
 
 it("the recovery tick repairs unread only as a slow backstop after a connection's own repair", async () => {

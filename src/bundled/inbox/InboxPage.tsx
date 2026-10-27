@@ -503,10 +503,14 @@ function InboxList({
       channel.id === selectedTarget?.channelId &&
       (channel.archived || channel.huddle || channel.metadataPending),
   );
+  // A restored selection may still be in a window the repair has not read.
+  const observing = inbox.freshness === "observing";
   useEffect(() => {
     if (
       selectedTarget &&
-      (selectedRetired || !showing || (!selected && inbox.status !== "loading"))
+      (selectedRetired ||
+        !showing ||
+        (!selected && inbox.status !== "loading" && !observing))
     ) {
       // Restoring the channel does not reopen its conversation.
       if (selectedRetired && opened && closeTab(opened))
@@ -527,6 +531,7 @@ function InboxList({
     opened,
     closeTab,
     inbox.status,
+    observing,
   ]);
   useLayoutEffect(() => {
     if (!retiredFocus.current) return;
@@ -884,6 +889,7 @@ function InboxList({
     list.status === "idle" ||
     list.status === "loading" ||
     inbox.status === "loading" ||
+    observing ||
     feed.status === "loading";
   const failure =
     error ?? list.error ?? inbox.error ?? feed.error ?? sync.error;
@@ -968,10 +974,12 @@ function InboxList({
           <div className={styles.listPane}>
             {toolbar}
             <div className={styles.scroll}>
-              {inbox.freshness === "stale" && !failure && (
+              {(inbox.freshness === "stale" || inbox.partial) && !failure && (
                 <div className={styles.notice} role="status">
                   <span className="text-body text-subtle">
-                    Showing retained activity.
+                    {inbox.freshness === "stale"
+                      ? "Showing retained activity."
+                      : "Some channels could not be checked."}
                   </span>
                   <Button
                     size="sm"

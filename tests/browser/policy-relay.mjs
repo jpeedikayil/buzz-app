@@ -362,6 +362,31 @@ export function policyRelay({
             filters.flatMap((filter) => answer(community, filter)),
           );
         }
+        // Unread participation: the viewer's threads refetched whole, one
+        // `#e` filter per channel naming its roots, with roots the retained
+        // evidence lacks fetched by ID in the same request.
+        if (
+          filters.every(
+            (filter) =>
+              [9, 40002, 40008].every((kind) => filter.kinds?.includes(kind)) &&
+              filter.include_aux &&
+              ((filter["#h"]?.length === 1 &&
+                filter["#e"] &&
+                !filter.authors &&
+                filter.since === undefined) ||
+                (filter.ids && !filter["#h"] && !filter["#e"])),
+          )
+        ) {
+          expect(filters.length).toBeLessThanOrEqual(4);
+          const community = communityOf(url);
+          for (const filter of filters) {
+            expect(filter.limit).toBe(filter.ids ? filter.ids.length : 200);
+            report.queries.push({ community, filter, at: performance.now() });
+          }
+          return Response.json(
+            filters.flatMap((filter) => answer(community, filter)),
+          );
+        }
         // Unread conversation lookup: missing parents by ID, and the viewer's
         // replies to undecided parents in one channel.
         if (
@@ -412,7 +437,7 @@ export function policyRelay({
         }
         // Unread evidence windows: up to four single-channel filters, each
         // since its channel's read mark; the viewer's own newest messages
-        // ride the last request.
+        // ride the first request.
         if (
           filters.every(
             (filter) =>
@@ -427,7 +452,12 @@ export function policyRelay({
           expect(filters.length).toBeLessThanOrEqual(4);
           const community = communityOf(url);
           for (const filter of filters) {
-            expect(filter.limit).toBe(100);
+            // One page per channel, smaller on a large roster.
+            if (filter.authors) expect(filter.limit).toBe(100);
+            else {
+              expect(filter.limit).toBeGreaterThanOrEqual(20);
+              expect(filter.limit).toBeLessThanOrEqual(100);
+            }
             report.queries.push({ community, filter, at: performance.now() });
           }
           const result = filters.flatMap((filter) => answer(community, filter));

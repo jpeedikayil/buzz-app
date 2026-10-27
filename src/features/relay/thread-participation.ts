@@ -70,7 +70,11 @@ export function browserThreadParticipation(
   function open() {
     if (closed)
       return Promise.reject(new Error("Thread participation storage closed"));
-    database ??= openDatabase();
+    // A failed open is not held against the next read or write.
+    database ??= openDatabase().catch((cause: unknown) => {
+      database = undefined;
+      throw cause;
+    });
     return database;
   }
   return {

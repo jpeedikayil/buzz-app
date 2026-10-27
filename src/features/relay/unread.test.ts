@@ -233,8 +233,9 @@ it("unread repair observes history without seeding the channel window or consumi
   h.query.mockImplementation(async (filters) => {
     const filter = filters[0];
     if (!filter?.kinds?.includes(9)) return [];
-    if (filter.authors) return []; // The participation pass: nothing authored.
-    if (filter.since !== undefined) return rows; // Per-channel unread evidence, not a window page.
+    // Per-channel unread evidence beside the viewer's authored page (nothing
+    // authored), not a window page.
+    if (filters.some((item) => item.since !== undefined)) return rows;
     const older = filter.until !== undefined;
     const cursor = rows[older ? 20 : 40];
     if (!cursor) throw new Error("Missing fixture cursor");
@@ -3087,16 +3088,21 @@ it("inbox observation exposes empty, failure, recovery and cache clear without a
     release();
   }
   await work;
+  // Dropped after its retry: observed but partial, not an error.
   expect(h.session.unread.inbox()).toMatchObject({
-    status: "error",
-    error: "offline",
+    status: "ready",
+    freshness: "observed",
+    partial: true,
+    items: [],
   });
+  expect(h.session.unread.inbox().error).toBeUndefined();
   h.query.mockResolvedValue([]);
   await h.session.unread.refresh();
   expect(h.session.unread.inbox()).toMatchObject({
     status: "ready",
     items: [],
   });
+  expect(h.session.unread.inbox().partial).toBeUndefined();
   h.emit([message(h.alice, "room", "fresh", 20, [["p", h.viewer.pubkey]])]);
   expect(h.session.unread.inbox().items).toHaveLength(1);
   await h.clearCache();

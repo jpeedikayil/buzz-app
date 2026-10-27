@@ -222,10 +222,11 @@ when it computes the response, which for a held older page is before release.
 Paging samples record `work.olderRowsServedBefore`, and the first-seen case
 requires zero. This proves which events arrive first-seen, not when background
 verification of the startup read finishes; setup does not wait for it. The option
-adds 500 fixture signatures to setup and one sidebar row. There is no first-seen
-channel-open case: verifying its one 20-event head page is within that case's
-sample-to-sample variation, and the busy channel also changes unread state
-before the click.
+adds 500 newer messages by the viewer in a second channel, which fill the
+viewer's own recent-messages read, plus their signatures at setup and one
+sidebar row. There is no first-seen channel-open case: verifying its one
+20-event head page is within that case's sample-to-sample variation, and the
+second channel also changes unread state before the click.
 
 ## Rich thread lifecycle
 

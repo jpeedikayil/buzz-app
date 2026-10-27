@@ -497,9 +497,10 @@ export const test = base.extend({
             );
           }),
         );
-    // A joined channel busier than the measured one; its window is read on
-    // its own, so under `firstSeenHistory` the fixture instead honours the
-    // app's never-read window start (see the unread evidence read below).
+    // A joined channel the viewer has since written far more in: its newer
+    // messages fill the viewer's authored page, which has no window start,
+    // while the fixture honours the never-read window start for the channel
+    // windows (see the unread evidence read below).
     if (firstSeenHistory)
       histories.set(
         "primary/busy",
@@ -2269,14 +2270,9 @@ export const test = base.extend({
           throw new Error(
             `Unexpected fixture request: ${request.method} ${request.url}`,
           );
+        // The host reads up to four filters per request.
         expect(body.length).toBeGreaterThan(0);
-        expect(body.length).toBeLessThanOrEqual(
-          body.every(
-            (filter) => filter.kinds?.length === 1 && filter.kinds[0] === 9007,
-          )
-            ? 4
-            : 3,
-        );
+        expect(body.length).toBeLessThanOrEqual(4);
         const filter = body[0];
         const result = [
           ...new Map(

@@ -125,11 +125,17 @@ disable read mutations. Saved frontiers are not proof of remote reconciliation.
 This is **bounded recent evidence**, not a complete historical inbox. Unread
 retains at most 4,096 events / 8 MiB. Each joined channel is observed on its
 own since its read mark (or since the last week, when never read anywhere), up
-to 100 recent events per channel, so one busy channel cannot push another
-channel's thread out of the Inbox. Threads the viewer took part in—wrote or
-replied in, was mentioned in, or follows—are refetched whole on every repair
-and remembered per relay and viewer on this device, at most 100 threads, so
-they stay in the Inbox after their channel's window has moved on. When the
+to 100 recent events per channel—fewer on a large roster, so a first run's
+windows together fit the budget—so one busy channel cannot push another
+channel's thread out of the Inbox. Threads the viewer took part in—replied in,
+was mentioned or answered in, or follows—are refetched whole on every repair,
+before the channel windows, and remembered per relay and viewer on this
+device, at most 100 threads, so they stay in the Inbox after their channel's
+window has moved on. The Inbox is ready once the viewer's own recent messages
+and the remembered threads have landed and reports `observing` while the
+windows still read. A read that fails is tried once more; dropped after that,
+its channels stay as they were and the Inbox notes that some channels could
+not be checked until the next refresh, with no automatic retry. When the
 budget is full, the oldest evidence outside those threads goes first; the
 observation completes rather than resetting. A lazy addressed query returns up to 50 kind-9/40002
 messages. For those exact IDs and unresolved failed targets, general `#e`

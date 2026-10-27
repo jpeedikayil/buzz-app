@@ -35,6 +35,10 @@ export type InboxItem = Readonly<{
 export type InboxSnapshot = Readonly<{
   status: "idle" | "loading" | "ready" | "error";
   items: readonly InboxItem[];
-  freshness: "unknown" | "observed" | "stale";
+  /** `observing`: evidence is shown while a repair still reads the roster. */
+  freshness: "unknown" | "observing" | "observed" | "stale";
+  /** The last repair dropped some channel windows or thread reads after a
+   * retry; their channels stay as they were until the next repair. */
+  partial?: true;
   error?: string | undefined;
 }>;

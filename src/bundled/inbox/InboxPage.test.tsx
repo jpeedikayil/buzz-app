@@ -1603,6 +1603,7 @@ function fixture(
   let rosterStarted = false;
   let evidenceReads = 0;
   let unreadGate: Promise<void> | undefined;
+  let unreadFails = false;
   let unreadStarted = false;
   const historyRequests: string[] = [];
   const threadRequests: string[] = [];
@@ -1769,6 +1770,7 @@ function fixture(
         ) {
           unreadStarted = true;
           await unreadGate;
+          if (unreadFails) throw new Error("unread window unavailable");
         }
         if (
           filters.some((filter) => !!filter["#p"] && filter.kinds?.includes(9))
@@ -1959,6 +1961,9 @@ function fixture(
     evidenceReads: () => evidenceReads,
     historyRequests,
     unreadStarted: () => unreadStarted,
+    failUnread(value: boolean) {
+      unreadFails = value;
+    },
     holdUnread() {
       unreadStarted = false;
       let release = () => {};
@@ -2637,6 +2642,32 @@ it("reads a reopened row again after its tab closes", async () => {
   open();
   await findReader();
   await waitFor(() => expect(unread()).not.toBeInTheDocument());
+});
+
+it("a window dropped after its retry shows a soft notice with Refresh, not the failure banner", async () => {
+  const h = fixture();
+  render(h.view);
+  await waitFor(() =>
+    expect(h.owner.session.unread.inbox().status).toBe("ready"),
+  );
+  h.failUnread(true);
+  await act(() => h.owner.session.unread.refresh());
+  expect(h.owner.session.unread.inbox()).toMatchObject({
+    status: "ready",
+    freshness: "observed",
+    partial: true,
+  });
+  const notice = await screen.findByText("Some channels could not be checked.");
+  expect(notice.closest("[role=status]")).toBeInTheDocument();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  h.failUnread(false);
+  fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+  await waitFor(() =>
+    expect(
+      screen.queryByText("Some channels could not be checked."),
+    ).not.toBeInTheDocument(),
+  );
+  expect(h.owner.session.unread.inbox().partial).toBeUndefined();
 });
 
 it.each([false, true])(

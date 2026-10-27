@@ -368,15 +368,17 @@ it.each([1, 2, 130])(
       const repair = owner.session.unread.ensure();
       await flush();
       // Per-channel windows ride up to four single-channel filters per
-      // request, two requests in flight beside the head.
+      // request, two requests in flight beside the head; the viewer's
+      // newest messages ride the first request, for the participation pass.
       await vi.waitFor(() =>
-        expect(wire.pending[0]?.filters[0]?.since).toEqual(expect.any(Number)),
+        expect(wire.pending[0]?.filters[1]?.since).toEqual(expect.any(Number)),
       );
       const evidence = wire.next();
-      expect(evidence.filters[0]).toMatchObject({
+      // One page per channel, sized so the roster's windows fit the budget.
+      expect(evidence.filters[1]).toMatchObject({
         "#h": [first],
         include_aux: true,
-        limit: 100,
+        limit: Math.max(20, Math.min(100, Math.floor(3072 / count))),
         since: expect.any(Number),
       });
       // Force the production race: both the old head and unread batch are still
@@ -391,8 +393,6 @@ it.each([1, 2, 130])(
       const answer = (batch: Scripted) => {
         expect(batch.filters.length).toBeLessThanOrEqual(4);
         const batchIds = batch.filters.flatMap((filter) => {
-          // The viewer's newest messages ride the last request, for the
-          // participation pass.
           if (filter.authors) {
             authored++;
             expect(filter).toMatchObject({
