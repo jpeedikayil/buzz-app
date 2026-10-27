@@ -493,15 +493,17 @@ export const test = base.extend({
                   : []),
               ],
               `${community} ${channel} message ${i}\n${"Mixed height message content. ".repeat((1 + (i % 7) * 3) * (tallMessages ? 5 : 1))}${syntax ? `\n${syntax}` : ""}`,
-              readState ? peerKey : userKey,
+              readState || firstSeenHistory ? peerKey : userKey,
               1700000100 + Math.floor(i / historyRowsPerSecond),
             );
           }),
         );
-    // A joined channel the viewer has since written far more in: its newer
-    // messages fill the viewer's authored page, which has no window start,
-    // while the fixture honours the never-read window start for the channel
-    // windows (see the unread evidence read below).
+    // A joined channel the viewer has written far more in: its newer messages
+    // fill the viewer's authored page, which has no window start, and the
+    // walk through the rest of them pages back behind the windows, while the
+    // fixture honours the never-read window start for the channel windows
+    // (see the unread evidence read below). The measured history is by a
+    // peer, so the walk does not serve it before the measurement.
     if (firstSeenHistory)
       histories.set(
         "primary/busy",
@@ -1675,7 +1677,8 @@ export const test = base.extend({
             }
         return [...rows, ...aux];
       }
-      // Unread participation: the viewer's newest messages in the community.
+      // Unread participation: the viewer's newest messages in the community,
+      // and the walk's keyset pages back through the rest.
       if (
         filter.kinds?.includes(9) &&
         filter.authors?.length === 1 &&
@@ -1689,7 +1692,14 @@ export const test = base.extend({
           .flatMap(([, history]) => history)
           .filter(
             (event) =>
-              filter.kinds.includes(event.kind) && event.pubkey === viewer,
+              filter.kinds.includes(event.kind) &&
+              event.pubkey === viewer &&
+              (filter.since === undefined ||
+                event.created_at >= filter.since) &&
+              (filter.until === undefined ||
+                event.created_at < filter.until ||
+                (event.created_at === filter.until &&
+                  event.id > filter.before_id)),
           )
           .toSorted(
             (a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id),

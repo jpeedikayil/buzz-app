@@ -1,26 +1,37 @@
 /** Threads the viewer is part of, keyed `channel:root` with the newest
  * message time seen in each: written or replied in, mentioned in, or
- * explicitly followed. Unread refetches these threads on every repair so a
+ * explicitly followed. Unread reads these threads on every repair so a
  * participated thread stays in the Inbox after the per-channel windows and
- * the viewer's own recent messages no longer reach it. */
-export type ThreadParticipation = ReadonlyMap<string, number>;
+ * the viewer's own recent messages no longer reach it. `walk` is the newest
+ * time of the viewer's authored messages a repair has read through: the
+ * first repair on a device walks the viewer's whole authored history to
+ * learn their threads, later ones read only what was authored since. */
+export type ThreadParticipation = Readonly<{
+  roots: ReadonlyMap<string, number>;
+  walk?: Readonly<{ since: number }>;
+}>;
 export type ThreadParticipationStorage = Readonly<{
   read(): Promise<ThreadParticipation>;
-  write(roots: ThreadParticipation): Promise<void>;
+  write(participation: ThreadParticipation): Promise<void>;
   close(): void;
 }>;
 
-/** Newest threads win, as the reference desktop keeps 100 activity rows per
- * identity and relay. Each remembered root costs one `#e` read per repair,
- * grouped by channel, so the cap also bounds repair. */
-export const THREAD_PARTICIPATION_LIMIT = 100;
+/** Newest threads win, as the reference desktop seeds 1,000 activity rows
+ * per identity and relay. Only the newest few are reread whole each repair;
+ * the rest are asked for replies since their newest time, so the cap bounds
+ * the filters a repair sends, not its events. */
+export const THREAD_PARTICIPATION_LIMIT = 1000;
+
+export const NO_THREAD_PARTICIPATION: ThreadParticipation = {
+  roots: new Map(),
+};
 
 export function memoryThreadParticipation(): ThreadParticipationStorage {
-  let saved: ThreadParticipation = new Map();
+  let saved = NO_THREAD_PARTICIPATION;
   return {
     read: async () => saved,
-    write: async (roots) => {
-      saved = new Map(roots);
+    write: async ({ roots, walk }) => {
+      saved = { roots: new Map(roots), ...(walk ? { walk } : {}) };
     },
     close() {},
   };
@@ -43,11 +54,15 @@ function openDatabase() {
   });
 }
 /** Storage is untrusted: anything but a bounded list of `[key, time]` pairs
- * reads as nothing remembered. */
+ * reads as nothing remembered, and anything but a time as no walk. The
+ * record was the bare list before it carried the walk; that form still reads. */
 function parse(raw: unknown): ThreadParticipation {
-  if (!Array.isArray(raw)) return new Map();
-  return new Map(
-    raw
+  const record =
+    raw && typeof raw === "object" && !Array.isArray(raw)
+      ? (raw as { roots?: unknown; walk?: { since?: unknown } })
+      : { roots: raw };
+  const roots = new Map(
+    (Array.isArray(record.roots) ? record.roots : [])
       .filter(
         (entry): entry is [string, number] =>
           Array.isArray(entry) &&
@@ -58,6 +73,10 @@ function parse(raw: unknown): ThreadParticipation {
       )
       .slice(0, THREAD_PARTICIPATION_LIMIT),
   );
+  const since = record.walk?.since;
+  return Number.isSafeInteger(since) && (since as number) >= 0
+    ? { roots, walk: { since: since as number } }
+    : { roots };
 }
 /** Device-local and partitioned by relay and viewer, like read state. A
  * sibling database rather than a second store in `buzz-read-state-v1`, so
@@ -89,12 +108,15 @@ export function browserThreadParticipation(
         request.onerror = () => reject(request.error);
       });
     },
-    async write(roots) {
+    async write({ roots, walk }) {
       const db = await open();
       return new Promise((resolve, reject) => {
         const tx = db.transaction("partitions", "readwrite");
         tx.objectStore("partitions").put(
-          [...roots].slice(0, THREAD_PARTICIPATION_LIMIT),
+          {
+            roots: [...roots].slice(0, THREAD_PARTICIPATION_LIMIT),
+            ...(walk ? { walk: { since: walk.since } } : {}),
+          },
           scope,
         );
         tx.oncomplete = () => resolve();

@@ -76,6 +76,9 @@ async function setup({
   const reader = {
     read: vi.fn(async (filters: readonly ReadFilter[]) => {
       const windows = filters.flatMap((filter) => filter["#h"] ?? []);
+      // The walk's pages beyond the first fail as the "walk" channel would.
+      if (filters.some((filter) => filter.until !== undefined))
+        windows.push("walk");
       await Promise.all(windows.map((id) => held.get(id)));
       if (windows.some((id) => failing.has(id)))
         throw new Error("Relay read timed out");
@@ -83,6 +86,12 @@ async function setup({
         throw new DOMException("Relay read timed out", "TimeoutError");
       return filters.flatMap((filter) => {
         if (filter.authors && !filter["#e"] && !authoredPage) return [];
+        // `until` is exclusive at the keyset cursor, as the relay's is.
+        const before = (item: RelayEvent) =>
+          filter.until === undefined ||
+          item.created_at < filter.until ||
+          (item.created_at === filter.until &&
+            (filter.before_id === undefined || item.id > filter.before_id));
         const matched = store
           .filter(
             (item) =>
@@ -90,11 +99,13 @@ async function setup({
               (!filter.ids || filter.ids.includes(item.id)) &&
               (!filter.authors || filter.authors.includes(item.pubkey)) &&
               (filter.since === undefined || item.created_at >= filter.since) &&
-              (filter.until === undefined || item.created_at <= filter.until) &&
+              before(item) &&
               (!filter["#h"] || tagged(item, "h", filter["#h"])) &&
               (!filter["#e"] || tagged(item, "e", filter["#e"])),
           )
-          .sort((a, b) => b.created_at - a.created_at)
+          .sort(
+            (a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id),
+          )
           .slice(0, filter.limit);
         // `include_aux`: the relay adds the deletions of what matched.
         const ids = matched.map((item) => item.id);
@@ -162,7 +173,16 @@ async function setup({
     );
     return release;
   };
-  return { owner, store, reader, filters, failing, transient, hold };
+  return {
+    owner,
+    store,
+    reader,
+    filters,
+    failing,
+    transient,
+    hold,
+    participation,
+  };
 }
 
 it("a thread the viewer replied in outlives its channel's later traffic and a busier channel", async () => {
@@ -425,7 +445,7 @@ it("a window dropped after its retry leaves its channel unknown and the Inbox pa
 it("reads the viewer's page with 127 windows first, remembered and newly taught threads next, then the remaining windows", async () => {
   const participation = memoryThreadParticipation();
   const remembered = "f".repeat(64);
-  await participation.write(new Map([[`c1:${remembered}`, 1000]]));
+  await participation.write({ roots: new Map([[`c1:${remembered}`, 1000]]) });
   const h = await setup({
     channels: ["never1", "c1", "c2", "c3", "never2", ...filler],
     frontiers: { c1: 1100, c2: 1300, c3: 1200, ...fillerFrontiers },
@@ -473,9 +493,9 @@ it("a thread read's full-page split goes ahead of the remaining windows", async 
     participation,
   });
   const roots = [event("c1", peer, 1000), event("c1", peer, 1001)];
-  await participation.write(
-    new Map(roots.map((root, i) => [`c1:${root.id}`, 2000 + i])),
-  );
+  await participation.write({
+    roots: new Map(roots.map((root, i) => [`c1:${root.id}`, 2000 + i])),
+  });
   // Each root has a full page of replies, so one read of both overflows.
   for (const root of roots)
     for (let i = 0; i < 200; i++)
@@ -533,9 +553,9 @@ it("a full page's split rereads count each reply once against the participation 
   const roots = Array.from({ length: 4 }, (_, i) =>
     event("c0", peer, 1000 + i),
   );
-  await participation.write(
-    new Map(roots.map((root, i) => [`c0:${root.id}`, 3000 + i])),
-  );
+  await participation.write({
+    roots: new Map(roots.map((root, i) => [`c0:${root.id}`, 3000 + i])),
+  });
   for (const root of roots) {
     h.store.push(root, reply("c0", viewer, 1010, root));
     for (let i = 0; i < 199; i++)
@@ -660,12 +680,14 @@ it("remembers threads the viewer took part in, not every message they wrote", as
   const unrelated = reply("c0", peer, 1060, other);
   h.store.push(note, asked, answer, theirs, mine, other, unrelated);
   await h.owner.capability.ensure();
-  expect(await participation.read()).toEqual(
-    new Map([
+  // The walk mark is the newest message the viewer wrote.
+  expect(await participation.read()).toEqual({
+    roots: new Map([
       [`c0:${asked.id}`, 1020],
       [`c0:${theirs.id}`, 1040],
     ]),
-  );
+    walk: { since: 1040 },
+  });
 });
 
 it("a followed thread is remembered as of the follow and refetched", async () => {
@@ -685,7 +707,9 @@ it("a followed thread is remembered as of the follow and refetched", async () =>
   );
   h.owner.capability.follow("c0", root.id, true);
   await h.owner.capability.refresh();
-  expect(await participation.read()).toEqual(new Map([[`c0:${root.id}`, NOW]]));
+  expect(await participation.read()).toEqual({
+    roots: new Map([[`c0:${root.id}`, NOW]]),
+  });
   expect(h.filters()).toContainEqual(
     expect.objectContaining({ "#h": ["c0"], "#e": [root.id] }),
   );
@@ -763,7 +787,10 @@ it("remembered participation is saved and refetches the thread after the authore
     expect.objectContaining({ rootId: root.id, unreadCount: 200 }),
   );
   // Remembered with the newest time the thread read saw.
-  expect(write).toHaveBeenCalledWith(new Map([[`c0:${root.id}`, 1219]]));
+  expect(write).toHaveBeenCalledWith({
+    roots: new Map([[`c0:${root.id}`, 1219]]),
+    walk: { since: 1010 },
+  });
   first.owner.dispose();
   // A later session: the viewer has since written a page of newer messages
   // elsewhere, so their authored page no longer reaches the old reply, which
@@ -798,7 +825,7 @@ it("remembered participation is saved and refetches the thread after the authore
 it("a remembered thread the viewer's deleted reply joined leaves the Inbox after restart", async () => {
   const participation = memoryThreadParticipation();
   const root = event("c0", peer, 1000);
-  await participation.write(new Map([[`c0:${root.id}`, 1219]]));
+  await participation.write({ roots: new Map([[`c0:${root.id}`, 1219]]) });
   const h = await setup({
     channels: ["c0"],
     frontiers: { c0: 1300 },
@@ -826,4 +853,187 @@ it("a remembered thread the viewer's deleted reply joined leaves the Inbox after
       h.owner.capability.inbox().items.find((item) => item.rootId === root.id),
     ).toBeUndefined(),
   );
+});
+
+// A viewer with 140 threads behind 480 later one-liners: the newest page is
+// one-liners only, so only the walk reaches the threads.
+function history(h: Awaited<ReturnType<typeof setup>>) {
+  const roots = Array.from({ length: 140 }, (_, i) =>
+    event(i % 2 ? "b" : "a", peer, 1000 + i),
+  );
+  const mine = roots.map((root, i) =>
+    reply(root.tags[0]?.[1] ?? "", viewer, 2000 + i, root),
+  );
+  const notes = Array.from({ length: 480 }, (_, i) =>
+    event("a", viewer, 3000 + i),
+  );
+  h.store.push(...roots, ...mine, ...notes);
+  return { roots, mine, notes };
+}
+
+it("a device's first repair walks the viewer's history behind the windows, remembering every thread they replied in, and reads new replies in the older ones", async () => {
+  const participation = memoryThreadParticipation();
+  const h = await setup({
+    channels: ["a", "b"],
+    frontiers: { a: 9600, b: 9600 },
+    participation,
+  });
+  const { roots, notes } = history(h);
+  // A peer answered the oldest thread since; the others are quiet.
+  const [oldest, quiet] = roots as [RelayEvent, RelayEvent];
+  const answer = reply("a", peer, 9500, oldest);
+  h.store.push(answer);
+  await h.owner.capability.ensure();
+  const requests = h.reader.read.mock.calls.map(([filters]) => filters);
+  // Today's page first, then two keyset pages of 500 behind the windows:
+  // the third is short, so the walk ends.
+  expect(requests[0]?.[0]).toEqual({
+    kinds: [9, 40002, 40008],
+    authors: [viewer],
+    include_aux: true,
+    limit: 100,
+  });
+  const pages = requests.filter((request) =>
+    request.some((filter) => filter.until !== undefined),
+  );
+  expect(pages).toEqual([
+    [
+      expect.objectContaining({
+        authors: [viewer],
+        until: 3380,
+        before_id: notes[380]?.id,
+        limit: 500,
+      }),
+    ],
+    [
+      expect.objectContaining({
+        authors: [viewer],
+        until: 2020,
+        before_id: h.store.find((item) => item.created_at === 2020)?.id,
+        limit: 500,
+      }),
+    ],
+  ]);
+  const windows = requests.findIndex((request) =>
+    request.some((filter) => filter["#h"] && !filter["#e"]),
+  );
+  expect(requests.indexOf(pages[0] as ReadFilter[])).toBeGreaterThan(windows);
+  // The 50 newest threads are read whole with their roots; the other 90 are
+  // each asked for replies since their newest time, and only the answered
+  // thread's root is then fetched.
+  const hot = h
+    .filters()
+    .filter(
+      (filter) => filter["#e"] && !filter.authors && filter.since === undefined,
+    );
+  expect(hot.map((filter) => filter["#e"]?.length)).toEqual([25, 25]);
+  expect(hot.every((filter) => filter.limit === 200)).toBe(true);
+  const cold = h
+    .filters()
+    .filter((filter) => filter["#e"] && filter.since !== undefined);
+  expect(cold).toHaveLength(90);
+  expect(cold.at(-1)).toEqual(
+    expect.objectContaining({
+      "#h": ["a"],
+      "#e": [oldest.id],
+      since: 2001,
+      limit: 50,
+    }),
+  );
+  expect(cold).toContainEqual(
+    expect.objectContaining({ "#h": ["b"], "#e": [quiet.id], since: 2002 }),
+  );
+  const fetched = h.filters().flatMap((filter) => filter.ids ?? []);
+  expect(fetched).toHaveLength(51);
+  expect(fetched).toContain(oldest.id);
+  expect(fetched).not.toContain(quiet.id);
+  const inbox = () => h.owner.capability.inbox();
+  expect(inbox()).toMatchObject({ status: "ready", freshness: "observed" });
+  expect(inbox().partial).toBeUndefined();
+  // The viewer's reply is older than the read reaches, so their membership
+  // is looked up; the read answer then shows under its fetched root.
+  await vi.waitFor(() =>
+    expect(inbox().items).toContainEqual(
+      expect.objectContaining({
+        rootId: oldest.id,
+        messageIds: [answer.id],
+        unreadCount: 0,
+      }),
+    ),
+  );
+  expect(
+    inbox().items.find((item) => item.rootId === quiet.id),
+  ).toBeUndefined();
+  // The walk's pages are not evidence: the one-liners outside the window are
+  // not retained, so channel a's count stays that of its window.
+  expect(
+    h.owner.capability.snapshot({ kind: "channel", channelId: "a" })
+      .observedCount,
+  ).toBe(0);
+  const saved = await participation.read();
+  expect(saved.roots.size).toBe(140);
+  expect(saved.roots.get(`a:${oldest.id}`)).toBe(9500);
+  expect(saved.walk).toEqual({ since: 3479 });
+  h.owner.dispose();
+  // The next repair reads only what was authored since the walk — the mark
+  // itself repeats, as `since` is inclusive — and walks no further.
+  const second = await setup({
+    channels: ["a", "b"],
+    frontiers: { a: 9600, b: 9600 },
+    participation,
+  });
+  second.store.push(...h.store);
+  const late = event("b", peer, 9000);
+  second.store.push(late, reply("b", viewer, 9700, late));
+  await second.owner.capability.ensure();
+  const again = second.reader.read.mock.calls.map(([filters]) => filters);
+  expect(again[0]?.[0]).toMatchObject({
+    authors: [viewer],
+    since: 3479,
+    limit: 100,
+  });
+  expect(
+    second.filters().filter((filter) => filter.until !== undefined),
+  ).toEqual([]);
+  // The 50 newest remembered threads by channel, then the thread the page
+  // just taught; the other 90 are asked one by one.
+  expect(
+    second
+      .filters()
+      .filter((filter) => filter["#e"] && !filter.authors && !filter.since),
+  ).toHaveLength(3);
+  expect(
+    second.filters().filter((filter) => filter["#e"] && filter.since),
+  ).toHaveLength(90);
+  expect(await second.participation.read()).toMatchObject({
+    walk: { since: 9700 },
+  });
+  expect((await participation.read()).roots.size).toBe(141);
+});
+
+it("a dropped walk page leaves the walk to the next repair without marking channels unchecked", async () => {
+  const participation = memoryThreadParticipation();
+  const h = await setup({
+    channels: ["a", "b"],
+    frontiers: { a: 9600, b: 9600 },
+    participation,
+  });
+  history(h);
+  h.failing.add("walk");
+  await h.owner.capability.ensure();
+  const inbox = h.owner.capability.inbox();
+  expect(inbox).toMatchObject({ status: "ready", freshness: "observed" });
+  expect(inbox.partial).toBeUndefined();
+  expect(inbox.error).toBeUndefined();
+  // The page was tried twice; nothing beyond today's page was learned.
+  expect(
+    h.filters().filter((filter) => filter.until !== undefined),
+  ).toHaveLength(2);
+  expect(await participation.read()).toEqual({ roots: new Map() });
+  // The next repair walks again from the newest page.
+  h.failing.clear();
+  await h.owner.capability.refresh();
+  const saved = await participation.read();
+  expect(saved.roots.size).toBe(140);
+  expect(saved.walk).toEqual({ since: 3479 });
 });

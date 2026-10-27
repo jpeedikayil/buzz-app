@@ -23,10 +23,11 @@ const keysAre = (filter: object, names: readonly string[]) => {
  * reader and hosts otherwise enforce: up to UNREAD_WINDOW_BATCH content-kind
  * filters with `include_aux`, each one of the repair's shapes — a channel
  * window (`#h` of one channel, `since`), the viewer's authored page
- * (`authors` of one key, at most once), a thread read (`#h` of one channel
- * and up to 100 `#e` roots) or a fetch of up to 100 `ids` with the same
- * `limit`. The relay honours each filter's own limit, which keeps the events
- * one request returns bounded. */
+ * (`authors` of one key, at most once, `since` the last walk or none), a
+ * thread read (`#h` of one channel and up to 100 `#e` roots, whole or
+ * `since` the threads' newest time) or a fetch of up to 100 `ids` with the
+ * same `limit`. The relay honours each filter's own limit, which keeps the
+ * events one request returns bounded. */
 export function isUnreadWindowBatch(value: unknown): boolean {
   if (
     !Array.isArray(value) ||
@@ -55,24 +56,30 @@ export function isUnreadWindowBatch(value: unknown): boolean {
       channel.length === 1 &&
       typeof channel[0] === "string" &&
       CHANNEL_ID.test(channel[0]);
+    const since =
+      filter.since === undefined ||
+      (Number.isInteger(filter.since) && filter.since >= 0);
+    const shape = (names: readonly string[]) =>
+      keysAre(filter, names) ||
+      (filter.since !== undefined && keysAre(filter, [...names, "since"]));
     if (keysAre(filter, ["kinds", "#h", "since", "include_aux", "limit"])) {
       if (
         !channelled ||
-        !Number.isInteger(filter.since) ||
-        (filter.since as number) < 0 ||
+        filter.since === undefined ||
+        !since ||
         windows.has(channel[0])
       )
         return false;
       windows.add(channel[0]);
       return true;
     }
-    if (keysAre(filter, ["kinds", "authors", "include_aux", "limit"])) {
-      if (authored || !hexes(filter.authors, 1)) return false;
+    if (shape(["kinds", "authors", "include_aux", "limit"])) {
+      if (authored || !hexes(filter.authors, 1) || !since) return false;
       authored = true;
       return true;
     }
-    if (keysAre(filter, ["kinds", "#h", "#e", "include_aux", "limit"]))
-      return channelled && hexes(filter["#e"], 100);
+    if (shape(["kinds", "#h", "#e", "include_aux", "limit"]))
+      return channelled && hexes(filter["#e"], 100) && since;
     if (keysAre(filter, ["kinds", "ids", "include_aux", "limit"]))
       return hexes(filter.ids, 100) && filter.limit === filter.ids?.length;
     return false;

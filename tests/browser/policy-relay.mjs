@@ -362,10 +362,12 @@ export function policyRelay({
             filters.flatMap((filter) => answer(community, filter)),
           );
         }
-        // Unread participation: the viewer's threads refetched whole, one
-        // `#e` filter per channel naming its roots, with roots the retained
-        // evidence lacks fetched by ID in the same request. Unread repair
-        // requests carry up to 128 filters (`isUnreadWindowBatch`).
+        // Unread participation: the viewer's newest threads refetched whole,
+        // one `#e` filter per channel naming its roots, with roots the
+        // retained evidence lacks fetched by ID in the same request; older
+        // threads asked one root at a time for replies since their newest.
+        // Unread repair requests carry up to 128 filters
+        // (`isUnreadWindowBatch`).
         if (
           filters.every(
             (filter) =>
@@ -373,15 +375,18 @@ export function policyRelay({
               filter.include_aux &&
               ((filter["#h"]?.length === 1 &&
                 filter["#e"] &&
-                !filter.authors &&
-                filter.since === undefined) ||
+                !filter.authors) ||
                 (filter.ids && !filter["#h"] && !filter["#e"])),
           )
         ) {
           expect(filters.length).toBeLessThanOrEqual(128);
           const community = communityOf(url);
           for (const filter of filters) {
-            expect(filter.limit).toBe(filter.ids ? filter.ids.length : 200);
+            if (filter.since !== undefined) {
+              expect(filter["#e"]).toHaveLength(1);
+              expect(filter.limit).toBe(50);
+            } else
+              expect(filter.limit).toBe(filter.ids ? filter.ids.length : 200);
             report.queries.push({ community, filter, at: performance.now() });
           }
           return Response.json(
@@ -438,7 +443,8 @@ export function policyRelay({
         }
         // Unread evidence windows: single-channel filters, each since its
         // channel's read mark, up to 128 per request; the viewer's own newest
-        // messages ride the first request.
+        // messages ride the first request, and when that page is full the
+        // walk pages back through their history one request at a time.
         if (
           filters.every(
             (filter) =>
@@ -454,7 +460,11 @@ export function policyRelay({
           const community = communityOf(url);
           for (const filter of filters) {
             // One page per channel, smaller on a large roster.
-            if (filter.authors) expect(filter.limit).toBe(100);
+            if (filter.authors && filter.until !== undefined) {
+              expect(filters).toHaveLength(1);
+              expect(filter.before_id).toEqual(expect.any(String));
+              expect(filter.limit).toBe(500);
+            } else if (filter.authors) expect(filter.limit).toBe(100);
             else {
               expect(filter.limit).toBeGreaterThanOrEqual(20);
               expect(filter.limit).toBeLessThanOrEqual(100);

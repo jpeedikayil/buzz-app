@@ -128,14 +128,19 @@ own since its read mark (or since the last week, when never read anywhere), up
 to 100 recent events per channel—fewer on a large roster, so a first run's
 windows together fit the budget—so one busy channel cannot push another
 channel's thread out of the Inbox. Threads the viewer took part in—replied in,
-was mentioned or answered in, or follows—are refetched whole on every repair,
-before the channel windows, and remembered per relay and viewer on this
-device, at most 100 threads, so they stay in the Inbox after their channel's
-window has moved on. The windows, the viewer's own recent messages and the
-thread reads ride together, up to 128 filters per request with two requests
-in flight, so a roster costs one or two round trips. The Inbox is ready once
-the viewer's own recent messages and the remembered threads have landed, or
-were dropped, and reports `observing` while further windows still read. A
+was mentioned or answered in, or follows—are remembered per relay and viewer
+on this device, at most 1,000 threads, so they stay in the Inbox after their
+channel's window has moved on: the 50 most recently active are refetched
+whole on every repair, before the channel windows, and the rest are asked
+only for replies newer than what was last seen, behind the windows. A device's
+first repair also walks back through the viewer's own messages, behind the
+windows, to learn the threads they replied in before their most recent
+messages; later repairs read only what they wrote since. The windows, the
+viewer's own recent messages and the thread reads ride together, up to 128
+filters per request with two requests in flight, so a roster costs one or two
+round trips. The Inbox is ready once the viewer's own recent messages and the
+most recently active remembered threads have landed, or were dropped, and
+reports `observing` while further windows still read. A
 read that fails is tried once more; dropped after that, its channels stay as
 they were and the Inbox notes that some channels could not be checked until
 the next refresh, with no automatic retry, and later reads that fail in the
