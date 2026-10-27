@@ -614,6 +614,194 @@ it("a full page's split rereads count each reply once against the participation 
     );
 });
 
+// Six remembered threads the viewer replied in, of 300 unread replies each
+// outside the channel's full window, and 44 remembered threads with nothing:
+// the hot tier, whose whole reads offer 1,194 replies to the 1,024-reply
+// budget. `cold` roots are remembered behind them with the time given, so
+// their reads are the last request, held until the six whole reads have
+// landed; the authored page is since the walk mark, so only the viewer's
+// replies in the busy threads are retained.
+async function spentBudget(
+  cold: readonly (readonly [RelayEvent, number])[],
+  events: readonly RelayEvent[],
+) {
+  const participation = memoryThreadParticipation();
+  const h = await setup({
+    channels: ["c0"],
+    frontiers: { c0: 5000 },
+    participation,
+  });
+  const busy = Array.from({ length: 6 }, (_, i) => event("c0", peer, 1000 + i));
+  const peerReplies = new Set<string>();
+  for (const [i, root] of busy.entries()) {
+    h.store.push(root, reply("c0", viewer, 8500 + i, root));
+    for (let j = 0; j < 300; j++) {
+      const answer = reply("c0", peer, 5100 + j, root);
+      peerReplies.add(answer.id);
+      h.store.push(answer);
+    }
+  }
+  h.store.push(...flood("c0", 100, 9000), ...events);
+  const quiet = Array.from({ length: 44 }, (_, i): [string, ThreadMark] => [
+    `c0:${"f".repeat(60)}${i.toString(16).padStart(4, "0")}`,
+    { at: 6000 + i },
+  ]);
+  await participation.write({
+    roots: new Map<string, ThreadMark>([
+      ...quiet,
+      ...busy.map((root, i): [string, ThreadMark] => [
+        `c0:${root.id}`,
+        { at: 7000 + i },
+      ]),
+      ...cold.map(([root, at]): [string, ThreadMark] => [
+        `c0:${root.id}`,
+        { at },
+      ]),
+    ]),
+    walk: { since: 8000 },
+  });
+  const release = h.hold("cold");
+  const done = h.owner.capability.ensure();
+  try {
+    await vi.waitFor(() =>
+      expect(
+        busy.every((root) =>
+          h
+            .filters()
+            .some(
+              (filter) =>
+                filter["#e"]?.[0] === root.id &&
+                filter["#e"].length === 1 &&
+                filter.since === undefined,
+            ),
+        ),
+      ).toBe(true),
+    );
+  } finally {
+    release();
+  }
+  await done;
+  const items = () => h.owner.capability.inbox().items;
+  const busyReplies = new Set(
+    items()
+      .filter((item) => busy.some((root) => root.id === item.rootId))
+      .flatMap((item) => item.messageIds)
+      .filter((id) => peerReplies.has(id)),
+  ).size;
+  return { h, items, busyReplies };
+}
+
+it("a thread whose read lands after busier threads spent the budget still gets its newest unread reply", async () => {
+  const root = event("c0", peer, 1000);
+  const answer = reply("c0", peer, 5050, root);
+  // The thread's newest reply is the viewer's, read; the one before it is a
+  // peer's, unread. Its slot was kept while the busier threads read.
+  const { items, busyReplies } = await spentBudget(
+    [[root, 1010]],
+    [
+      root,
+      reply("c0", viewer, 1010, root),
+      answer,
+      reply("c0", viewer, 5060, root),
+    ],
+  );
+  expect(busyReplies).toBe(1023);
+  await vi.waitFor(() =>
+    expect(items()).toContainEqual(
+      expect.objectContaining({
+        rootId: root.id,
+        unreadCount: 1,
+        messageIds: [answer.id],
+      }),
+    ),
+  );
+});
+
+it("each thread in a landing is given its newest unread reply before the busiest one takes the rest", async () => {
+  const roots = [event("c0", peer, 1000), event("c0", peer, 1001)];
+  const [talkative, quiet] = roots;
+  assert(talkative && quiet);
+  const answer = reply("c0", peer, 5050, quiet);
+  // Two slots were kept for the two threads; newest first alone would give
+  // both to the talkative thread's newer replies.
+  const { items, busyReplies } = await spentBudget(
+    [
+      [talkative, 1020],
+      [quiet, 1010],
+    ],
+    [
+      ...roots,
+      reply("c0", viewer, 1020, talkative),
+      ...Array.from({ length: 40 }, (_, i) =>
+        reply("c0", peer, 5100 + i, talkative),
+      ),
+      reply("c0", viewer, 1010, quiet),
+      answer,
+    ],
+  );
+  expect(busyReplies).toBe(1022);
+  await vi.waitFor(() => {
+    expect(items()).toContainEqual(
+      expect.objectContaining({
+        rootId: talkative.id,
+        unreadCount: 1,
+        messageIds: [expect.toSatisfy((id: string) => id !== answer.id)],
+      }),
+    );
+    expect(items()).toContainEqual(
+      expect.objectContaining({
+        rootId: quiet.id,
+        unreadCount: 1,
+        messageIds: [answer.id],
+      }),
+    );
+  });
+});
+
+it("a dropped read releases its thread's reserved slot to the reads still to land", async () => {
+  const participation = memoryThreadParticipation();
+  const cold = event("c0", peer, 1000);
+  await coldThread(participation, "c0", cold, 1010);
+  const h = await setup({
+    channels: ["c0", "busy"],
+    frontiers: { c0: 5000, busy: 5000 },
+    participation,
+  });
+  h.store.push(cold, reply("c0", viewer, 1010, cold));
+  // Six threads the viewer replied in after the channel's mark: the window
+  // teaches them once it lands, after the cold read has been dropped, and
+  // their whole reads offer 1,194 read replies to the budget.
+  const busy = Array.from({ length: 6 }, (_, i) =>
+    event("busy", peer, 1000 + i),
+  );
+  const peerReplies = new Set<string>();
+  for (const [i, root] of busy.entries()) {
+    h.store.push(root, reply("busy", viewer, 5500 + i, root));
+    for (let j = 0; j < 300; j++) {
+      const answer = reply("busy", peer, 1100 + j, root);
+      peerReplies.add(answer.id);
+      h.store.push(answer);
+    }
+  }
+  h.failing.add("cold");
+  const release = h.hold("busy");
+  const done = h.owner.capability.ensure();
+  try {
+    await vi.waitFor(() => expect(coldReads(h, cold)).toHaveLength(2));
+  } finally {
+    release();
+  }
+  await done;
+  const admitted = new Set(
+    h.owner.capability
+      .inbox()
+      .items.filter((item) => busy.some((root) => root.id === item.rootId))
+      .flatMap((item) => item.messageIds)
+      .filter((id) => peerReplies.has(id)),
+  );
+  expect(admitted.size).toBe(1024);
+});
+
 it("a dropped first request still lets the Inbox leave loading", async () => {
   const h = await setup({
     channels: ["c1", "c0", ...filler, "quiet"],

@@ -1751,8 +1751,9 @@ export function createUnread({
   // under another's older time, COLD_LIMIT each and usually none, with a root
   // fetched by ID once a reply arrives. Across threads, only the newest
   // PARTICIPATION_BUDGET replies are admitted per repair, the most recently
-  // active threads having been asked first: pinned evidence must leave the
-  // channel windows at least three quarters of the retained budget.
+  // active threads having been asked first and each thread asked its newest
+  // unread reply before the rest: pinned evidence must leave the channel
+  // windows at least three quarters of the retained budget.
   const THREAD_LIMIT = 200;
   const HOT_THREADS = 50;
   const COLD_LIMIT = 50;
@@ -1929,11 +1930,14 @@ export function createUnread({
         .sort(([, a], [, b]) => b.at - a.at)
         .slice(0, THREAD_PARTICIPATION_LIMIT)
         .map(([key]) => key);
-    // Roots asked for this repair, roots asked for by ID, every event the
+    // Roots asked for this repair, those whose read has not landed, those
+    // holding an admitted reply, roots asked for by ID, every event the
     // thread reads returned, and the replies admitted so far by ID: a full
     // page's split rereads replies the page already admitted, which count
     // once.
     const fetched = new Set<string>();
+    const pending = new Set<string>();
+    const held = new Set<string>();
     const fetchedIds = new Set<string>();
     const rows = new Map<string, RelayEvent>();
     const admitted = new Set<string>();
@@ -1958,6 +1962,7 @@ export function createUnread({
       for (const key of keys) {
         if (fetched.has(key)) continue;
         fetched.add(key);
+        pending.add(key);
         const separator = key.indexOf(":");
         const channelId = key.slice(0, separator);
         groups.set(channelId, [
@@ -2090,13 +2095,29 @@ export function createUnread({
         if (rank < 0) return [];
         return rank < HOT_THREADS ? this.hot([key]) : this.cold([key]);
       },
+      /** A thread read's result, or `undefined` for a dropped read, which
+       * only releases its roots' reserved slots. */
       landed(
         request: readonly ReadFilter[],
-        result: readonly RelayEvent[],
+        result: readonly RelayEvent[] | undefined,
         requests: ReadFilter[][],
       ) {
+        // Every root asked for and not yet landed keeps one slot of the
+        // budget, so a read landing later still has room for its newest
+        // unread reply; a root already holding an admitted reply needs none.
+        // This request's roots have landed and are served below.
+        const asked = request.flatMap((filter) => {
+          const channelId = filter["#h"]?.[0];
+          return channelId
+            ? (filter["#e"] ?? []).map((rootId) => `${channelId}:${rootId}`)
+            : [];
+        });
+        for (const key of asked) pending.delete(key);
+        if (!result) return true;
+        const reserve = [...pending].filter((key) => !held.has(key)).length;
         // A full page may hide replies under a filter's other roots, or
-        // older than a lone root's `since` page reaches.
+        // older than a lone root's `since` page reaches; the roots are asked
+        // for again and keep their slots.
         for (const filter of request) {
           const channelId = filter["#h"]?.[0];
           const rootIds = filter["#e"];
@@ -2111,6 +2132,7 @@ export function createUnread({
               ),
           ).length;
           if (page < filter.limit) continue;
+          for (const rootId of rootIds) pending.add(`${channelId}:${rootId}`);
           // The split stays ahead of the windows, as the thread read was.
           if (rootIds.length < 2) {
             requests.unshift([threads(channelId, rootIds)]);
@@ -2124,30 +2146,71 @@ export function createUnread({
         }
         // A cold read's boundary reply was seen by an earlier repair and is
         // passed over. Replies already retained cost the budget nothing: one
-        // a window read, or one this pass admitted. The rest are admitted
-        // newest first while the budget lasts; what is not admitted is not
-        // kept and teaches no thread a newer time, so a later read still
-        // reaches it.
+        // a window read, or one this pass admitted. Of the rest, each root
+        // holding no admitted reply yet is given its newest unread reply, or
+        // its newest, most recently active threads first; then the rest are
+        // admitted newest first while the budget less the reserve lasts.
+        // What is not admitted is not kept and teaches no thread a newer
+        // time, so a later read still reaches it.
         const reply = (event: RelayEvent) =>
           contentKind(event) && !!threadReference(event);
-        const seen = (event: RelayEvent) => {
+        const keyOf = (event: RelayEvent) => {
           const channelId = channelOf(event);
           const rootId = threadReference(event)?.rootId;
-          return (
-            !!channelId &&
-            !!rootId &&
-            boundary.get(`${channelId}:${rootId}`) === event.id
-          );
+          return channelId && rootId ? `${channelId}:${rootId}` : undefined;
+        };
+        const seen = (event: RelayEvent) => {
+          const key = keyOf(event);
+          return key !== undefined && boundary.get(key) === event.id;
         };
         const fresh = result.filter((event) => !seen(event));
-        const replies = fresh
+        const candidates = fresh
           .filter(
             (event) =>
               reply(event) && !admitted.has(event.id) && !structural(event.id),
           )
-          .sort(byTime)
-          .slice(0, Math.max(0, PARTICIPATION_BUDGET - admitted.size));
-        for (const event of replies) admitted.add(event.id);
+          .sort(byTime);
+        const byRoot = new Map<string, RelayEvent[]>();
+        for (const event of candidates) {
+          const key = keyOf(event);
+          if (key) byRoot.set(key, [...(byRoot.get(key) ?? []), event]);
+        }
+        const state = reads.state();
+        const unread = (event: RelayEvent, key: string) => {
+          const separator = key.indexOf(":");
+          const rootId = key.slice(separator + 1);
+          return (
+            event.pubkey !== viewer &&
+            event.created_at >
+              Math.max(
+                effectiveFrontier(
+                  state,
+                  `msg:${event.id}`,
+                  key.slice(0, separator),
+                  rootId,
+                ) ?? -1,
+                state.frontiers[`thread-activity:${rootId}`] ?? -1,
+              )
+          );
+        };
+        const room = () => PARTICIPATION_BUDGET - reserve - admitted.size;
+        const replies: RelayEvent[] = [];
+        const admit = (event: RelayEvent, key: string | undefined) => {
+          admitted.add(event.id);
+          if (key) held.add(key);
+          replies.push(event);
+        };
+        for (const [key, events] of [...byRoot].sort(
+          ([a], [b]) => (roots.get(b)?.at ?? 0) - (roots.get(a)?.at ?? 0),
+        )) {
+          const [newest] = events;
+          if (!newest || held.has(key) || room() <= 0) continue;
+          admit(events.find((event) => unread(event, key)) ?? newest, key);
+        }
+        for (const event of candidates) {
+          if (room() <= 0) break;
+          if (!admitted.has(event.id)) admit(event, keyOf(event));
+        }
         const kept = fresh.filter(
           (event) =>
             !reply(event) || admitted.has(event.id) || !!structural(event.id),
@@ -2261,8 +2324,7 @@ export function createUnread({
           "background",
           { landed: false, dropped: true, failure: undefined },
           (request, result, queue) =>
-            current() &&
-            (result === undefined || run.pass.landed(request, result, queue)),
+            current() && run.pass.landed(request, result, queue),
         );
         if (!current()) return;
         run.pass.learn();
@@ -2373,9 +2435,9 @@ export function createUnread({
         ) => {
           let ok = true;
           const walk = walkPage(request);
-          if (!result) unchecked ||= request.some(checks);
-          else if (request.some((filter) => filter["#e"] || filter.ids))
+          if (request.some((filter) => filter["#e"] || filter.ids))
             ok = pass.landed(request, result, queue);
+          else if (!result) unchecked ||= request.some(checks);
           else {
             // A read channel with nothing since its mark is observed with
             // nothing unread; a never-read channel with no recent history
