@@ -461,6 +461,50 @@ it("a lookup that lands after the repair reads the thread it found in the backgr
   );
 });
 
+it("a lookup that lands as the repair's last read does still gets its thread read, in a follow-up", async () => {
+  const { owner, store, reader, threadReads, participation } = await setup();
+  const root = event(peer, 9, 10, []);
+  const mine = reply(viewer, 11, root);
+  const answer = reply(peer, 700, root);
+  store.push(root, mine, answer, ...flood(499, 100));
+  const answers = reader.read.getMockImplementation();
+  assert(answers);
+  // Each read resolves a tick after the relay answers. The first request
+  // lands and its publish starts the answer's lookups at once (the
+  // subscriber projects the Inbox), so the membership read's answer and the
+  // repair's last drain interleave: the lookup lands after the drain found
+  // the queue empty and before the pool was released, the one window in
+  // which its thread read would wait for the next repair. Should the
+  // repair's tail change shape, the lookup lands in the pool or after its
+  // release instead, and the read is made either way.
+  reader.read.mockImplementation(async (request) => {
+    const result = await answers(request);
+    return result;
+  });
+  const stop = owner.capability.subscribeInbox(() => {
+    owner.capability.inbox();
+  });
+  try {
+    await owner.capability.ensure();
+    expect(owner.capability.inbox()).toMatchObject({
+      status: "ready",
+      freshness: "observed",
+    });
+    await vi.waitFor(() => expect(threadReads()).toBe(1));
+    await vi.waitFor(async () =>
+      expect((await participation.read()).roots.get(`c0:${root.id}`)).toEqual({
+        at: 11,
+        newestId: mine.id,
+      }),
+    );
+    expect(owner.capability.inbox().items).toContainEqual(
+      expect.objectContaining({ rootId: root.id, unreadCount: 1 }),
+    );
+  } finally {
+    stop();
+  }
+});
+
 it("a follow-up read that fails is dropped without a retry, and the thread is still remembered", async () => {
   const { owner, store, reader, threadReads, participation } = await setup();
   const root = event(peer, 9, 10, []);

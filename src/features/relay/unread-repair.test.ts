@@ -59,12 +59,15 @@ async function setup({
   frontiers,
   participation = memoryThreadParticipation(),
   authoredPage = true,
+  localUnread = {},
 }: {
   channels: readonly string[];
   frontiers: Readonly<Record<string, number>>;
   participation?: ReturnType<typeof memoryThreadParticipation>;
   // Whether the viewer's newest authored page still reaches their old replies.
   authoredPage?: boolean;
+  // Messages marked unread on this device, which a relaunch keeps.
+  localUnread?: Readonly<Record<string, number>>;
 }) {
   const store: RelayEvent[] = [];
   // Channels whose window requests fail: every time, or only the first.
@@ -133,6 +136,9 @@ async function setup({
   let journal: ReadJournal | undefined = {
     ...newReadJournal(),
     state: { frontiers, overrides: {} },
+    localUnread: { ...localUnread },
+    // A saved mark's revision is at most the journal's.
+    revision: Math.max(0, ...Object.values(localUnread)),
   };
   const reads = createReadState({
     viewer,
@@ -802,18 +808,38 @@ it("a dropped read releases its thread's reserved slot to the reads still to lan
   expect(admitted.size).toBe(1024);
 });
 
-it("a large cold set keeps at most a quarter of the budget from the hot landing", async () => {
+it("a large cold set keeps at most a quarter of the budget from the hot landing, and its landing threads still each admit one reply", async () => {
   // 950 remembered threads behind the hot ones, their reads held while the
   // six whole reads land: the landings still fill three quarters of the
-  // budget, rather than the 74 slots the whole cold set would leave.
-  const { busyReplies } = await spentBudget(
-    Array.from(
-      { length: 950 },
-      (_, i) => [event("c0", peer, 100 + i), 500 + i] as const,
-    ),
-    [],
+  // budget, rather than the 74 slots the whole cold set would leave. Five of
+  // the cold threads, in the first cold request to land (the most recently
+  // written in), have an unread reply each: with 822 roots still pending
+  // the reserve is at its cap, but a landing root's one slot is drawn on
+  // the whole budget, not on the budget less the reserve, which is spent.
+  // The viewer's own reply in each, at the thread's mark, is not admitted;
+  // the membership lookup finds it and the row shows.
+  const cold = Array.from(
+    { length: 950 },
+    (_, i) => [event("c0", peer, 100 + i), 500 + i] as const,
   );
+  const answered = cold.slice(945).map(([root]) => root);
+  const answers = answered.map((root, i) => reply("c0", peer, 5050 + i, root));
+  const { items, busyReplies } = await spentBudget(cold, [
+    ...answered,
+    ...answered.map((root, i) => reply("c0", viewer, 1445 + i, root)),
+    ...answers,
+  ]);
   expect(busyReplies).toBe(768);
+  await vi.waitFor(() => {
+    for (const [i, root] of answered.entries())
+      expect(items()).toContainEqual(
+        expect.objectContaining({
+          rootId: root.id,
+          unreadCount: 1,
+          messageIds: [answers[i]?.id],
+        }),
+      );
+  });
 });
 
 it("a dropped first request still lets the Inbox leave loading", async () => {
@@ -1484,6 +1510,136 @@ it("a cold thread's unread replies return on every launch until read; read, the 
   expect(fetched(fourth)).not.toContain(root.id);
   expect(row(fourth)).toBeUndefined();
   expect(await mark()).toEqual({ at: 2002, newestId: newest.id });
+});
+
+it("a cold thread's boundary reply marked unread on this device is admitted on the next launch, not passed over", async () => {
+  const participation = memoryThreadParticipation();
+  const root = event("c0", peer, 1000);
+  const mine = reply("c0", viewer, 1010, root);
+  const answer = reply("c0", peer, 2000, root);
+  await coldThread(participation, "c0", root, 1010, mine.id);
+  const history = [root, mine, answer, ...flood("c0", 100, 3000)];
+  // The thread was read through the answer on another device.
+  const frontiers = { c0: 1500, [`thread:${root.id}`]: 2000 };
+  const launch = async (localUnread: Readonly<Record<string, number>> = {}) => {
+    const h = await setup({
+      channels: ["c0"],
+      frontiers,
+      participation,
+      localUnread,
+    });
+    h.store.push(...history);
+    await h.owner.capability.ensure();
+    return h;
+  };
+  type Launch = Awaited<ReturnType<typeof launch>>;
+  const row = (h: Launch) =>
+    h.owner.capability.inbox().items.find((item) => item.rootId === root.id);
+  const mark = async () =>
+    (await participation.read()).roots.get(`c0:${root.id}`);
+  // The read answer is the thread's newest reply: the repair learns it as
+  // the boundary. Marked unread here, it counts at once.
+  const first = await launch();
+  await vi.waitFor(() => expect(row(first)).toMatchObject({ unreadCount: 0 }));
+  expect(await mark()).toEqual({ at: 2000, newestId: answer.id });
+  await first.owner.capability.markUnreadLocal({
+    kind: "message",
+    channelId: "c0",
+    messageId: answer.id,
+  });
+  expect(row(first)).toMatchObject({ unreadCount: 1, manual: true });
+  expect(await mark()).toEqual({ at: 2000, newestId: answer.id });
+  first.owner.dispose();
+  // Relaunched, the cold read returns the boundary alone; still marked
+  // unread on this device, it is admitted under its fetched root and its
+  // mark does not pass it.
+  const second = await launch({ [`msg:${answer.id}`]: 1 });
+  expect(coldReads(second, root)).toEqual([
+    expect.objectContaining({ since: 2000 }),
+  ]);
+  await vi.waitFor(() =>
+    expect(row(second)).toMatchObject({
+      unreadCount: 1,
+      manual: true,
+      messageIds: [answer.id],
+    }),
+  );
+  expect(await mark()).toEqual({ at: 2000, newestId: answer.id });
+});
+
+it("a cold thread's reply marked unread below its mark moves the mark back to it, and the mark stays there across launches until the mark is cleared", async () => {
+  const participation = memoryThreadParticipation();
+  const root = event("c0", peer, 1000);
+  const mine = reply("c0", viewer, 1010, root);
+  const answer = reply("c0", peer, 2000, root);
+  const later = reply("c0", peer, 2100, root);
+  await coldThread(participation, "c0", root, 1010, mine.id);
+  const history = [root, mine, answer, later, ...flood("c0", 100, 3000)];
+  // The thread was read through the later reply on another device.
+  const frontiers = { c0: 1500, [`thread:${root.id}`]: 2100 };
+  const launch = async (localUnread: Readonly<Record<string, number>> = {}) => {
+    const h = await setup({
+      channels: ["c0"],
+      frontiers,
+      participation,
+      localUnread,
+    });
+    h.store.push(...history);
+    await h.owner.capability.ensure();
+    return h;
+  };
+  type Launch = Awaited<ReturnType<typeof launch>>;
+  const row = (h: Launch) =>
+    h.owner.capability.inbox().items.find((item) => item.rootId === root.id);
+  const mark = async () =>
+    (await participation.read()).roots.get(`c0:${root.id}`);
+  const write = vi.spyOn(participation, "write");
+  // Both read replies return and the mark advances past them. Marking the
+  // older one unread moves the mark back to it, saved at once.
+  const first = await launch();
+  await vi.waitFor(() => expect(row(first)).toMatchObject({ unreadCount: 0 }));
+  expect(await mark()).toEqual({ at: 2100, newestId: later.id });
+  write.mockClear();
+  await first.owner.capability.markUnreadLocal({
+    kind: "message",
+    channelId: "c0",
+    messageId: answer.id,
+  });
+  expect(row(first)).toMatchObject({ unreadCount: 1, manual: true });
+  expect(write).toHaveBeenCalledTimes(1);
+  expect(await mark()).toEqual({ at: 2000 });
+  first.owner.dispose();
+  // Relaunched, the cold read reaches the marked reply again; the later
+  // read reply returns too and does not move the mark past it.
+  const marked = { [`msg:${answer.id}`]: 1 };
+  const second = await launch(marked);
+  expect(coldReads(second, root)).toEqual([
+    expect.objectContaining({ since: 2000 }),
+  ]);
+  await vi.waitFor(() =>
+    expect(row(second)).toMatchObject({
+      unreadCount: 1,
+      manual: true,
+      messageIds: expect.arrayContaining([answer.id, later.id]),
+    }),
+  );
+  expect(await mark()).toEqual({ at: 2000 });
+  second.owner.dispose();
+  // And on the launch after that. Cleared, the next repair learns the later
+  // reply as the boundary again.
+  const third = await launch(marked);
+  await vi.waitFor(() =>
+    expect(row(third)).toMatchObject({ unreadCount: 1, manual: true }),
+  );
+  expect(await mark()).toEqual({ at: 2000 });
+  await third.owner.capability.clearUnreadLocal({
+    kind: "message",
+    channelId: "c0",
+    messageId: answer.id,
+  });
+  expect(row(third)).toMatchObject({ unreadCount: 0, manual: false });
+  await third.owner.capability.refresh();
+  expect(await mark()).toEqual({ at: 2100, newestId: later.id });
 });
 
 it("a cold thread whose page comes back full is read whole, losing none of its replies", async () => {

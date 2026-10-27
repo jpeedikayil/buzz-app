@@ -368,9 +368,11 @@ export function createUnread({
   // retained messages and lookup witnesses: the automatic follow.
   const ownThreads = new Set<string>();
   // `channel:root` of the threads the viewer is part of, with the newest
-  // message time seen in each (see thread-participation.ts). Read from storage
-  // by the first repair, extended and read again by every repair, and evicted
-  // last when retained evidence overflows.
+  // time they wrote or read in each (see thread-participation.ts). Read from
+  // storage by the first repair, extended and read again by every repair, and
+  // evicted last when retained evidence overflows. The live map is bounded by
+  // what the walk, the evidence and follows can teach; the 1,000 limit is
+  // applied where it is read (`newest()`) and in the saved record.
   let remembered: Map<string, ThreadMark> | undefined;
   // What storage holds, with the walk mark, so a repair writes only a change.
   let persisted: ThreadParticipation | undefined;
@@ -616,10 +618,18 @@ export function createUnread({
       reads.localUnread(`msg:${event.id}`)
     )
       return true;
-    return relevant(entry, dm) && afterFrontier(entry, state, dm);
+    return (
+      relevant(entry, dm) && afterFrontier(entry, state, timeline(entry, dm))
+    );
   }
-  /** The read-state half of unread, before conversation relevance. */
-  function afterFrontier(entry: Evidence, state: ReadState, dm: boolean) {
+  /** The read-state half of unread, before conversation relevance; `ordinary`
+   * is a top-level message the channel catch-up mark reads (see `timeline`).
+   * A thread read's reply is judged by the same marks as retained evidence. */
+  function afterFrontier(
+    entry: Pick<Evidence, "event" | "channelId" | "rootId">,
+    state: ReadState,
+    ordinary: boolean,
+  ) {
     const { event, channelId, rootId } = entry;
     const frontier = effectiveFrontier(
       state,
@@ -641,13 +651,13 @@ export function createUnread({
     // Channel catch-up never acknowledges thread replies: retained evidence
     // cannot prove nonparticipation, especially after reload. Only ordinary
     // top-level messages inherit it; reply attention/direct thread dots survive.
-    const ordinary = timeline(entry, dm)
+    const catchUp = ordinary
       ? state.frontiers[`activity:${channelId}`]
       : undefined;
     const thread = rootId
       ? state.frontiers[`thread-activity:${rootId}`]
       : undefined;
-    const caughtUp = Math.max(frontier ?? -1, ordinary ?? -1, thread ?? -1);
+    const caughtUp = Math.max(frontier ?? -1, catchUp ?? -1, thread ?? -1);
     return event.created_at > caughtUp || !!forced;
   }
   /** An ordinary top-level message: the channel catch-up mark reads it. Its
@@ -1410,7 +1420,8 @@ export function createUnread({
     // except in a remembered thread: the viewer's reply may be older than the
     // thread page and the authored page both reach, so the lookup recovers
     // that verified witness, or finds it deleted and leaves the thread.
-    const read = () => !afterFrontier(entry, reads.state(), dm);
+    const read = () =>
+      !afterFrontier(entry, reads.state(), timeline(entry, dm));
     const structuralRootId =
       !entry.rootId &&
       (chosen(entry) === true ||
@@ -1739,18 +1750,19 @@ export function createUnread({
   const WINDOW_CONCURRENCY = 2;
   const WINDOW_FLOOR_SECONDS = 7 * 24 * 60 * 60;
   // The viewer's threads ride the same requests as the windows do. The
-  // HOT_THREADS most recently active are refetched whole, one filter per
-  // channel naming its roots (a full page splits a filter's roots, as
-  // `viewerReplies` does); the rest are asked only for replies since their
+  // HOT_THREADS most recently read or written in are refetched whole, one
+  // filter per channel naming its roots (a full page splits a filter's roots,
+  // as `viewerReplies` does); the rest are asked only for replies since their
   // newest time, one filter per root so no thread's seen replies are reread
   // under another's older time, COLD_LIMIT each and usually none, with a root
   // fetched by ID once a reply arrives. Across threads, only the newest
-  // PARTICIPATION_BUDGET replies are admitted per repair, the most recently
-  // active threads having been asked first and each thread asked its newest
-  // unread reply before the rest, with at most PARTICIPATION_RESERVE slots
-  // kept for the reads still to land, so a large cold set (mostly empty) does
-  // not starve the hot landing: pinned evidence must leave the channel
-  // windows at least three quarters of the retained budget.
+  // PARTICIPATION_BUDGET replies are admitted per repair, the threads most
+  // recently read or written in having been asked first and each thread
+  // given its newest unread reply before the rest fill, with at most
+  // PARTICIPATION_RESERVE slots kept from the fill for the reads still to
+  // land, so a large cold set (mostly empty) does not starve the hot
+  // landing: pinned evidence must leave the channel windows at least three
+  // quarters of the retained budget.
   const THREAD_LIMIT = 200;
   const HOT_THREADS = 50;
   const COLD_LIMIT = 50;
@@ -1911,45 +1923,64 @@ export function createUnread({
     for (const [key, following] of choices())
       if (following && !roots.has(key) && active(key))
         roots.set(key, { at: seen });
-    /** A peer's reply the viewer has not read, by the marks the Inbox counts
-     * with: `msg:`, channel, `thread:` and `thread-activity:` frontiers. */
+    /** A peer's reply the viewer has not read, as `isUnread` judges one:
+     * marked unread on this device, or past the marks the Inbox counts with
+     * (`msg:`, channel, `thread:` and `thread-activity:` frontiers and the
+     * synced overrides). */
     const unreadReply = (event: RelayEvent, key: string, state: ReadState) => {
       const separator = key.indexOf(":");
-      const rootId = key.slice(separator + 1);
+      const channelId = key.slice(0, separator);
       return (
         event.pubkey !== viewer &&
-        event.created_at >
-          Math.max(
-            effectiveFrontier(
-              state,
-              `msg:${event.id}`,
-              key.slice(0, separator),
-              rootId,
-            ) ?? -1,
-            state.frontiers[`thread-activity:${rootId}`] ?? -1,
-          )
+        (!!forcedMessages.get(channelId)?.has(event.id) ||
+          !!reads.localUnread(`msg:${event.id}`) ||
+          afterFrontier(
+            { event, channelId, rootId: key.slice(separator + 1) },
+            state,
+            false,
+          ))
       );
     };
-    // Of replies in the same second, the first by `byTime` is the newest. A
-    // thread in a channel the roster lacks is learned, not read: the walk
-    // mark advances past the viewer's replies in it. A thread only an unread
-    // reply teaches is remembered as of its root, when that is held.
+    // An unread reply caps its thread's mark for this pass at its own time,
+    // whatever is read after it, so the cold read still reaches it; a reply
+    // marked unread below the mark moves the mark back to it, the one way a
+    // mark moves back. Of replies in the same second, the first by `byTime`
+    // is the newest. A thread in a channel the roster lacks is learned, not
+    // read: the walk mark advances past the viewer's replies in it. A thread
+    // only an unread reply teaches is remembered as of its root, when that is
+    // held.
+    const ceilings = new Map<string, number>();
+    const moveBack = (key: string, at: number) => {
+      const mark = roots.get(key);
+      if (mark && mark.at > at) roots.set(key, { at });
+    };
+    const cap = (key: string, at: number) => {
+      ceilings.set(key, Math.min(ceilings.get(key) ?? at, at));
+      moveBack(key, at);
+    };
     const learn = (key: string, event: RelayEvent) => {
       if (!followed(key)) return;
       if (threadReference(event) && unreadReply(event, key, reads.state())) {
+        cap(key, event.created_at);
         const root = structural(key.slice(key.indexOf(":") + 1));
         if (root && !threadReference(root) && !roots.has(key)) learn(key, root);
         return;
       }
-      const { created_at: at, id } = event;
+      const ceiling = ceilings.get(key);
+      const [at, newestId] =
+        ceiling !== undefined && ceiling < event.created_at
+          ? [ceiling, undefined]
+          : [event.created_at, event.id];
       const mark = roots.get(key);
       if (
         !mark ||
         at > mark.at ||
         (at === mark.at &&
-          (mark.newestId === undefined || id.localeCompare(mark.newestId) < 0))
+          newestId !== undefined &&
+          (mark.newestId === undefined ||
+            newestId.localeCompare(mark.newestId) < 0))
       )
-        roots.set(key, { at, newestId: id });
+        roots.set(key, newestId === undefined ? { at } : { at, newestId });
     };
     const newest = () =>
       [...roots]
@@ -2118,6 +2149,14 @@ export function createUnread({
         if (rank < 0) return [];
         return rank < HOT_THREADS ? this.hot([key]) : this.cold([key]);
       },
+      /** A reply marked unread on this device: its thread's mark moves back
+       * to it (to the root, for a thread), so the cold read reaches it again,
+       * and the record is saved; `learn` keeps the mark there while the reply
+       * stays unread. */
+      lower(key: string, at: number) {
+        moveBack(key, at);
+        this.save();
+      },
       /** A thread read's result, or `undefined` for a dropped read, which
        * only releases its roots' reserved slots. */
       landed(
@@ -2176,8 +2215,9 @@ export function createUnread({
         // Replies already retained cost the budget nothing: one
         // a window read, or one this pass admitted. Of the rest, each root
         // holding no admitted reply yet is given its newest unread reply, or
-        // its newest, most recently active threads first; then the rest are
-        // admitted newest first while the budget less the reserve lasts.
+        // its newest, most recently read or written in first, drawing on the
+        // whole budget (the reserve is kept for exactly these); then the rest
+        // are admitted newest first while the budget less the reserve lasts.
         // What is not admitted is not kept and teaches no thread a newer
         // time, so a later read still reaches it.
         const reply = (event: RelayEvent) =>
@@ -2219,7 +2259,8 @@ export function createUnread({
           ([a], [b]) => (roots.get(b)?.at ?? 0) - (roots.get(a)?.at ?? 0),
         )) {
           const [newest] = events;
-          if (!newest || held.has(key) || room() <= 0) continue;
+          if (!newest || held.has(key) || admitted.size >= PARTICIPATION_BUDGET)
+            continue;
           admit(
             events.find((event) => unreadReply(event, key, state)) ?? newest,
             key,
@@ -2400,9 +2441,10 @@ export function createUnread({
         const marked = new Set(
           windows.flatMap(({ id, since }) => (since === undefined ? [] : [id])),
         );
-        // The viewer's newest messages ride the first request, and the most
-        // recently active remembered threads are read right behind it, before
-        // the windows: the pinned rows are the ones the windows cannot show.
+        // The viewer's newest messages ride the first request, and the
+        // remembered threads most recently read or written in are read right
+        // behind it, before the windows: the pinned rows are the ones the
+        // windows cannot show.
         // The other remembered threads are asked for new replies, and the
         // walk pages back through the viewer's history, behind the windows.
         const pass = participating(new Set(ids), stored);
@@ -2523,6 +2565,9 @@ export function createUnread({
         if (!progress.landed) throw progress.failure;
         pass.learn();
         pass.save();
+        // A lookup that landed between the last drain and the pool's release
+        // queued its read for a pool that had finished; it is the follow-up's.
+        if (requests.length) void followUp(run);
         // A dropped request leaves its channels as they were; the Inbox says
         // so until the next repair, with no automatic retry.
         partial = unchecked;
@@ -3466,9 +3511,28 @@ export function createUnread({
         return true;
       };
       if (!valid()) throw new Error("Unread target unavailable");
-      return serialize(target.channelId, () =>
+      const result = await serialize(target.channelId, () =>
         reads.markLocalUnread(key, valid),
       );
+      // In a remembered thread, the mark moves back to the reply marked
+      // unread, or to the root for a thread, so the cold read reaches it
+      // again on later launches; the repair's `learn` keeps it there while
+      // the reply stays unread.
+      if (target.kind !== "channel") {
+        const event = events.get(
+          target.kind === "thread" ? target.rootId : target.messageId,
+        );
+        const rootId =
+          target.kind === "thread"
+            ? target.rootId
+            : event && threadReference(event)?.rootId;
+        if (event && rootId)
+          activePass?.pass.lower(
+            conversationKey(target.channelId, rootId),
+            event.created_at,
+          );
+      }
+      return result;
     },
     async clearUnreadLocal(target) {
       const key = targetKey(target);
