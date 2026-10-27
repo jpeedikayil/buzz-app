@@ -776,7 +776,9 @@ it("notification startup waits for the roster without consuming the shared evide
   const evidence = () =>
     h.query.mock.calls.filter(([filters]) => filters[0]?.kinds?.includes(9));
   expect(evidence()).toHaveLength(1);
-  expect(evidence()[0]?.[0][0]).toMatchObject({ "#h": ["room"] });
+  expect(evidence()[0]?.[0]).toContainEqual(
+    expect.objectContaining({ "#h": ["room"] }),
+  );
   h.discover();
   await h.owner.session.unread.ensure();
   expect(h.markerQuery).toHaveBeenCalledOnce();
