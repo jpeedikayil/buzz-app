@@ -4,6 +4,7 @@ import type { ChannelQueries } from "./contracts";
 import { eventVisibility } from "./event-access";
 import type { ReadFilter, RelayEvent } from "./events";
 import { createReadState } from "./read-state";
+import type { Priority, ReadOptions } from "./reader";
 import {
   newReadJournal,
   readJournal,
@@ -476,9 +477,13 @@ it("a lookup that lands as the repair's last read does still gets its thread rea
   // the queue empty and before the pool was released, the one window in
   // which its thread read would wait for the next repair. Should the
   // repair's tail change shape, the lookup lands in the pool or after its
-  // release instead, and the read is made either way.
-  reader.read.mockImplementation(async (request) => {
+  // release instead, and the read is made either way; a follow-up's read is
+  // made in the background, where the repair's pool reads in the foreground.
+  let threadRead: Priority | undefined;
+  reader.read.mockImplementation(async (request, options?: ReadOptions) => {
     const result = await answers(request);
+    if (request.some((filter) => filter["#e"] && !filter.authors))
+      threadRead = options?.priority;
     return result;
   });
   const stop = owner.capability.subscribeInbox(() => {
@@ -497,6 +502,7 @@ it("a lookup that lands as the repair's last read does still gets its thread rea
         newestId: mine.id,
       }),
     );
+    expect(threadRead).toBe("background");
     expect(owner.capability.inbox().items).toContainEqual(
       expect.objectContaining({ rootId: root.id, unreadCount: 1 }),
     );

@@ -1944,11 +1944,12 @@ export function createUnread({
     // An unread reply caps its thread's mark for this pass at its own time,
     // whatever is read after it, so the cold read still reaches it; a reply
     // marked unread below the mark moves the mark back to it, the one way a
-    // mark moves back. Of replies in the same second, the first by `byTime`
-    // is the newest. A thread in a channel the roster lacks is learned, not
-    // read: the walk mark advances past the viewer's replies in it. A thread
-    // only an unread reply teaches is remembered as of its root, when that is
-    // held.
+    // mark moves back, and a thread or root marked unread holds the mark at
+    // the root while that intent lasts. Of replies in the same second, the
+    // first by `byTime` is the newest. A thread in a channel the roster lacks
+    // is learned, not read: the walk mark advances past the viewer's replies
+    // in it. A thread only an unread reply teaches is remembered as of its
+    // root, when that is held.
     const ceilings = new Map<string, number>();
     const moveBack = (key: string, at: number) => {
       const mark = roots.get(key);
@@ -1960,9 +1961,15 @@ export function createUnread({
     };
     const learn = (key: string, event: RelayEvent) => {
       if (!followed(key)) return;
+      const rootId = key.slice(key.indexOf(":") + 1);
+      const root = structural(rootId);
+      if (
+        reads.localUnread(`thread:${rootId}`) ||
+        reads.localUnread(`msg:${rootId}`)
+      )
+        cap(key, root?.created_at ?? roots.get(key)?.at ?? event.created_at);
       if (threadReference(event) && unreadReply(event, key, reads.state())) {
         cap(key, event.created_at);
-        const root = structural(key.slice(key.indexOf(":") + 1));
         if (root && !threadReference(root) && !roots.has(key)) learn(key, root);
         return;
       }
@@ -2150,11 +2157,13 @@ export function createUnread({
         return rank < HOT_THREADS ? this.hot([key]) : this.cold([key]);
       },
       /** A reply marked unread on this device: its thread's mark moves back
-       * to it (to the root, for a thread), so the cold read reaches it again,
-       * and the record is saved; `learn` keeps the mark there while the reply
-       * stays unread. */
+       * to it (to the root, for a thread or its root), capped there for this
+       * pass so a lookup's single-event `learn` cannot re-advance it before a
+       * save, and the record is saved; `learn` keeps the mark there while the
+       * reply stays unread. */
       lower(key: string, at: number) {
-        moveBack(key, at);
+        if (!roots.has(key)) return;
+        cap(key, at);
         this.save();
       },
       /** A thread read's result, or `undefined` for a dropped read, which
@@ -3515,9 +3524,9 @@ export function createUnread({
         reads.markLocalUnread(key, valid),
       );
       // In a remembered thread, the mark moves back to the reply marked
-      // unread, or to the root for a thread, so the cold read reaches it
-      // again on later launches; the repair's `learn` keeps it there while
-      // the reply stays unread.
+      // unread, or to the root for a thread or its root, so the cold read
+      // reaches it again on later launches; the repair's `learn` keeps it
+      // there while the reply stays unread.
       if (target.kind !== "channel") {
         const event = events.get(
           target.kind === "thread" ? target.rootId : target.messageId,
@@ -3525,7 +3534,7 @@ export function createUnread({
         const rootId =
           target.kind === "thread"
             ? target.rootId
-            : event && threadReference(event)?.rootId;
+            : event && (threadReference(event)?.rootId ?? event.id);
         if (event && rootId)
           activePass?.pass.lower(
             conversationKey(target.channelId, rootId),

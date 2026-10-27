@@ -1642,6 +1642,156 @@ it("a cold thread's reply marked unread below its mark moves the mark back to it
   expect(await mark()).toEqual({ at: 2100, newestId: later.id });
 });
 
+// A cold thread read through its newest reply on this device, then marked
+// unread as a whole or by its root: the mark holds at the root across
+// launches while the intent lasts, so the row keeps returning. A thread mark
+// counts nothing on the row; a peer's root is held for grouping but is not a
+// row entry, so its own mark shows nowhere in the Inbox.
+for (const [name, target] of [
+  [
+    "thread",
+    (root: RelayEvent) => ({ kind: "thread" as const, rootId: root.id }),
+  ],
+  [
+    "root",
+    (root: RelayEvent) => ({ kind: "message" as const, messageId: root.id }),
+  ],
+] as const) {
+  it(`a cold thread marked unread by its ${name} holds its mark at the root across launches until the mark is cleared`, async () => {
+    const participation = memoryThreadParticipation();
+    const root = event("c0", peer, 1000);
+    const mine = reply("c0", viewer, 1010, root);
+    const answer = reply("c0", peer, 2000, root);
+    const later = reply("c0", peer, 2100, root);
+    await coldThread(participation, "c0", root, 1010, mine.id);
+    const history = [root, mine, answer, later, ...flood("c0", 100, 3000)];
+    // The thread was read through the later reply on another device.
+    const frontiers = { c0: 1500, [`thread:${root.id}`]: 2100 };
+    const launch = async (
+      localUnread: Readonly<Record<string, number>> = {},
+    ) => {
+      const h = await setup({
+        channels: ["c0"],
+        frontiers,
+        participation,
+        localUnread,
+      });
+      h.store.push(...history);
+      await h.owner.capability.ensure();
+      return h;
+    };
+    type Launch = Awaited<ReturnType<typeof launch>>;
+    const row = (h: Launch) =>
+      h.owner.capability.inbox().items.find((item) => item.rootId === root.id);
+    const mark = async () =>
+      (await participation.read()).roots.get(`c0:${root.id}`);
+    const marked = { channelId: "c0", ...target(root) };
+    const manual = name === "thread";
+    const first = await launch();
+    await vi.waitFor(() =>
+      expect(row(first)).toMatchObject({ unreadCount: 0, manual: false }),
+    );
+    expect(await mark()).toEqual({ at: 2100, newestId: later.id });
+    await first.owner.capability.markUnreadLocal(marked);
+    expect(row(first)).toMatchObject({ unreadCount: 0, manual });
+    expect((await mark())?.at).toBe(1000);
+    first.owner.dispose();
+    // Relaunched, the cold read begins at the root and the row returns; the
+    // read replies it carries do not advance the mark.
+    const kept = { [`${name === "thread" ? "thread" : "msg"}:${root.id}`]: 1 };
+    const second = await launch(kept);
+    expect(coldReads(second, root)).toEqual([
+      expect.objectContaining({ since: 1000 }),
+    ]);
+    await vi.waitFor(() =>
+      expect(row(second)).toMatchObject({
+        unreadCount: 0,
+        manual,
+        messageIds: expect.arrayContaining([answer.id, later.id]),
+      }),
+    );
+    expect((await mark())?.at).toBe(1000);
+    second.owner.dispose();
+    // And on the launch after that. Cleared, the next repair learns the later
+    // reply as the boundary again.
+    const third = await launch(kept);
+    expect(coldReads(third, root)).toEqual([
+      expect.objectContaining({ since: 1000 }),
+    ]);
+    await vi.waitFor(() =>
+      expect(row(third)).toMatchObject({ unreadCount: 0, manual }),
+    );
+    expect((await mark())?.at).toBe(1000);
+    await third.owner.capability.clearUnreadLocal(marked);
+    expect(row(third)).toMatchObject({ unreadCount: 0, manual: false });
+    await third.owner.capability.refresh();
+    expect(await mark()).toEqual({ at: 2100, newestId: later.id });
+  });
+}
+
+it("a lookup feeding a thread whose mark was just lowered cannot re-advance it before another thread's mark is saved", async () => {
+  const participation = memoryThreadParticipation();
+  const rootA = event("c0", peer, 20);
+  const rootB = event("c0", peer, 20);
+  const answerA = reply("c0", peer, 700, rootA);
+  const answerB = reply("c0", peer, 720, rootB);
+  // Both threads were read through 900 on another device.
+  await participation.write({
+    roots: new Map([
+      [`c0:${rootA.id}`, { at: 900 }],
+      [`c0:${rootB.id}`, { at: 900 }],
+    ]),
+    walk: { since: 6000 },
+  });
+  const h = await setup({
+    channels: ["c0"],
+    frontiers: {
+      c0: 20,
+      [`thread:${rootA.id}`]: 900,
+      [`thread:${rootB.id}`]: 900,
+    },
+    participation,
+  });
+  h.store.push(rootA, rootB, answerA, answerB);
+  await h.owner.capability.ensure();
+  const marks = async () => {
+    const { roots } = await participation.read();
+    return [roots.get(`c0:${rootA.id}`), roots.get(`c0:${rootB.id}`)];
+  };
+  expect(await marks()).toEqual([{ at: 900 }, { at: 900 }]);
+  // Marking A's reply unread lowers A's mark to it.
+  await h.owner.capability.markUnreadLocal({
+    kind: "message",
+    channelId: "c0",
+    messageId: answerA.id,
+  });
+  expect(await marks()).toEqual([{ at: 700 }, { at: 900 }]);
+  // The viewer replies in A from another device, newer than the lowered
+  // mark; the read reply's membership lookup finds that reply and feeds it
+  // to the pass, which has already read A: no follow-up, no full learn.
+  const mine = reply("c0", viewer, 800, rootA);
+  h.store.push(mine);
+  h.owner.capability.inbox();
+  await vi.waitFor(() =>
+    expect(h.owner.capability.attention("c0", answerA.id)).toMatchObject({
+      category: "thread",
+    }),
+  );
+  expect(h.filters()).toContainEqual(
+    expect.objectContaining({
+      authors: [viewer],
+      "#e": expect.arrayContaining([rootA.id]),
+    }),
+  );
+  // Lowering B's mark saves the record: A's mark is still the lowered one.
+  await h.owner.capability.markUnreadLocal({
+    kind: "message",
+    channelId: "c0",
+    messageId: answerB.id,
+  });
+  expect(await marks()).toEqual([{ at: 700 }, { at: 720 }]);
+});
+
 it("a cold thread whose page comes back full is read whole, losing none of its replies", async () => {
   const participation = memoryThreadParticipation();
   const root = event("c0", peer, 1000);

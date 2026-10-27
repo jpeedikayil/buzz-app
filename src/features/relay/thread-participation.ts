@@ -2,7 +2,8 @@
  * its root) and, when known, the ID of the newest reply at that time: a read
  * since the time is inclusive, and the reply with that ID is the one already
  * read. An unread reply advances neither, so it is read again until read; a
- * reply marked unread below the time moves it back to itself. */
+ * reply marked unread below the time moves it back to itself, and a thread
+ * or root marked unread holds it at the root. */
 export type ThreadMark = Readonly<{ at: number; newestId?: string }>;
 /** Threads the viewer is part of, keyed `channel:root` with the newest
  * message seen in each: written or replied in, mentioned in, or explicitly

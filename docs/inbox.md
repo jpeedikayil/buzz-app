@@ -136,10 +136,11 @@ asked only for replies since the newest one the viewer wrote or read, behind
 the windows—that reply is remembered by ID and passed over when it returns, so
 a reply in the same second is not missed and a quiet thread costs nothing on
 later launches, while a thread's unread replies return on every repair until
-they are read, and a reply marked unread moves that mark back to itself. A
-device's first repair also walks back through the viewer's own messages,
-behind the windows, to learn the threads they replied in before their most
-recent messages; later repairs read only what they wrote since.
+they are read, and a reply marked unread moves that mark back to itself (a
+thread or root marked unread, back to the root). A device's first repair also
+walks back through the viewer's own messages, behind the windows, to learn the
+threads they replied in before their most recent messages; later repairs read
+only what they wrote since.
 The windows, the viewer's own recent messages and the thread reads ride
 together, up to 128 filters per request with two requests in flight, so a
 roster costs one or two round trips. The Inbox is ready once the viewer's own
