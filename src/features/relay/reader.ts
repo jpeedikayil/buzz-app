@@ -15,6 +15,10 @@ export type ReadOptions = {
   priority?: Priority;
   /** A write preflight must start after its intent, never join an older in-flight read. */
   fresh?: boolean;
+  /** A read of every channel resolves the channels its events name first,
+   * whatever their kinds, so a readable one the session does not know yet is
+   * not dropped. It waits for discovery: before it, the read fails. */
+  resolveChannels?: boolean;
 };
 /** Finite, verified event reads. No retained event cache or claim of live freshness. */
 export type RelayReader = {

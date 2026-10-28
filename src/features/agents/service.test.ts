@@ -8481,9 +8481,8 @@ it("listens in a public channel it is not in, but delivers a watch's turn only w
 it("holds a public channel's catch-up until its metadata is known, and hears it in a watch of every channel", async () => {
   vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
   try {
-    const { service, run, history, recover, storage, pending } = await setup({
-      identities: [echo],
-    });
+    const { service, run, history, recover, storage, pending, session } =
+      await setup({ identities: [echo] });
     const now = nowSeconds();
     vi.setSystemTime(now * 1000);
     const watch = { ...chat["watch/chat"], channels: [plaza] };
@@ -8524,6 +8523,16 @@ it("holds a public channel's catch-up until its metadata is known, and hears it 
     await settle();
     await settle();
     expect(heard(run)).toEqual(["missed", "posted"]);
+    // Its read asks the session to resolve the channels it finds.
+    expect(
+      vi
+        .mocked(session.read)
+        .mock.calls.filter(([filters]) => filters[0]?.until !== undefined)
+        .map(([filters, options]) => [
+          !!filters[0]?.["#h"],
+          !!options?.resolveChannels,
+        ]),
+    ).toContainEqual([false, true]);
   } finally {
     vi.useRealTimers();
   }

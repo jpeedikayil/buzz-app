@@ -660,24 +660,31 @@ export function createRelaySession(
     events = events.filter((event) => event.kind !== PRODUCT_FEEDBACK_KIND);
     // Ranked global search needs channel authority before visibility filtering.
     // Store metadata reads use channelTraffic=false, so this cannot recurse.
+    // So does a read of every channel that asks for it, of any kinds.
+    const chat = (kind: number) => [9, 40002, 40008].includes(kind);
+    const broad = !!settings?.resolveChannels;
     if (
       channelTraffic &&
       filters.every(
         (filter) =>
-          (filter.search !== undefined ||
+          (broad ||
+            filter.search !== undefined ||
             !!filter.authors?.length ||
             filter.since !== undefined ||
             filter.until !== undefined) &&
           !filter["#h"]?.length &&
           !!filter.kinds?.length &&
-          filter.kinds.every((kind) => [9, 40002, 40008].includes(kind)),
+          (broad || filter.kinds.every(chat)),
       )
     ) {
+      // A lookup may extend a discovered list, never stand in for it.
+      if (broad && channels.queries.list().status !== "ready")
+        throw new ReadError("unavailable", "Channels are not discovered yet.");
       const ids = [
         ...new Set(
           events.flatMap((event) => {
             const tags = event.tags.filter(([name]) => name === "h");
-            return [9, 40002, 40008].includes(event.kind) &&
+            return (broad || chat(event.kind)) &&
               tags.length === 1 &&
               tags[0]?.[1]
               ? [tags[0][1]]
@@ -686,13 +693,15 @@ export function createRelaySession(
         ),
       ];
       await channels.queries.resolve?.(ids, settings);
-      events = events.filter((event) => {
-        const destinations = event.tags.filter(([name]) => name === "h");
-        const id = destinations[0]?.[1];
-        return (
-          destinations.length === 1 && !!id && !!channels.queries.get?.(id)
-        );
-      });
+      // A read of every channel keeps what visibility keeps below.
+      if (!broad)
+        events = events.filter((event) => {
+          const destinations = event.tags.filter(([name]) => name === "h");
+          const id = destinations[0]?.[1];
+          return (
+            destinations.length === 1 && !!id && !!channels.queries.get?.(id)
+          );
+        });
       settings?.signal?.throwIfAborted();
       if (closed || epoch !== accessEpoch)
         throw new DOMException("Stale relay search", "AbortError");

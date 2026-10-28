@@ -1438,6 +1438,8 @@ export class AgentRunners {
         signal,
         priority: "background",
         fresh: true,
+        // Of every channel: a public one the session does not know yet too.
+        ...(filter["#h"] ? {} : { resolveChannels: true }),
       });
       signal.throwIfAborted();
       // Only what the relay signed: a read also returns the owner's own

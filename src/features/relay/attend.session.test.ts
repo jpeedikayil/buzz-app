@@ -53,7 +53,12 @@ function harness() {
     wire.pending.splice(roster(), 1)[0]?.respond([]);
     await flush();
   };
-  return { owner, wire, update, discover, reconnect };
+  /** Connects, with the roster read left unanswered. */
+  const connect = () => {
+    live.state({ status: "connected", routes: [] });
+    live.established();
+  };
+  return { owner, wire, update, discover, reconnect, connect };
 }
 /** The relay's signed metadata and roster of a channel only `other` is in. */
 const channel = (id: string, visibility: "public" | "private") => [
@@ -154,4 +159,83 @@ it("says a channel is pending until its metadata is read, attended or not yet, a
   expect(pending()).toBe(true);
   answer((entry) => entry.respond(channel(OPEN, "public") as RelayEvent[]));
   await vi.waitFor(() => expect(pending()).toBe(false));
+});
+
+it("resolves the channels a read of every channel finds, of any kinds, once discovery is done", async () => {
+  const h = harness();
+  const read = () =>
+    h.owner.session.read([{ kinds: [9, 7], since: 11, until: 20, limit: 16 }], {
+      fresh: true,
+      resolveChannels: true,
+    });
+  const message = signed(other, {
+    kind: 9,
+    content: "message",
+    created_at: 15,
+    tags: [["h", OPEN]],
+  });
+  const history = [
+    message,
+    signed(other, {
+      kind: 7,
+      content: "+",
+      created_at: 16,
+      tags: [
+        ["h", OPEN],
+        ["e", message.id],
+      ],
+    }),
+  ] as RelayEvent[];
+  await h.discover();
+  const reading = read();
+  await vi.waitFor(() =>
+    expect(
+      h.wire.pending.some((entry) =>
+        entry.filters.some((filter) => filter.kinds?.includes(7)),
+      ),
+    ).toBe(true),
+  );
+  const index = h.wire.pending.findIndex((entry) =>
+    entry.filters.some((filter) => filter.kinds?.includes(7)),
+  );
+  h.wire.pending.splice(index, 1)[0]?.respond(history);
+  await vi.waitFor(() =>
+    expect(h.wire.pending.some((entry) => asks(entry.filters, OPEN))).toBe(
+      true,
+    ),
+  );
+  const lookup = h.wire.pending.find((entry) => asks(entry.filters, OPEN));
+  lookup?.respond(channel(OPEN, "public") as RelayEvent[]);
+  expect((await reading).map(({ kind }) => kind).sort()).toEqual([7, 9]);
+});
+
+it("does not answer a read of every channel that resolves its channels before discovery, rather than drop what it cannot place", async () => {
+  const h = harness();
+  // Discovery has not succeeded: its roster read failed.
+  h.connect();
+  await vi.waitFor(() => expect(h.wire.pending).toHaveLength(1));
+  h.wire.next().fail(new Error("down"));
+  await vi.waitFor(() =>
+    expect(h.owner.session.channels.list().status).not.toBe("ready"),
+  );
+  let settled = false;
+  void h.owner.session
+    .read([{ kinds: [7], since: 11, until: 20, limit: 16 }], {
+      fresh: true,
+      resolveChannels: true,
+    })
+    .finally(() => {
+      settled = true;
+    })
+    .catch(() => {});
+  const reads = () =>
+    h.wire.pending.findIndex((entry) =>
+      entry.filters.some((filter) => filter.kinds?.includes(7)),
+    );
+  await vi.waitFor(() => expect(reads()).not.toBe(-1));
+  h.wire.pending.splice(reads(), 1)[0]?.respond([]);
+  await flush();
+  await flush();
+  // It is tried again later, not answered empty.
+  expect(settled).toBe(false);
 });
