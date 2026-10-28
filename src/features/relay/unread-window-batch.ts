@@ -1,4 +1,4 @@
-import type { ReadFilter } from "./events";
+import type { ReadFilter } from "./events.ts";
 
 /** Content kinds the unread owner observes: messages, agent posts and files. */
 export const UNREAD_CONTENT_KINDS: readonly number[] = [9, 40002, 40008];

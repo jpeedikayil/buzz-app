@@ -340,8 +340,12 @@ test("cursor paging preserves visible anchors and keeps a large history virtuali
     expect(app.pending.length).toBeLessThanOrEqual(1);
   }
   expect(cursors.size).toBe(31);
+  // Only channel cursor pages: the unread walk's authored pages carry
+  // `until` too, since the viewer wrote this history.
   expect(
-    app.report.queries.filter(({ filter }) => filter.until !== undefined),
+    app.report.queries.filter(
+      ({ filter }) => filter.until !== undefined && filter["#h"],
+    ),
   ).toHaveLength(31);
   expect(app.pending).toHaveLength(0);
 

@@ -101,7 +101,11 @@ test("old root and reply beyond the first thread page open exactly; reclick and 
     app.report.queries.some((q) => q.filter.thread_cursor !== undefined),
     "the exact reply requires a second thread page",
   ).toBe(true);
-  expect(app.report.queries.filter((q) => q.filter.until)).toHaveLength(0);
+  // Only channel cursor pages: the unread walk's authored pages carry
+  // `until` too when the viewer wrote this history.
+  expect(
+    app.report.queries.filter((q) => q.filter.until && q.filter["#h"]),
+  ).toHaveLength(0);
   // Settings temporarily takes the rail without disposing the routed thread.
   const threadElement = page.locator('[aria-label="Thread"]');
   await threadElement.evaluate((element) => {
