@@ -98,6 +98,8 @@ export function fakeRelay(origin = "https://relay.example.test") {
     }),
   };
   let status = "connected";
+  /** Attended channels whose metadata the session has not read yet. */
+  const pending = new Set<string>();
   /** Channels of the list live does not route. */
   const unrouted = new Set<string>();
   const statuses = new Set<() => void>();
@@ -126,9 +128,15 @@ export function fakeRelay(origin = "https://relay.example.test") {
       )
         throw new Error("Relay reads need valid kinds or event IDs");
       // A catch-up read is bounded on both sides; it may ask for any kinds.
+      // The session drops a channel's events until it knows the channel.
       return filters[0]?.kinds?.includes(9) ||
         (filters[0]?.since !== undefined && filters[0]?.until !== undefined)
-        ? page(history, filters[0])
+        ? page(history, filters[0]).filter(
+            ({ tags }) =>
+              !tags.some(
+                ([key, value]) => key === "h" && pending.has(value ?? ""),
+              ),
+          )
         : [...listed];
     }),
     readRemote: vi.fn(async (filters: readonly ReadFilter[]) => {
@@ -164,6 +172,7 @@ export function fakeRelay(origin = "https://relay.example.test") {
       attended.add(ids);
       return () => attended.delete(ids);
     }),
+    attendPending: (id: string) => pending.has(id),
     live: {
       // Each channel of the list is live while connected, unless `unrouted`.
       snapshot: () => ({
@@ -264,6 +273,7 @@ export function fakeRelay(origin = "https://relay.example.test") {
     attended,
     listed,
     unrouted,
+    pending,
     history,
     memories,
     session,

@@ -325,6 +325,7 @@ async function setup({
     reconnecting: fake.reconnecting,
     recover: fake.recover,
     unrouted: fake.unrouted,
+    pending: fake.pending,
     memories: fake.memories,
     archives: fake.archives,
     session: fake.session,
@@ -8473,6 +8474,57 @@ it("listens in a public channel it is not in, but delivers a watch's turn only w
   };
   expect(trigger.channel).toBe(channel);
   expect(trigger.text).toContain('watch "here"');
+});
+
+it("holds a public channel's catch-up until its metadata is known, and hears it in a watch of every channel", async () => {
+  vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+  try {
+    const { service, run, history, recover, storage, pending } = await setup({
+      identities: [echo],
+    });
+    const now = nowSeconds();
+    vi.setSystemTime(now * 1000);
+    const watch = { ...chat["watch/chat"], channels: [plaza] };
+    await service.save(bot, {
+      attentionEnabled: true,
+      attention: { "watch/channel": null, "watch/plaza": watch },
+    });
+    await settle();
+    vi.setSystemTime((now + 60) * 1000);
+    history.push(eventDto(message(author, plaza, "missed", now + 30)));
+    // Read now, it would come back empty: the session drops a channel's
+    // events until it knows the channel.
+    pending.add(plaza);
+    recover();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await settle();
+    expect(heard(run)).toEqual([]);
+    expect(
+      Object.values(readCheckpoints(storage)).map(({ through }) => through),
+    ).toEqual([now]);
+    pending.delete(plaza);
+    await vi.advanceTimersByTimeAsync(5_000);
+    await settle();
+    await settle();
+    expect(heard(run)).toEqual(["missed"]);
+    // A watch of every channel hears it too, though it is not live, from the
+    // read of what live does not cover.
+    await service.save(bot, {
+      attention: {
+        "watch/plaza": null,
+        "watch/all": { ...chat["watch/chat"], channels: "all" },
+      },
+    });
+    await settle();
+    const later = nowSeconds();
+    history.push(eventDto(message(author, plaza, "posted", later + 1)));
+    await vi.advanceTimersByTimeAsync(45_000);
+    await settle();
+    await settle();
+    expect(heard(run)).toEqual(["missed", "posted"]);
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 it("keeps the channels its enabled watches name live while attention is on", async () => {

@@ -325,6 +325,9 @@ membership. Only demanded retained previews enter the existing live interest set
 and the public channels agents' watches name (`session.attend`), which the session
 reads metadata for first. Attended channels come after joined and demanded ones,
 in the capacity those leave, and are never joined, listed or counted unread.
+Until an attended channel's metadata is read, `session.attendPending(id)` is true
+and a read of it returns none of its events, so agent catch-up waits for it. A
+failed metadata read is tried again after 30 s, and after a reconnect.
 Shared composers and reactions remain unavailable for nonmembers; message helpers
 and workflows do not acquire write eligibility from public metadata. The relay
 remains the final write authority, including low-level outbox intent.

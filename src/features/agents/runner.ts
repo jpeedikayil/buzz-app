@@ -348,7 +348,10 @@ export type Connection = {
 /** An agent's community while it is live: one object for as long as its
  * session lasts. */
 export type LiveCommunity = {
-  readonly session: Pick<RelaySession, "read" | "readRemote" | "live">;
+  readonly session: Pick<
+    RelaySession,
+    "read" | "readRemote" | "live" | "attendPending"
+  >;
   /** Aborts when the session is replaced, so no work outlives it. */
   readonly controller: AbortController;
   readonly connection: Connection;
@@ -1213,7 +1216,13 @@ export class AgentRunners {
           // A stream new to catch-up, as every one is on an upgrade, starts
           // now: an earlier `since` does not replay older events.
           move(stream.key, { through: now });
-        else reading.push(stream);
+        // Until its channel's metadata is known, a read returns none of its
+        // events: it waits, with its checkpoint where it was.
+        else if (
+          stream.channel === undefined ||
+          !community?.session.attendPending(stream.channel)
+        )
+          reading.push(stream);
       }
       const pass = this.passes.get(runner.key);
       const since = community?.connection.since;

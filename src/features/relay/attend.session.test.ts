@@ -38,7 +38,22 @@ function harness() {
       expect(owner.session.channels.list().status).toBe("ready"),
     );
   };
-  return { owner, wire, update, discover };
+  /** Drops and restores the socket, and discovery reads the roster again. */
+  const reconnect = async () => {
+    live.state({ status: "retrying", routes: [] });
+    live.state({ status: "connected", routes: [] });
+    live.established();
+    const roster = () =>
+      wire.pending.findIndex(
+        (entry) =>
+          !entry.signal?.aborted &&
+          !entry.filters.some((filter) => filter["#d"]),
+      );
+    await vi.waitFor(() => expect(roster()).not.toBe(-1));
+    wire.pending.splice(roster(), 1)[0]?.respond([]);
+    await flush();
+  };
+  return { owner, wire, update, discover, reconnect };
 }
 /** The relay's signed metadata and roster of a channel only `other` is in. */
 const channel = (id: string, visibility: "public" | "private") => [
@@ -93,4 +108,48 @@ it("keeps an attended public channel live once its metadata is read, never a pri
   ).not.toContain(OPEN);
   stop();
   expect(live()).not.toContain(OPEN);
+});
+
+it("says an attended channel is pending until its metadata is read, and reads again what failed", async () => {
+  const h = harness();
+  const pending = () => h.owner.session.attendPending(OPEN);
+  const lookup = () =>
+    h.wire.pending.find(
+      (entry) => !entry.signal?.aborted && asks(entry.filters, OPEN),
+    );
+  /** Answers the metadata read in flight, and takes it off the wire. */
+  const answer = (
+    respond: (entry: NonNullable<ReturnType<typeof lookup>>) => void,
+  ) => {
+    const entry = lookup();
+    if (!entry) throw new Error("No metadata read");
+    h.wire.pending.splice(h.wire.pending.indexOf(entry), 1);
+    respond(entry);
+  };
+  expect(pending()).toBe(false);
+  h.owner.session.attend([OPEN]);
+  expect(pending()).toBe(true);
+  await h.discover();
+  await vi.waitFor(() => expect(lookup()).toBeDefined());
+  // A failed read leaves it pending, and a reconnect reads it again.
+  answer((entry) => entry.fail(new Error("down")));
+  await flush();
+  expect(pending()).toBe(true);
+  expect(lookup()).toBeUndefined();
+  await h.reconnect();
+  await vi.waitFor(() => expect(lookup()).toBeDefined());
+  // So does a wait, with no reconnect.
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    answer((entry) => entry.fail(new Error("down again")));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lookup()).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(30_000);
+  } finally {
+    vi.useRealTimers();
+  }
+  await vi.waitFor(() => expect(lookup()).toBeDefined());
+  expect(pending()).toBe(true);
+  answer((entry) => entry.respond(channel(OPEN, "public") as RelayEvent[]));
+  await vi.waitFor(() => expect(pending()).toBe(false));
 });
