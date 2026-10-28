@@ -38,7 +38,8 @@ export type InboxSnapshot = Readonly<{
   /** `observing`: evidence is shown while a repair still reads the roster. */
   freshness: "unknown" | "observing" | "observed" | "stale";
   /** The last repair dropped some channel windows or thread reads after a
-   * retry; their channels stay as they were until the next repair. */
+   * retry; those channels or threads stay as they were until the next
+   * repair. */
   partial?: true;
   error?: string | undefined;
 }>;

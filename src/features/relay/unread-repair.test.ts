@@ -1234,6 +1234,8 @@ it("a device's first repair walks the viewer's history behind the windows, remem
       }),
     ),
   );
+  // A cold thread the viewer has read is not a row until it gets a reply
+  // they have not read; see docs/inbox.md.
   expect(
     inbox().items.find((item) => item.rootId === quiet.id),
   ).toBeUndefined();
@@ -1828,7 +1830,7 @@ it("a cold thread whose page comes back full is read whole, losing none of its r
   });
 });
 
-it("a dropped cold read leaves its thread to the next repair without marking channels unchecked", async () => {
+it("a dropped cold read leaves its thread to the next repair and the Inbox partial, with its channel still observed", async () => {
   const participation = memoryThreadParticipation();
   const root = event("c0", peer, 1000);
   await coldThread(participation, "c0", root, 1010);
@@ -1847,21 +1849,26 @@ it("a dropped cold read leaves its thread to the next repair without marking cha
   h.failing.add("cold");
   await h.owner.capability.ensure();
   const inbox = () => h.owner.capability.inbox();
-  expect(inbox()).toMatchObject({ status: "ready", freshness: "observed" });
-  expect(inbox().partial).toBeUndefined();
-  expect(inbox().error).toBeUndefined();
-  // Tried twice, then dropped: the thread's time is unchanged, and the
-  // channel's window is still observed.
+  // Tried twice, then dropped: the thread's unread reply is missing, which
+  // the Inbox says with the soft notice rather than the failure banner; the
+  // thread's time is unchanged and the channel's window is still observed.
   expect(coldReads(h, root)).toHaveLength(2);
+  expect(inbox()).toMatchObject({
+    status: "ready",
+    freshness: "observed",
+    partial: true,
+  });
+  expect(inbox().error).toBeUndefined();
   expect(inbox().items.find((item) => item.rootId === root.id)).toBeUndefined();
   expect((await participation.read()).roots.get(`c0:${root.id}`)).toEqual({
     at: 1010,
   });
   expect(
-    h.owner.capability.snapshot({ kind: "channel", channelId: "c0" }).coverage,
-  ).toBe("observed");
+    h.owner.capability.snapshot({ kind: "channel", channelId: "c0" }),
+  ).toMatchObject({ coverage: "observed", freshness: "observed" });
   h.failing.clear();
   await h.owner.capability.refresh();
+  expect(inbox().partial).toBeUndefined();
   await vi.waitFor(() =>
     expect(inbox().items).toContainEqual(
       expect.objectContaining({ rootId: root.id, unreadCount: 1 }),

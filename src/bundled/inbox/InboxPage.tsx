@@ -1003,7 +1003,7 @@ function InboxList({
                   <span className="text-body text-subtle">
                     {inbox.freshness === "stale"
                       ? "Showing retained activity."
-                      : "Some channels could not be checked."}
+                      : "Some recent activity could not be checked."}
                   </span>
                   <Button
                     ref={retryButton}

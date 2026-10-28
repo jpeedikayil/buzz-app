@@ -7,13 +7,10 @@ import { createRelayProfiler, type RelayProfiler } from "./profiling";
 import type { ReadFilter, RelayEvent } from "./events";
 import type { ReadTransport } from "./transport";
 import { byteSize } from "./budget";
-import { ReadError } from "./errors";
+import { READ_BUDGET_EXCEEDED, ReadError } from "./errors";
 import type { AgentLibrary } from "../agents/library";
 
 export type Priority = "foreground" | "background";
-/** The response was larger than the 8 MiB a read admits. Deterministic: a
- * caller that can asks for less rather than again. */
-export const READ_BUDGET_EXCEEDED = "Relay response exceeds the read budget";
 export type ReadOptions = {
   signal?: AbortSignal;
   priority?: Priority;

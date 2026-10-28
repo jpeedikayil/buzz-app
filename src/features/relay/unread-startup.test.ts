@@ -1329,6 +1329,46 @@ it("a response over the reader's byte budget splits the request and the repair c
   expect(h.session.unread.inbox().partial).toBeUndefined();
 });
 
+it("a response the native host rejects as too large splits the request the same way", async () => {
+  const h = setup(40);
+  // Native reads at most 16 MiB (`read_response`) and rejects before the
+  // reader can measure, with the plain string its IPC carries.
+  const recent = Math.floor(Date.now() / 1000) - 3600;
+  h.query.mockImplementation(async (filters) => {
+    // The whole roster's windows in one request are over the cap; either half fits.
+    if (filters.length > 30) throw "Relay response is too large";
+    return filters.flatMap((filter) => {
+      const channel = filter["#h"]?.[0];
+      if (!filter.kinds?.includes(9) || !channel || filter.since === undefined)
+        return [];
+      return [
+        {
+          ...message(h.peer, channel, "recent", recent),
+          [verifiedSymbol]: true,
+        },
+      ];
+    });
+  });
+  await h.session.unread.ensure();
+  const windowed = h.query.mock.calls
+    .map(([filters]) => filters)
+    .filter((filters) => filters.some((filter) => filter.kinds?.includes(9)));
+  expect(windowed.map((filters) => filters.length)).toEqual([41, 21, 20]);
+  for (const id of h.ids)
+    expect(
+      h.session.unread.snapshot({ kind: "channel", channelId: id }),
+    ).toMatchObject({
+      coverage: "observed",
+      freshness: "observed",
+      observedCount: 1,
+    });
+  expect(h.session.unread.inbox()).toMatchObject({
+    status: "ready",
+    freshness: "observed",
+  });
+  expect(h.session.unread.inbox().partial).toBeUndefined();
+});
+
 it.each(["clear", "dispose", "revoke"])(
   "no evidence dispatch after %s while markers are pending",
   async (boundary) => {

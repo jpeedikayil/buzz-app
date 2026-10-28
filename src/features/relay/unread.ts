@@ -18,12 +18,8 @@ import type {
 } from "./read-state";
 import type { ReadJournal } from "./read-state-storage";
 import { markMessage } from "./read-state-retention";
-import {
-  READ_BUDGET_EXCEEDED,
-  type Priority,
-  type RelayReader,
-} from "./reader";
-import { ReadError } from "./errors";
+import type { Priority, RelayReader } from "./reader";
+import { isOversizedResponse } from "./errors";
 import { foldMessages, deletionApplies, messageAuthor } from "./fold";
 import { eventMs } from "./message-order";
 import { threadReference } from "./thread-reference";
@@ -1784,12 +1780,11 @@ export function createUnread({
   /** One repair's reads: whether any landed, whether one was dropped, and
    * the last failure, which is the repair's error when nothing landed. */
   type Pass = { landed: boolean; dropped: boolean; failure: unknown };
-  /** A response over the reader's byte budget fails the same way every time,
-   * so the request is split, not retried: its filters in two halves, a lone
-   * filter's `ids` in two, or a lone filter's limit halved. A lone filter at
-   * limit 1 cannot shrink and is dropped. */
-  const oversized = (cause: unknown) =>
-    cause instanceof ReadError && cause.message === READ_BUDGET_EXCEEDED;
+  /** A response over the reader's byte budget, or the native host's, fails
+   * the same way every time, so the request is split, not retried: its
+   * filters in two halves, a lone filter's `ids` in two, or a lone filter's
+   * limit halved. A lone filter at limit 1 cannot shrink and is dropped. */
+  const oversized = isOversizedResponse;
   function split(request: readonly ReadFilter[]): ReadFilter[][] {
     if (request.length > 1) {
       const half = Math.ceil(request.length / 2);
@@ -2487,9 +2482,11 @@ export function createUnread({
           failure: undefined,
         };
         // A dropped window, or the first request carrying them, leaves its
-        // channels as they were, which the Inbox says; a dropped thread read
-        // or walk page leaves those threads or the walk to the next repair,
-        // which is no channel's concern.
+        // channels as they were; a dropped thread read or root fetch leaves
+        // those threads to the next repair, with their channels' counts
+        // still observed. Either way the Inbox says some activity could not
+        // be checked. A dropped walk page leaves only the walk's mark where
+        // it was, so the next repair resumes it, and says nothing.
         let unchecked = false;
         const walkPage = (request: readonly ReadFilter[]) =>
           request.find((filter) => filter.authors);
@@ -2503,9 +2500,10 @@ export function createUnread({
         ) => {
           let ok = true;
           const walk = walkPage(request);
-          if (request.some((filter) => filter["#e"] || filter.ids))
+          if (request.some((filter) => filter["#e"] || filter.ids)) {
             ok = pass.landed(request, result, queue);
-          else if (!result) unchecked ||= request.some(checks);
+            if (!result) unchecked = true;
+          } else if (!result) unchecked ||= request.some(checks);
           else {
             // A read channel with nothing since its mark is observed with
             // nothing unread; a never-read channel with no recent history
@@ -2577,8 +2575,8 @@ export function createUnread({
         // A lookup that landed between the last drain and the pool's release
         // queued its read for a pool that had finished; it is the follow-up's.
         if (requests.length) void followUp(run);
-        // A dropped request leaves its channels as they were; the Inbox says
-        // so until the next repair, with no automatic retry.
+        // A dropped request leaves its channels or threads as they were; the
+        // Inbox says so until the next repair, with no automatic retry.
         partial = unchecked;
         freshness = "observed";
         owing = false;
