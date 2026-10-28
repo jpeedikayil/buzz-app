@@ -321,7 +321,10 @@ DM type grants nonmember reading. Signed membership still owns the joined roster
 `channels.list()` remains joined-only. Opening a nonmember destination revalidates
 its metadata and reuses the existing channel window/exact thread owners. It does
 not join, persist a public head, warm all search results, or add sidebar/unread
-membership. Only demanded retained previews enter the existing live interest set.
+membership. Only demanded retained previews enter the existing live interest set,
+and the public channels agents' watches name (`session.attend`), which the session
+reads metadata for first. Attended channels come after joined and demanded ones,
+in the capacity those leave, and are never joined, listed or counted unread.
 Shared composers and reactions remain unavailable for nonmembers; message helpers
 and workflows do not acquire write eligibility from public metadata. The relay
 remains the final write authority, including low-level outbox intent.

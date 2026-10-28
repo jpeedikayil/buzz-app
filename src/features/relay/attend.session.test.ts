@@ -1,0 +1,96 @@
+import { afterEach, expect, it, vi } from "vitest";
+import { createRelaySession } from "./session";
+import type { RelayEvent } from "./events";
+import type { LiveCallbacks } from "./live";
+import { flush, keypair, scriptedTransport, signed } from "./testing";
+
+const viewer = keypair(),
+  relay = keypair(),
+  other = keypair();
+const owners: ReturnType<typeof createRelaySession>[] = [];
+afterEach(() => {
+  for (const owner of owners.splice(0)) owner.dispose();
+});
+const OPEN = "33333333-3333-4333-8333-333333333333";
+const CLOSED = "44444444-4444-4444-8444-444444444444";
+
+function harness() {
+  const wire = scriptedTransport(viewer.pubkey, relay.pubkey);
+  const update =
+    vi.fn<(ids: readonly string[], joined?: readonly string[]) => void>();
+  let live!: LiveCallbacks;
+  const owner = createRelaySession({
+    ...wire.transport,
+    scope: "https://one.example",
+    subscribe(callbacks) {
+      live = callbacks;
+      return { update, retry() {}, dispose() {} };
+    },
+  });
+  owners.push(owner);
+  /** Connects, and the viewer's roster read finds no channel. */
+  const discover = async () => {
+    live.state({ status: "connected", routes: [] });
+    live.established();
+    await vi.waitFor(() => expect(wire.pending).toHaveLength(1));
+    wire.next().respond([]);
+    await vi.waitFor(() =>
+      expect(owner.session.channels.list().status).toBe("ready"),
+    );
+  };
+  return { owner, wire, update, discover };
+}
+/** The relay's signed metadata and roster of a channel only `other` is in. */
+const channel = (id: string, visibility: "public" | "private") => [
+  signed(relay, {
+    kind: 39000,
+    content: "",
+    created_at: 10,
+    tags: [["d", id], ["name", id.slice(0, 4)], [visibility]],
+  }),
+  signed(relay, {
+    kind: 39002,
+    content: "",
+    created_at: 10,
+    tags: [
+      ["d", id],
+      ["p", other.pubkey],
+    ],
+  }),
+];
+const asks = (filters: readonly { "#d"?: readonly string[] }[], id: string) =>
+  filters.some((filter) => filter["#d"]?.includes(id));
+
+it("keeps an attended public channel live once its metadata is read, never a private one, and drops it when stopped", async () => {
+  const h = harness();
+  const live = () => h.update.mock.lastCall?.[0] ?? [];
+  const joined = () => h.update.mock.lastCall?.[1] ?? [];
+  const stop = h.owner.session.attend([OPEN, CLOSED, "not a channel id"]);
+  // Unknown until the relay's metadata is read, which waits for discovery:
+  // a lookup must not stand in for it.
+  await flush();
+  expect(live()).not.toContain(OPEN);
+  expect(h.wire.pending.some((entry) => asks(entry.filters, OPEN))).toBe(false);
+  await h.discover();
+  await vi.waitFor(() =>
+    expect(h.wire.pending.some((entry) => asks(entry.filters, OPEN))).toBe(
+      true,
+    ),
+  );
+  const read = h.wire.pending.find((entry) => asks(entry.filters, OPEN));
+  read?.respond([
+    ...channel(OPEN, "public"),
+    ...channel(CLOSED, "private"),
+  ] as RelayEvent[]);
+  await vi.waitFor(() => expect(live()).toContain(OPEN));
+  await flush();
+  // Live, though not joined or listed; a private channel the viewer is not
+  // in is not live.
+  expect(joined()).not.toContain(OPEN);
+  expect(live()).not.toContain(CLOSED);
+  expect(
+    h.owner.session.channels.list().channels.map(({ id }) => id),
+  ).not.toContain(OPEN);
+  stop();
+  expect(live()).not.toContain(OPEN);
+});

@@ -409,6 +409,10 @@ export type RunnerHost = {
   /** Whether the agent is in the event's channel, or undefined while its
    * roster is only the one saved on disk and the relay has not confirmed it. */
   member(agent: Agent, event: Pick<RelayEvent, "tags">): boolean | undefined;
+  /** Whether the agent may read the event's channel: it is in it, or the
+   * channel is public; undefined as for `member`. Only a member may be
+   * delivered to. */
+  reads(agent: Agent, event: Pick<RelayEvent, "tags">): boolean | undefined;
   /** Whether the event's channel is a DM between the agent and one other. */
   dm(agent: Agent, event: RelayEvent): boolean;
   /** While the owner is still starting this chat, settles once it can take
@@ -2052,9 +2056,9 @@ export class AgentRunners {
       this.heldForStartup = true;
       return { triggers: [], held: true, discarded };
     }
-    const member = this.host.member(agent, event);
-    if (member === undefined) return { triggers: [], held: true };
-    if (!member) return { triggers: [] };
+    const reads = this.host.reads(agent, event);
+    if (reads === undefined) return { triggers: [], held: true };
+    if (!reads) return { triggers: [] };
     const destinations = matches.map(({ watch }) =>
       watch.channel
         ? this.host.member(agent, { tags: [["h", watch.channel]] })

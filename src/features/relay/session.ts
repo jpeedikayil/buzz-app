@@ -88,7 +88,12 @@ import {
 import { PRODUCT_FEEDBACK_KIND } from "./product-feedback";
 import { attemptEnded } from "./withdraw";
 import type { ReadTransport } from "./transport";
-import type { LiveGlobal, LiveSnapshot, LiveSubscription } from "./live";
+import {
+  LIVE_CHANNEL_CAPACITY,
+  type LiveGlobal,
+  type LiveSnapshot,
+  type LiveSubscription,
+} from "./live";
 import {
   hasTag,
   type ReadFilter,
@@ -1240,6 +1245,32 @@ export function createRelaySession(
   const followed = new Set<readonly string[]>();
   /** Each follow's check, after an access change, for channels it lost. */
   const followRevocations = new Set<() => void>();
+  /** Channels each `attend` keeps live for agents' watches, its own list. */
+  const attended = new Set<readonly string[]>();
+  /** Attended channels whose metadata was read for them, or is being read. */
+  const attendChecked = new Set<string>();
+  /** Reads the metadata of attended channels not known yet, once each. Only
+   * into a ready list: a lookup may extend one, never stand in for initial
+   * discovery. A failed read is not tried again until a later `attend`. */
+  const resolveAttended = () => {
+    if (
+      closed ||
+      !channels.queries.resolve ||
+      channels.queries.list().status !== "ready"
+    )
+      return;
+    const unknown = [...new Set([...attended].flat())].filter(
+      (id) => !attendChecked.has(id) && !channels.queries.get?.(id),
+    );
+    for (const id of unknown) attendChecked.add(id);
+    for (let start = 0; start < unknown.length; start += 128)
+      void channels.queries
+        .resolve(unknown.slice(start, start + 128), {
+          signal: lifetime.signal,
+        })
+        .catch(() => {})
+        .finally(updateInterests);
+  };
   const liveListeners = new Set<() => void>();
   let liveSnapshot: LiveSnapshot = Object.freeze({
     status: transport?.subscribe ? "connecting" : "unavailable",
@@ -2178,6 +2209,27 @@ export function createRelaySession(
         incomingListeners.delete(listener);
       };
     },
+    /** Keeps `channelIds` in the live routes while attended, for agents'
+     * watches: a readable public channel the viewer has not joined too, whose
+     * metadata is read first when unknown. It is not joined, listed or counted
+     * unread, as an opened preview is not. Its events reach `subscribeLive`.
+     * Joined and opened channels keep their room first; past it, the rest
+     * are left out. */
+    attend(channelIds: readonly string[]): () => void {
+      if (closed) return () => {};
+      const ids = [
+        ...new Set(
+          channelIds.filter((id) => /^[a-zA-Z0-9_-]{1,128}$/.test(id)),
+        ),
+      ];
+      // Unread or refused before, it is read again.
+      for (const id of ids) attendChecked.delete(id);
+      attended.add(ids);
+      updateInterests();
+      return () => {
+        if (attended.delete(ids)) updateInterests();
+      };
+    },
     /** Verified, access-filtered live-phase events of any kind, after reconciliation.
      * Never finite reads or local intent, except the viewer's own messages in
      * a Solo chat this device is starting: those arrive here before the relay
@@ -3067,6 +3119,25 @@ export function createRelaySession(
         }),
       ]),
     ];
+    // Channels agents' watches listen to come last, in the room the others
+    // leave (two globals may take some), so they never push one out.
+    const room = Math.max(0, LIVE_CHANNEL_CAPACITY - 2 - ids.length);
+    const listened = new Set(ids);
+    ids.push(
+      ...[...new Set([...attended].flat())]
+        .filter((id) => {
+          const channel = channels.queries.get?.(id);
+          return (
+            !listened.has(id) &&
+            !!channel &&
+            channels.canAccess(id) &&
+            !channel.cached &&
+            !channel.pending
+          );
+        })
+        .slice(0, room),
+    );
+    resolveAttended();
     const wanted = new Set(ids);
     for (const id of catchups.keys()) if (!wanted.has(id)) catchups.delete(id);
     try {

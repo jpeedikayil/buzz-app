@@ -81,7 +81,9 @@ import {
   fakeNative,
   fakeRelay,
   groupDm,
+  lobby,
   other,
+  plaza,
   sibling,
   steps,
   viewer,
@@ -327,6 +329,7 @@ async function setup({
     archives: fake.archives,
     session: fake.session,
     history: fake.history,
+    attended: fake.attended,
     authorize,
     plugin,
     watching,
@@ -8407,7 +8410,7 @@ it("wakes nothing from the time its watch was off, also when it is turned on aft
   }
 });
 
-it("wakes a watch only for channels the agent is in, even when it watches all", async () => {
+it("wakes a watch only for channels the agent may read, even when it watches all", async () => {
   const { service, run, emit } = await setup();
   await service.create({ type: "example/echo", name: "Echo" });
   await service.save(bot, { attentionEnabled: true });
@@ -8430,15 +8433,76 @@ it("wakes a watch only for channels the agent is in, even when it watches all", 
       event("unknown", { tags: [["h", "elsewhere"]] }),
       event("bare", { kind: 1, tags: [] }),
       event("open"),
+      // Public channels anyone may read, though the agent is in neither.
+      event("lobby", { tags: [["h", lobby]] }),
+      event("plaza", { tags: [["h", plaza]] }),
     ],
   });
+  await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(3));
+  await settle();
+  expect(run).toHaveBeenCalledTimes(3);
+  expect(woke(run)).toEqual(["open", "lobby", "plaza"]);
+});
+
+it("listens in a public channel it is not in, but delivers a watch's turn only where it is a member", async () => {
+  const { service, run, emit } = await setup();
+  await service.create({ type: "example/echo", name: "Echo" });
+  await service.save(bot, { attentionEnabled: true });
+  const watch = {
+    type: "event",
+    interest_id: "default",
+    enabled: true,
+    since: 1,
+    channels: [lobby],
+    kinds: [9],
+  } as const;
+  await service.save(bot, {
+    attention: {
+      "watch/here": { ...watch, channel },
+      "watch/there": { ...watch, channel: lobby },
+    },
+  });
+  emit({ events: [event("hello", { tags: [["h", lobby]] })] });
   await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1));
   await settle();
   expect(run).toHaveBeenCalledTimes(1);
-  expect(run.mock.calls[0]?.[0].trigger).toMatchObject({
-    slug: "watch/everything",
-    event: { id: "open".padEnd(64, "0") },
+  // An addressed watch's turn runs in its channel.
+  const trigger = run.mock.calls[0]?.[0].trigger as {
+    channel?: string;
+    text?: string;
+  };
+  expect(trigger.channel).toBe(channel);
+  expect(trigger.text).toContain('watch "here"');
+});
+
+it("keeps the channels its enabled watches name live while attention is on", async () => {
+  const { service, attended } = await setup();
+  await service.create({ type: "example/echo", name: "Echo" });
+  const watch = {
+    type: "event",
+    interest_id: "default",
+    enabled: true,
+    since: 1,
+    kinds: [9],
+  } as const;
+  await service.save(bot, {
+    attention: {
+      "watch/plaza": { ...watch, channels: [plaza, channel] },
+      "watch/all": { ...watch, channels: "all" },
+      "watch/off": { ...watch, enabled: false, channels: [lobby] },
+    },
   });
+  await settle();
+  expect([...attended]).toEqual([]);
+  await service.save(bot, { attentionEnabled: true });
+  await settle();
+  // A watch of "all" hears what the session listens to already.
+  expect([...attended].map((ids) => [...ids].sort())).toEqual([
+    [channel, plaza].sort(),
+  ]);
+  await service.save(bot, { attentionEnabled: false });
+  await settle();
+  expect([...attended]).toEqual([]);
 });
 
 it("answers an unmentioned one-to-one DM as conversation even when a watch matches it", async () => {
