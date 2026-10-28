@@ -160,6 +160,7 @@ async function setup({
   identities = [] as AgentIdentity[],
   listed = [] as RelayEvent[],
   history = [] as RelayEvent[],
+  pendingChannels = [] as string[],
   timeoutMs = 60_000,
   runOnce = undefined as AgentType<Config>["runOnce"],
   jev = undefined as FakeJev | undefined,
@@ -195,6 +196,7 @@ async function setup({
   const native = fakeNative(identities);
   fake.listed.push(...listed);
   fake.history.push(...history);
+  for (const id of pendingChannels) fake.pending.add(id);
   const authorize = vi.fn(
     async (_: string, __: AbortSignal) =>
       ["auth", viewer, "", "f".repeat(128)] as const,
@@ -8522,6 +8524,44 @@ it("holds a public channel's catch-up until its metadata is known, and hears it 
     await settle();
     await settle();
     expect(heard(run)).toEqual(["missed", "posted"]);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("holds a public channel's catch-up after a restart, before it is attended, until its metadata is known", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  try {
+    const start = nowSeconds();
+    const storage = memoryStorage();
+    const first = await setup({ storage, identities: [echo] });
+    vi.setSystemTime(start * 1000);
+    await first.service.save(bot, {
+      attentionEnabled: true,
+      attention: {
+        "watch/channel": null,
+        "watch/plaza": { ...chat["watch/chat"], channels: [plaza] },
+      },
+    });
+    await settle();
+    first.connect(false);
+    vi.setSystemTime((start + 60) * 1000);
+    // Restarted: the session does not know plaza yet.
+    const second = await setup({
+      storage,
+      identities: [echo],
+      history: [eventDto(message(author, plaza, "missed", start + 30))],
+      pendingChannels: [plaza],
+    });
+    await settle();
+    await settle();
+    second.pending.delete(plaza);
+    vi.setSystemTime((start + 90) * 1000);
+    second.recover();
+    await settle();
+    await settle();
+    await settle();
+    expect(heard(second.run)).toEqual(["missed"]);
   } finally {
     vi.useRealTimers();
   }

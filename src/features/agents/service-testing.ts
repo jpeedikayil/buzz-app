@@ -98,7 +98,7 @@ export function fakeRelay(origin = "https://relay.example.test") {
     }),
   };
   let status = "connected";
-  /** Attended channels whose metadata the session has not read yet. */
+  /** Channels the session does not know yet, attended or not. */
   const pending = new Set<string>();
   /** Channels of the list live does not route. */
   const unrouted = new Set<string>();

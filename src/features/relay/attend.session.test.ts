@@ -110,7 +110,7 @@ it("keeps an attended public channel live once its metadata is read, never a pri
   expect(live()).not.toContain(OPEN);
 });
 
-it("says an attended channel is pending until its metadata is read, and reads again what failed", async () => {
+it("says a channel is pending until its metadata is read, attended or not yet, and reads again what failed", async () => {
   const h = harness();
   const pending = () => h.owner.session.attendPending(OPEN);
   const lookup = () =>
@@ -126,7 +126,9 @@ it("says an attended channel is pending until its metadata is read, and reads ag
     h.wire.pending.splice(h.wire.pending.indexOf(entry), 1);
     respond(entry);
   };
-  expect(pending()).toBe(false);
+  // Unknown, it is pending before any `attend`, so a catch-up that starts
+  // first waits too.
+  expect(pending()).toBe(true);
   h.owner.session.attend([OPEN]);
   expect(pending()).toBe(true);
   await h.discover();

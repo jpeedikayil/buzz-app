@@ -2256,10 +2256,11 @@ export function createRelaySession(
         if (attended.delete(ids)) updateInterests();
       };
     },
-    /** Whether `channelId` is attended and its metadata is not known yet:
-     * until it is, a read of the channel returns none of its events. */
+    /** Whether the session does not know `channelId` yet, and has not read
+     * its metadata for `attend`: until then, a read of the channel returns
+     * none of its events. True of a channel not attended yet too, so a read
+     * that runs before its `attend` waits for it as well. */
     attendPending(channelId: string): boolean {
-      if (![...attended].some((ids) => ids.includes(channelId))) return false;
       const channel = channels.queries.get?.(channelId);
       return channel ? !!channel.pending : !attendRead.has(channelId);
     },
