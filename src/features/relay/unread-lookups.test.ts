@@ -10,7 +10,8 @@ import {
   readJournal,
   type ReadJournal,
 } from "./read-state-storage";
-import { memoryThreadParticipation } from "./thread-participation";
+import { NO_THREAD_PARTICIPATION } from "./thread-participation";
+import { memoryUnreadStorage, type UnreadStorage } from "./unread-storage";
 import { createUnread } from "./unread";
 
 // Conversation lookups with thousands of events. Unread receives events the
@@ -43,14 +44,14 @@ const flood = (count: number, from: number) =>
   Array.from({ length: count }, (_, i) => event(peer, 9, from + i, []));
 
 const owners: ReturnType<typeof createUnread>[] = [];
+// The threads storage holds for the next launch.
+const remembered = async (storage: UnreadStorage) =>
+  (await storage.read())?.participation ?? NO_THREAD_PARTICIPATION;
 afterEach(() => {
   for (const owner of owners.splice(0)) owner.dispose();
 });
 
-async function setup(
-  initial?: ReadJournal,
-  participation = memoryThreadParticipation(),
-) {
+async function setup(initial?: ReadJournal, storage = memoryUnreadStorage()) {
   // A relay whose channel sample holds only the 500 newest rows, so older
   // conversation membership is reachable only by parent lookup.
   const store: RelayEvent[] = [];
@@ -116,7 +117,7 @@ async function setup(
     channels,
     reader,
     viewer,
-    participation,
+    storage,
   });
   owners.push(owner);
   const lookups = () =>
@@ -128,7 +129,7 @@ async function setup(
     reader.read.mock.calls.filter(([request]) =>
       request.some((filter) => filter["#e"] && !filter.authors),
     ).length;
-  return { owner, store, asked, reader, lookups, threadReads, participation };
+  return { owner, store, asked, reader, lookups, threadReads, storage };
 }
 
 it("a lookup batch larger than the witness bound keeps every membership deletable", async () => {
@@ -218,7 +219,7 @@ it("a later reply of the viewer outlives a negative lookup and its eviction", as
 });
 
 it("eviction keeps the newest evidence observed and lookup results survive a refresh without asking again", async () => {
-  const { owner, store, lookups, participation } = await setup();
+  const { owner, store, lookups, storage } = await setup();
   const mine = event(viewer, 9, 10, []);
   const answer = reply(peer, 700, mine);
   store.push(mine, answer, ...flood(499, 100));
@@ -230,7 +231,7 @@ it("eviction keeps the newest evidence observed and lookup results survive a ref
   // The lookup's witness hands the thread to the repair's pass, which reads
   // it and remembers it; its replies are then evicted last.
   await vi.waitFor(async () =>
-    expect((await participation.read()).roots.has(`c0:${mine.id}`)).toBe(true),
+    expect((await remembered(storage)).roots.has(`c0:${mine.id}`)).toBe(true),
   );
   const snapshot = () =>
     owner.capability.snapshot({ kind: "channel", channelId: "c0" });
@@ -431,8 +432,8 @@ it("Activity recovers the dropped root of a read reply marked unread", async () 
 });
 
 it("a lookup that lands after the repair reads the thread it found in the background and remembers it, leaving the repair's result alone", async () => {
-  const { owner, store, threadReads, participation } = await setup();
-  const write = vi.spyOn(participation, "write");
+  const { owner, store, threadReads, storage } = await setup();
+  const save = vi.spyOn(storage, "save");
   const root = event(peer, 9, 10, []);
   const mine = reply(viewer, 11, root);
   const answer = reply(peer, 700, root);
@@ -441,19 +442,19 @@ it("a lookup that lands after the repair reads the thread it found in the backgr
   const inbox = () => owner.capability.inbox();
   expect(inbox()).toMatchObject({ status: "ready", freshness: "observed" });
   expect(inbox().partial).toBeUndefined();
-  expect(write).not.toHaveBeenCalled();
+  expect(save).not.toHaveBeenCalled();
   expect(threadReads()).toBe(0);
   // The membership lookup finds the viewer's reply: one background read of
   // the thread, then the record written with its key and the viewer's reply,
   // since the answer is unread.
   await vi.waitFor(async () =>
-    expect((await participation.read()).roots.get(`c0:${root.id}`)).toEqual({
+    expect((await remembered(storage)).roots.get(`c0:${root.id}`)).toEqual({
       at: 11,
       newestId: mine.id,
     }),
   );
   expect(threadReads()).toBe(1);
-  expect(write).toHaveBeenCalledTimes(1);
+  expect(save).toHaveBeenCalledTimes(1);
   expect(inbox()).toMatchObject({ status: "ready", freshness: "observed" });
   expect(inbox().partial).toBeUndefined();
   expect(inbox().error).toBeUndefined();
@@ -463,7 +464,7 @@ it("a lookup that lands after the repair reads the thread it found in the backgr
 });
 
 it("a lookup that lands as the repair's last read does still gets its thread read, in a follow-up", async () => {
-  const { owner, store, reader, threadReads, participation } = await setup();
+  const { owner, store, reader, threadReads, storage } = await setup();
   const root = event(peer, 9, 10, []);
   const mine = reply(viewer, 11, root);
   const answer = reply(peer, 700, root);
@@ -497,7 +498,7 @@ it("a lookup that lands as the repair's last read does still gets its thread rea
     });
     await vi.waitFor(() => expect(threadReads()).toBe(1));
     await vi.waitFor(async () =>
-      expect((await participation.read()).roots.get(`c0:${root.id}`)).toEqual({
+      expect((await remembered(storage)).roots.get(`c0:${root.id}`)).toEqual({
         at: 11,
         newestId: mine.id,
       }),
@@ -512,7 +513,7 @@ it("a lookup that lands as the repair's last read does still gets its thread rea
 });
 
 it("a follow-up read that fails is dropped without a retry, and the thread is still remembered", async () => {
-  const { owner, store, reader, threadReads, participation } = await setup();
+  const { owner, store, reader, threadReads, storage } = await setup();
   const root = event(peer, 9, 10, []);
   const mine = reply(viewer, 11, root);
   const answer = reply(peer, 700, root);
@@ -530,7 +531,7 @@ it("a follow-up read that fails is dropped without a retry, and the thread is st
   // The thread the witness taught is saved once its read is dropped, as of
   // that witness; the next repair reads it.
   await vi.waitFor(async () =>
-    expect((await participation.read()).roots.get(`c0:${root.id}`)).toEqual({
+    expect((await remembered(storage)).roots.get(`c0:${root.id}`)).toEqual({
       at: 11,
       newestId: mine.id,
     }),
@@ -542,8 +543,8 @@ it("a follow-up read that fails is dropped without a retry, and the thread is st
 });
 
 it("a follow-up pre-empted by a new repair leaves the thread it fed to that repair", async () => {
-  const { owner, store, reader, threadReads, participation } = await setup();
-  const write = vi.spyOn(participation, "write");
+  const { owner, store, reader, threadReads, storage } = await setup();
+  const save = vi.spyOn(storage, "save");
   const root = event(peer, 9, 10, []);
   const mine = reply(viewer, 11, root);
   const answer = reply(peer, 700, root);
@@ -567,7 +568,7 @@ it("a follow-up pre-empted by a new repair leaves the thread it fed to that repa
   // The lookup finds the viewer's reply after the repair saved; its
   // follow-up read is in flight when a new repair starts.
   await vi.waitFor(() => expect(threadReads()).toBe(1));
-  expect(write).not.toHaveBeenCalled();
+  expect(save).not.toHaveBeenCalled();
   const refresh = owner.capability.refresh();
   try {
     // That repair remembers the fed thread and reads it itself.
@@ -577,8 +578,8 @@ it("a follow-up pre-empted by a new repair leaves the thread it fed to that repa
   }
   await refresh;
   expect(threadReads()).toBe(2);
-  expect(write).toHaveBeenCalledTimes(1);
-  expect((await participation.read()).roots.get(`c0:${root.id}`)).toEqual({
+  expect(save).toHaveBeenCalledTimes(1);
+  expect((await remembered(storage)).roots.get(`c0:${root.id}`)).toEqual({
     at: 11,
     newestId: mine.id,
   });

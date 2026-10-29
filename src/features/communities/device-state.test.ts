@@ -33,9 +33,8 @@ vi.mock("../relay/read-state-storage", () => ({
 vi.mock("../relay/outbox-storage", () => ({
   purgeOutboxStorage: (scope: string) => record("outbox", scope),
 }));
-vi.mock("../relay/thread-participation", () => ({
-  purgeThreadParticipation: (scope: string) =>
-    record("thread participation", scope),
+vi.mock("../relay/unread-storage", () => ({
+  purgeUnreadStorage: (scope: string) => record("unread state", scope),
 }));
 
 vi.mock("../artifact-storage/store", () => ({
@@ -135,7 +134,7 @@ it("clears the remaining stores when one is unavailable and reports each failure
   ]);
 });
 
-it("purges the relay's heads, read state, thread participation and outbox for the exact partition, in order", async () => {
+it("purges the relay's heads, read state, unread state and outbox for the exact partition, in order", async () => {
   vi.stubGlobal("indexedDB", {});
   expect(await purgeCommunityDeviceState(origin, viewer)).toEqual([]);
   // Heads keep their reversed `viewer:origin` encoding inside persistence.
@@ -144,7 +143,7 @@ it("purges the relay's heads, read state, thread participation and outbox for th
     ["heads.clear"],
     ["heads.close"],
     ["read state", `${origin}:${viewer}`],
-    ["thread participation", `${origin}:${viewer}`],
+    ["unread state", `${origin}:${viewer}`],
     ["outbox", `${origin}:${viewer}`],
     ["artifacts", viewer, origin],
   ]);
@@ -154,7 +153,7 @@ it("skips the head cache without IndexedDB and still purges the other relay stor
   expect(await purgeCommunityDeviceState(origin, viewer)).toEqual([]);
   expect(relay.calls).toEqual([
     ["read state", `${origin}:${viewer}`],
-    ["thread participation", `${origin}:${viewer}`],
+    ["unread state", `${origin}:${viewer}`],
     ["outbox", `${origin}:${viewer}`],
   ]);
 });
@@ -179,7 +178,7 @@ it("reports each failed relay store by name, closes heads and still clears the o
     "heads.clear",
     "heads.close",
     "read state",
-    "thread participation",
+    "unread state",
     "outbox",
     "artifacts",
   ]);

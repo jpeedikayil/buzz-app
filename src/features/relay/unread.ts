@@ -34,13 +34,12 @@ import {
   type ThreadFollowStorage,
 } from "./thread-follows";
 import {
-  memoryThreadParticipation,
   NO_THREAD_PARTICIPATION,
   THREAD_PARTICIPATION_LIMIT,
   type ThreadMark,
   type ThreadParticipation,
-  type ThreadParticipationStorage,
 } from "./thread-participation";
+import { memoryUnreadStorage, type UnreadStorage } from "./unread-storage";
 
 export type UnreadSnapshot = Readonly<{
   target: ReadTarget;
@@ -222,7 +221,7 @@ export function createUnread({
   profiles,
   notify = (listener) => listener(),
   follows = memoryThreadFollows(),
-  participation = memoryThreadParticipation(),
+  storage = memoryUnreadStorage(),
   now = () => Date.now(),
 }: {
   reads: ReturnType<typeof createReadState>;
@@ -235,7 +234,7 @@ export function createUnread({
   profiles?: ProfileQueries;
   notify?: (listener: () => void) => void;
   follows?: ThreadFollowStorage;
-  participation?: ThreadParticipationStorage;
+  storage?: UnreadStorage;
   /** Only for the never-read channel window floor; reading never uses the clock. */
   now?: () => number;
 }) {
@@ -1891,7 +1890,8 @@ export function createUnread({
   async function rememberedRoots(): Promise<ThreadParticipation> {
     if (!persisted) {
       try {
-        persisted = await participation.read();
+        persisted =
+          (await storage.read())?.participation ?? NO_THREAD_PARTICIPATION;
       } catch {
         // Unreadable storage forgets nothing durable: this repair relearns
         // what the relay still shows and saves that.
@@ -2360,7 +2360,10 @@ export function createUnread({
           persisted?.walk?.since !== walk?.since
         ) {
           persisted = next;
-          void participation.write(next).catch(() => {});
+          // The record holds no evidence yet, only the threads.
+          void storage
+            .save({ participation: next, events: [] })
+            .catch(() => {});
         }
       },
     };
@@ -3694,7 +3697,7 @@ export function createUnread({
       inboxListeners.clear();
       forcedMessages.clear();
       entered.clear();
-      participation.close();
+      storage.close();
       reads.dispose();
     },
   };
