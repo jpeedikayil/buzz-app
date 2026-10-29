@@ -147,7 +147,8 @@ afterEach(() => {
  * attaches edits and deletions only to top-level and depth-limited
  * reads, which the repair does not send. `down` fails every evidence read
  * (the repair's, the delta's and the read of deletions), `fail` the ones it
- * matches; `now` is the device clock. */
+ * matches; `now` is the device clock, and `rosterSettled` says whether the
+ * channel list is the relay's whole answer. */
 async function launch({
   store,
   storage,
@@ -157,6 +158,7 @@ async function launch({
   down = false,
   fail = () => false,
   now = () => NOW,
+  rosterSettled = () => true,
 }: {
   store: readonly RelayEvent[];
   storage: UnreadStorage;
@@ -166,6 +168,7 @@ async function launch({
   down?: boolean;
   fail?: (filters: readonly ReadFilter[]) => boolean;
   now?: () => number;
+  rosterSettled?: () => boolean;
 }) {
   const tagged = (item: RelayEvent, name: string, values: readonly string[]) =>
     item.tags.some(
@@ -312,6 +315,7 @@ async function launch({
       close: () => storage.close(),
     },
     now,
+    rosterSettled,
   });
   owners.push(owner);
   /** Evidence reads wait until `release`; `waiting` resolves with the first
@@ -3325,22 +3329,25 @@ const ownReads = (filters: readonly ReadFilter[]) =>
   threadReads(filters).filter(
     (filter) => filter.since === undefined || filter.limit === 50,
   );
-/** A record whose mark is too old for a delta, so the launch reads the
- * bootstrap from it, holding no evidence: `hot` threads read whole and
- * through, `cold` ones read through, and `owed` ones neither. */
+/** A record not complete, so the launch reads the bootstrap from its mark,
+ * confirmed at `checked` (a minute ago unless given), holding no evidence:
+ * `hot` threads read whole and through, `cold` ones read through, and
+ * `owed` ones neither. */
 async function readThrough({
   hot = [],
   cold = [],
   owed = [],
+  checked = SECONDS - 60,
 }: {
   hot?: readonly [string, RelayEvent][];
   cold?: readonly [string, RelayEvent][];
   owed?: readonly [string, RelayEvent][];
+  checked?: number;
 }) {
   const key = ([channelId, root]: [string, RelayEvent]) =>
     `${channelId}:${root.id}`;
   const storage = memoryUnreadStorage();
-  const mark = { at: SECONDS - 600, checked: SECONDS - 86_401 };
+  const mark = { at: SECONDS - 600, checked };
   await storage.save({
     participation: {
       roots: new Map(
@@ -3352,7 +3359,7 @@ async function readThrough({
     },
     events: [],
     structure: new Set(),
-    complete: true,
+    complete: false,
     mark,
     roster: new Set(ROSTER),
     whole: new Set(hot.map(key)),
@@ -3466,8 +3473,8 @@ it("a dropped read past the mark holds the mark and says some activity could not
   await h.saved;
   expect((await storage.read())?.mark).toEqual(mark);
   failing = false;
-  const ticking = await sentDuring(h, () => h.reconnected());
-  expect(ticking.filter(past)).toHaveLength(1);
+  const refreshed = await sentDuring(h, () => h.owner.capability.refresh());
+  expect(refreshed.filter(past)).toHaveLength(1);
   expect(h.owner.capability.inbox().partial).toBeUndefined();
   expect((await storage.read())?.mark?.checked).toBeGreaterThan(mark.checked);
 });
@@ -3580,16 +3587,12 @@ it("restored evidence discarded after a full repair from the mark asked its thre
   const sent = (h: Launch) =>
     h.reader.read.mock.calls.flatMap(([filters]) => filters);
   const release = holdRestore();
-  // A day on, the mark is too old for a delta: the launch reads the
-  // bootstrap from it while restore still verifies.
-  const h = await launch({
-    store: later,
-    storage,
-    now: () => NOW + 86_401_000,
-  });
+  // Refresh on launch reads the bootstrap from the mark while restore still
+  // verifies.
+  const h = await launch({ store: later, storage });
   let launched: Promise<void> | undefined;
   try {
-    launched = h.owner.capability.ensure();
+    launched = h.owner.capability.refresh();
     await vi.waitFor(() => expect(sent(h).filter(past)).toHaveLength(1));
   } finally {
     release();
@@ -3600,4 +3603,234 @@ it("restored evidence discarded after a full repair from the mark asked its thre
   expect(h.owner.capability.inbox().items).toContainEqual(
     expect.objectContaining({ rootId: root.id, unreadCount: 1 }),
   );
+});
+
+// A thread whose restored reply is forgotten is read whole or on its own
+// again: read past the mark alone, a reply older than it would be lost.
+it.each([
+  ["a full repair from a mark confirmed over a day ago", 86_401, 1001],
+  // Fresh, so the full repair reads past the mark.
+  [
+    "a catch-up still full at its last page, read in full from its mark",
+    60,
+    3000,
+  ],
+] as const)(
+  "restored evidence forgotten by %s, whose roster sample drops and whose edits since the mark are more than its read of deletions takes, leaves its thread read neither whole nor through: the next launch reads it whole and the unread reply counts",
+  async (_, age, edited) => {
+    const root = post(viewerKey, "team", T);
+    const answer = reply(peerKey, "team", root, T + 2);
+    const key = `team:${root.id}`;
+    const at = SECONDS - 600;
+    const storage = memoryUnreadStorage();
+    await storage.save({
+      participation: { roots: new Map([[key, { at: T }]]) },
+      events: [root, answer],
+      structure: new Set(),
+      complete: true,
+      mark: { at, checked: SECONDS - age },
+      roster: new Set(ROSTER),
+      whole: new Set([key]),
+      through: new Set([key]),
+    });
+    // Newer posts fill team's window above the answer; they are saved, so
+    // signed. The edits are of a message no longer held.
+    const newer = Array.from({ length: 101 }, (_, i) =>
+      post(peerKey, "team", at + 1 + i),
+    );
+    const edits = Array.from({ length: edited }, (_, i) =>
+      hashed("team", at + 200 + i, 40003, [["e", "f".repeat(64)]]),
+    );
+    const store = [root, answer, ...newer, ...edits];
+    const first = await launch({ store, storage, fail: sampleRead });
+    await first.owner.capability.ensure();
+    await first.saved;
+    first.owner.dispose();
+    const h = await launch({ store, storage });
+    const launched = await sentDuring(h, () => h.owner.capability.ensure());
+    expect(launched.filter(wholeOf(root.id))).toHaveLength(1);
+    expect(h.owner.capability.inbox().items).toContainEqual(
+      expect.objectContaining({ rootId: root.id, unreadCount: 1 }),
+    );
+  },
+);
+
+it("a full repair from a mark confirmed more than a day ago reads each remembered thread on its own, none past the mark", async () => {
+  const hot = Array.from({ length: 50 }, (_, i): [string, RelayEvent] => [
+    "team",
+    post(peerKey, "team", T + 10 + i),
+  ]);
+  const cold = post(peerKey, "quiet", T);
+  const { storage, since } = await readThrough({
+    hot,
+    cold: [["quiet", cold]],
+    checked: SECONDS - 25 * 3600,
+  });
+  const h = await launch({
+    store: [...hot.map(([, root]) => root), cold, ...busy],
+    storage,
+    frontiers: BUSY_READ,
+  });
+  const launched = await sentDuring(h, () => h.owner.capability.ensure());
+  const reads = threadReads(launched);
+  expect(reads.filter((filter) => filter.since === since)).toEqual([]);
+  expect(
+    new Set(
+      reads
+        .filter((filter) => filter.since === undefined)
+        .flatMap((filter) => filter["#e"] ?? []),
+    ),
+  ).toEqual(new Set(hot.map(([, root]) => root.id)));
+  expect(ownReads(launched).filter((filter) => filter.since)).toEqual([
+    {
+      kinds: CONTENT,
+      "#h": ["quiet"],
+      "#e": [cold.id],
+      since: T,
+      include_aux: true,
+      limit: 50,
+    },
+  ]);
+});
+
+// The hot threads' replies are admitted, so the budget refuses the rest;
+// the cold ones' are read and older than their thread's newest time, so are
+// passed over and none is refused.
+it.each([
+  ["hot threads", false],
+  ["cold threads whose replies are read", true],
+] as const)(
+  "a read past the mark of %s still full after eight splits is dropped there: its threads are no longer read through, the mark stays, the Inbox says so, and the next full repair reads each of them on its own",
+  async (_, read) => {
+    const { since } = await readThrough({});
+    // Ranked below 50 hotter threads that have no replies.
+    const hotter = read
+      ? Array.from({ length: 50 }, (_, i): [string, RelayEvent] => [
+          "quiet",
+          post(peerKey, "quiet", since + 400 + i),
+        ])
+      : [];
+    const roots = Array.from({ length: 10 }, (_, i): [string, RelayEvent] => [
+      "team",
+      post(peerKey, "team", read ? since + 300 + i : T + i),
+    ]);
+    const { storage, mark } = await readThrough(
+      read ? { hot: hotter, cold: roots } : { hot: roots },
+    );
+    // Any two of them have more replies since the mark than a page holds, so
+    // every read of more than one is split.
+    const replies = roots.flatMap(([, root]) =>
+      Array.from({ length: 251 }, (_, i) =>
+        hashed("team", since + 1 + i, 9, [["e", root.id, "", "reply"]]),
+      ),
+    );
+    const h = await launch({
+      store: [
+        ...[...hotter, ...roots].map(([, root]) => root),
+        ...replies,
+        ...busy,
+      ],
+      storage,
+      frontiers: { ...BUSY_READ, team: SECONDS },
+    });
+    const past = (filter: ReadFilter) =>
+      !!filter["#e"] && filter.since === since;
+    const from = h.reader.read.mock.calls.length;
+    await h.owner.capability.ensure();
+    const requests = h.reader.read.mock.calls
+      .slice(from)
+      .map(([filters]) => filters.filter(past))
+      .filter((filters) => filters.length);
+    // The read and its eight splits.
+    expect(requests).toHaveLength(9);
+    // The roots of a read of many whose page is full and that is not split.
+    const filters = requests.flat();
+    const capped = filters.flatMap((filter) => {
+      const ids = filter["#e"] ?? [];
+      const page = replies.filter((event) =>
+        event.tags.some(([name, id]) => name === "e" && ids.includes(id ?? "")),
+      ).length;
+      const split = filters.some(
+        (other) =>
+          (other["#e"]?.length ?? 0) < ids.length &&
+          other["#e"]?.every((id) => ids.includes(id)),
+      );
+      return ids.length > 1 && page >= filter.limit && !split ? ids : [];
+    });
+    expect(capped).not.toEqual([]);
+    expect(h.owner.capability.inbox().partial).toBe(true);
+    await h.saved;
+    const record = await storage.read();
+    expect(record?.mark).toEqual(mark);
+    expect(record?.through).toEqual(
+      new Set(
+        [...hotter, ...roots]
+          .filter(([, root]) => !capped.includes(root.id))
+          .map(([channelId, root]) => `${channelId}:${root.id}`),
+      ),
+    );
+    const refreshed = await sentDuring(h, () => h.owner.capability.refresh());
+    expect(
+      new Set(
+        threadReads(refreshed)
+          .filter((filter) => !past(filter))
+          .flatMap((filter) => filter["#e"] ?? []),
+      ),
+    ).toEqual(new Set(capped));
+    expect(
+      refreshed
+        .filter(past)
+        .flatMap((filter) => filter["#e"] ?? [])
+        .filter((id) => capped.includes(id)),
+    ).toEqual([]);
+    expect(h.owner.capability.inbox().partial).toBeUndefined();
+  },
+);
+
+it("a catch-up that ends while the channel list is still being read leaves the walk mark, so a channel that read then lists is walked from it and the viewer's reply there is remembered", async () => {
+  const walked = SECONDS - 1000;
+  const storage = memoryUnreadStorage();
+  await storage.save({
+    participation: { roots: new Map(), walk: { since: walked } },
+    events: [],
+    structure: new Set(),
+    complete: true,
+    mark: { at: SECONDS - 600, checked: SECONDS - 60 },
+    roster: new Set(ROSTER),
+  });
+  const store: RelayEvent[] = [];
+  let settled = true;
+  // The viewer reads `added` on another device after replying there.
+  const h = await launch({
+    store,
+    storage,
+    frontiers: { added: SECONDS - 350 },
+    rosterSettled: () => settled,
+  });
+  await h.owner.capability.ensure();
+  // While away the viewer was added to `added` and replied there, then
+  // posted in team; busier channels' newer traffic keeps the reply out of
+  // the roster's newest events.
+  const root = post(peerKey, "added", SECONDS - 500);
+  const mine = reply(viewerKey, "added", root, SECONDS - 400);
+  store.push(
+    root,
+    mine,
+    ...Array.from({ length: 500 }, (_, i) =>
+      hashed("busy", SECONDS - 390 + (i % 50)),
+    ),
+    post(viewerKey, "team", SECONDS - 300),
+  );
+  // A reconnect's catch-up ends before the channel list read beside it.
+  settled = false;
+  await h.reconnected();
+  expect((await storage.read())?.participation.walk).toEqual({
+    since: walked,
+  });
+  settled = true;
+  h.roster(summaries([...ROSTER, "added"]));
+  await h.owner.capability.ensure();
+  expect(
+    (await storage.read())?.participation.roots.has(`added:${root.id}`),
+  ).toBe(true);
 });

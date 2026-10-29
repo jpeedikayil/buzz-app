@@ -235,6 +235,7 @@ export function createUnread({
   notify = (listener) => listener(),
   follows = memoryThreadFollows(),
   storage = memoryUnreadStorage(),
+  rosterSettled = () => true,
   now = () => Date.now(),
 }: {
   reads: ReturnType<typeof createReadState>;
@@ -248,6 +249,10 @@ export function createUnread({
   notify?: (listener: () => void) => void;
   follows?: ThreadFollowStorage;
   storage?: UnreadStorage;
+  /** Whether the channel list is the relay's whole answer: its last read
+   * reached its end and none is running. A delta moves the walk mark only
+   * then (see `walk.caught`). */
+  rosterSettled?: () => boolean;
   /** For the never-read channel window floor and the age of the mark's
    * confirmation (see `route`); reading never uses the clock. */
   now?: () => number;
@@ -1907,14 +1912,18 @@ export function createUnread({
   const COLD_LIMIT = 50;
   const PARTICIPATION_BUDGET = 1024;
   const PARTICIPATION_RESERVE = PARTICIPATION_BUDGET / 4;
-  // From a mark, a full repair asks the threads read through to it only for
-  // replies since it less DELTA_LOOKBACK (see `past`): up to MARK_ROOTS roots
-  // in up to SAMPLE_CHANNELS channels a filter, MARK_LIMIT a page, a full
-  // page split in halves, never paged (the relay plans a paged read of many
-  // roots generically: 16 → 388 ms). A read by ID asks ID_BATCH IDs a filter
-  // (the relay plans 100 as a scan: 5 → 66 ms).
+  // From a mark confirmed within MARK_AGE, a full repair asks the threads
+  // read through to it only for replies since it less DELTA_LOOKBACK (see
+  // `past`): up to MARK_ROOTS roots in up to SAMPLE_CHANNELS channels a
+  // filter, MARK_LIMIT a page, a full page split in halves, never paged (the
+  // relay plans a paged read of many roots generically: 16 → 388 ms), at most
+  // MARK_SPLITS times a filter: 1 + MARK_SPLITS requests, each of at most two
+  // filters, so (1 + 2 × MARK_SPLITS) × MARK_LIMIT events. Eight splits take
+  // one busy root of 200 down to itself. A read by ID asks ID_BATCH IDs a
+  // filter (the relay plans 100 as a scan: 5 → 66 ms).
   const MARK_ROOTS = 200;
   const MARK_LIMIT = 500;
+  const MARK_SPLITS = 8;
   const ID_BATCH = 50;
   // The walk over the viewer's authored history teaches the threads they
   // replied in. A device's first repair pages back from the authored page in
@@ -2148,13 +2157,10 @@ export function createUnread({
    * mark, the pass is partial, and the next pass reads the delta again.
    * Only a pass that reads the bootstrap lets the sample move the mark or
    * rebuild the roster set. */
+  const recent = (at: UnreadMark) =>
+    Math.floor(now() / 1000) - at.checked <= MARK_AGE;
   const route = (catchUp: boolean): "delta" | "bootstrap" =>
-    catchUp &&
-    complete &&
-    mark &&
-    Math.floor(now() / 1000) - mark.checked <= MARK_AGE
-      ? "delta"
-      : "bootstrap";
+    catchUp && complete && mark && recent(mark) ? "delta" : "bootstrap";
   /** A read of every chunk of the roster to its end confirms the mark now,
    * raised to the newest time it returned. Live events never move it: a
    * dropped frame could leave them behind the delta's lookback. */
@@ -2677,7 +2683,11 @@ export function createUnread({
     }
     forget(gone);
   }
-  /** Drops restored evidence found gone, or that no read vouches for. */
+  /** Drops restored evidence found gone, or that no read vouches for. Its
+   * thread is no longer read whole or through: a full repair from the mark
+   * would read it only since the mark (see `past`), and a catch-up not at
+   * all (see `promote`), so a reply forgotten while undeleted would not be
+   * read again. */
   function forget(gone: Iterable<string>) {
     const changed = new Set<string>();
     let removed = false;
@@ -2690,6 +2700,9 @@ export function createUnread({
       bytes -= sizeOf(event);
       const channel = channelOf(event);
       if (channel) changed.add(channel);
+      const key = `${channel}:${threadReference(event)?.rootId ?? event.id}`;
+      whole.delete(key);
+      through.delete(key);
     }
     if (!removed) return;
     dropOrphans();
@@ -3127,6 +3140,11 @@ export function createUnread({
     const riding = new Set<string>();
     const hotRiding = new Set<string>();
     const floors = new Map<string, number>();
+    // The splits each read past the mark has left, by root, and the roots of
+    // a half still full once it has none: no longer read through, so the
+    // next full repair reads each on its own.
+    const splits = new Map<string, { left: number }>();
+    const capped = new Set<string>();
     const threads = threadRead;
     /** The roots of `keys` not yet asked for (or all of them, `again`), by
      * channel, now asked for. */
@@ -3193,6 +3211,7 @@ export function createUnread({
       readThrough,
       riding,
       hotRiding,
+      capped,
       walk: {
         /** The authored read riding the first request: the viewer's newest
          * page, since the last walk when there was one. */
@@ -3244,7 +3263,10 @@ export function createUnread({
          * of it, `newest`, as a walk reaching its end does. Only when the
          * delta read every channel the viewer may have written in: with one
          * listed but unconfirmed, or outside the roster set, the walk reads
-         * beside the delta instead and moves the mark itself. */
+         * beside the delta instead and moves the mark itself; while the
+         * channel list is still being read (`rosterSettled`), as on a
+         * reconnect, the mark stays, so a channel that read then lists is
+         * joined and walked from it. */
         caught(newest: number | undefined) {
           walked = true;
           if (newest !== undefined)
@@ -3302,6 +3324,7 @@ export function createUnread({
         const marks: ReadFilter[][] = [];
         let channelIds = new Set<string>();
         let rootIds: string[] = [];
+        let keys: string[] = [];
         const flush = () => {
           if (rootIds.length)
             marks.push([
@@ -3314,8 +3337,11 @@ export function createUnread({
                 limit: MARK_LIMIT,
               },
             ]);
+          const left = { left: MARK_SPLITS };
+          for (const key of keys) splits.set(key, left);
           channelIds = new Set();
           rootIds = [];
+          keys = [];
         };
         for (const key of rides) {
           riding.add(key);
@@ -3334,6 +3360,7 @@ export function createUnread({
             flush();
           channelIds.add(channelId);
           rootIds.push(key.slice(separator + 1));
+          keys.push(key);
         }
         flush();
         return { hot: reads, marks };
@@ -3454,7 +3481,9 @@ export function createUnread({
         // older than a lone root's `since` page reaches; the roots are asked
         // for again and keep their slots. A lone root's page as long as its
         // whole read holds what that read would return. Halves are not paged:
-        // the relay plans a paged read of many roots generically.
+        // the relay plans a paged read of many roots generically. A read past
+        // the mark splits MARK_SPLITS times at most; a half still full after
+        // that is dropped, its roots no longer read through.
         const reasked = new Set<string>();
         for (const filter of request) {
           const channelIds = filter["#h"];
@@ -3474,7 +3503,20 @@ export function createUnread({
               ),
           ).length;
           if (page < filter.limit) continue;
-          for (const key of threadsOf(filter)) {
+          const keys = threadsOf(filter);
+          const left =
+            filter.since !== undefined && rootIds.length > 1
+              ? splits.get(keys[0] ?? "")
+              : undefined;
+          if (left && !left.left) {
+            for (const key of keys) {
+              capped.add(key);
+              through.delete(key);
+            }
+            continue;
+          }
+          if (left) left.left--;
+          for (const key of keys) {
             pending.add(key);
             reasked.add(key);
           }
@@ -3575,7 +3617,8 @@ export function createUnread({
         // (or read past the mark when it was: see `past`).
         for (const filter of request)
           for (const key of threadsOf(filter)) {
-            if (reasked.has(key) || refused.has(key)) continue;
+            if (reasked.has(key) || refused.has(key) || capped.has(key))
+              continue;
             through.add(key);
             readThrough.add(key);
             if (filter.since === undefined) whole.add(key);
@@ -3785,16 +3828,18 @@ export function createUnread({
         // the windows. The other remembered threads are asked for new
         // replies, and the walk pages back through the viewer's history,
         // behind them. Its gate is the first request and those threads. From
-        // a mark whose evidence is held, the threads read through to it are
-        // asked only for replies since it (see `past`): the newest of those
-        // reads joins the gate, the rest follow the roster sample.
+        // a mark confirmed within MARK_AGE whose evidence is held, the threads
+        // read through to it are asked only for replies since it (see
+        // `past`): the newest of those reads joins the gate, the rest follow
+        // the roster sample. From an older mark each is read on its own, as
+        // one read of many roots since it would read a long gap.
         const bootstrap = () => {
           const queue = chunk<ReadFilter>(
             [pass.walk.first(), ...windows],
             UNREAD_WINDOW_BATCH,
           );
           const { hot, marks } =
-            prior && !restore?.discarded
+            prior && recent(prior) && !restore?.discarded
               ? pass.past(deltaSince)
               : { hot: pass.hot(), marks: [] };
           queue.splice(1, 0, ...hot, ...marks.slice(0, 1));
@@ -4086,6 +4131,9 @@ export function createUnread({
         }
         // Nothing landed: nothing was observed, so the repair failed.
         if (!progress.landed) throw progress.failure;
+        // A read past the mark that ran out of splits is dropped, as a
+        // dropped thread read is: the mark stays, and the Inbox says so.
+        if (pass.capped.size) unchecked = unvouched = true;
         // A delta read to its end confirms the mark, and has read what
         // restored evidence owes and, with no walk beside it, what the
         // viewer wrote since it. One still full at its last page, or never
@@ -4098,7 +4146,8 @@ export function createUnread({
         if (caught) {
           confirm(catching?.newest());
           cover(ids, deltaSince);
-          if (!bootstrapped && !walking) pass.walk.caught(authored);
+          if (!bootstrapped && !walking && rosterSettled())
+            pass.walk.caught(authored);
         }
         // In a pass that reads the bootstrap, the roster sample landing whole
         // confirms the mark (design §3.5), once every read but the windows

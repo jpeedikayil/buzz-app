@@ -101,7 +101,8 @@ const ids = (raw: unknown, bound: number, length = 64): raw is string[] =>
  * malformed one as incomplete, so a record from an older build keeps its
  * threads and only owes a full repair (a missing or malformed `mark`,
  * `whole`, `through` or `absent` reads as none); without `structure` no event can be
- * told apart from structure, so none is restored. Event validity is left to
+ * told apart from structure, so none is restored, nor the threads read whole
+ * or through, whose replies those events held. Event validity is left to
  * the owner's re-verification. */
 function parse(
   raw: unknown,
@@ -151,10 +152,10 @@ function parse(
     complete: known && covered && complete === true,
     ...(mark ? { mark } : {}),
     ...(covered && roster.length ? { roster: new Set(roster) } : {}),
-    ...(ids(whole, THREAD_PARTICIPATION_LIMIT, 256) && whole.length
+    ...(known && ids(whole, THREAD_PARTICIPATION_LIMIT, 256) && whole.length
       ? { whole: new Set(whole) }
       : {}),
-    ...(ids(through, THREAD_PARTICIPATION_LIMIT, 256) && through.length
+    ...(known && ids(through, THREAD_PARTICIPATION_LIMIT, 256) && through.length
       ? { through: new Set(through) }
       : {}),
     ...(ids(absent, THREAD_PARTICIPATION_LIMIT) && absent.length

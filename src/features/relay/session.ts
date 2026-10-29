@@ -1199,6 +1199,7 @@ export function createRelaySession(
     notify,
     follows: browserThreadFollows(readScope),
     storage: browserUnreadStorage(readScope),
+    rosterSettled: () => channels.roster().state === "verified",
   });
   const inboxFeed = createInboxFeed({
     // A withheld auxiliary event is not proof of an exhausted history page.

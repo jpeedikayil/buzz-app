@@ -273,7 +273,9 @@ it("a field added after the participation reads as incomplete when missing or ma
   idb.seed("meta", scope, { ...meta(participation), complete: true });
   await expect(storage.read()).resolves.toMatchObject({ complete: true });
   // Without a readable structure no event is told apart from structure (a
-  // fetched root restored as evidence would count), so none is restored.
+  // fetched root restored as evidence would count), so none is restored, nor
+  // the threads read whole or through: their replies were those events.
+  const read = ["c0:root"];
   for (const structure of [
     undefined,
     held.id,
@@ -285,6 +287,8 @@ it("a field added after the participation reads as incomplete when missing or ma
       ...meta(participation),
       structure,
       complete: true,
+      whole: read,
+      through: read,
     });
     await expect(storage.read()).resolves.toEqual({
       participation: { roots: new Map([["c0:root", { at: 1000 }]]) },
@@ -297,12 +301,16 @@ it("a field added after the participation reads as incomplete when missing or ma
     ...meta(participation),
     structure: [held.id],
     complete: true,
+    whole: read,
+    through: read,
   });
   await expect(storage.read()).resolves.toEqual({
     participation: { roots: new Map([["c0:root", { at: 1000 }]]) },
     events: [held],
     structure: new Set([held.id]),
     complete: true,
+    whole: new Set(read),
+    through: new Set(read),
   });
   // A record from before the roster set says nothing of what its mark
   // covered, so every channel is read again.
