@@ -2592,8 +2592,9 @@ export const test = base.extend({
           targetEvents.push(deletion);
           relay.publish("primary", deletion);
         },
-        // The peer deletes a thread reply on the relay alone, nothing live:
-        // the channel's later reads return the deletion in its place.
+        // The peer deletes a thread reply on the relay alone, nothing live,
+        // now, as while the app is closed: the channel's later reads, and a
+        // relay's delta from the app's mark, return the deletion in its place.
         deleteThreadReply(content) {
           for (const replies of threadReplies.values()) {
             const index = replies.findIndex(
@@ -2610,7 +2611,7 @@ export const test = base.extend({
               ],
               "",
               peerKey,
-              event.created_at + 100,
+              Math.floor(Date.now() / 1000),
             );
             histories.get(`primary/${channel}`).push(deletion);
             return deletion;

@@ -389,6 +389,7 @@ it("admits an unread repair batch of edits and deletions read by up to 100 event
     batch.map((f) => ({ ...f, before_id: "a".repeat(64) })),
     stopped.map((f) => ({ ...f, before_id: "A".repeat(64) })),
     stopped.map((f) => ({ ...f, until: 2000.5 })),
+    stopped.map((f) => ({ ...f, until: -1 })),
   ] as ReadFilter[][])
     await expect(read(invalid)).rejects.toThrow("1–4 filters");
   await expect(read([...batch, filter(9)])).rejects.toThrow(

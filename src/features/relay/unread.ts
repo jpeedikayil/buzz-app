@@ -406,10 +406,10 @@ export function createUnread({
   const covered = new Set<string>();
   let whole = new Set<string>();
   let resample = false;
-  // The last pass read the bootstrap and its walk stopped short: a delta
-  // would advance the walk mark past what it did not walk (see
-  // `walk.caught`), so until a walk reaches its end a save is not complete
-  // and the next pass reads the bootstrap (see `route`).
+  // The last pass read the walk, in the bootstrap or beside a delta, and it
+  // stopped short: a delta would advance the walk mark past what it did not
+  // walk (see `walk.caught`), so until a walk reaches its end a save is not
+  // complete and the next pass reads the bootstrap (see `route`).
   let unwalked = false;
   // Roots the relay returned nothing for when asked by ID, read with the
   // record too, so a remembered thread whose root was deleted does not leave
@@ -3192,7 +3192,10 @@ export function createUnread({
         /** A delta read to its end has read what the viewer wrote in the
          * roster since the mark less the lookback, which the walk mark is
          * not behind (see `unwalked`): the mark advances to the newest
-         * of it, `newest`, as a walk reaching its end does. */
+         * of it, `newest`, as a walk reaching its end does. Only when the
+         * delta read every channel the viewer may have written in: with one
+         * listed but unconfirmed, or outside the roster set, the walk reads
+         * beside the delta instead and moves the mark itself. */
         caught(newest: number | undefined) {
           walked = true;
           if (newest !== undefined)
@@ -3634,14 +3637,31 @@ export function createUnread({
         // threads in those channels, whose hot ones are promoted. The gate is
         // the delta's first pages.
         const joined = new Set(ids.filter((id) => !covered.has(id)));
+        // The delta moves the walk mark only when it read every channel the
+        // viewer may have written in since that mark (see `walk.caught`):
+        // none is listed with its membership not yet confirmed, which it does
+        // not read, and none is outside the roster set. Otherwise the walk
+        // reads beside it, from the walk mark, with those channels' windows.
+        const walking =
+          !!catching &&
+          (joined.size > 0 ||
+            channels
+              .list()
+              .channels.some(
+                (channel) =>
+                  channel.cached && channel.members?.includes(viewer),
+              ));
         const { queue: requests, gate } = catching
           ? {
               queue: [
                 ...catching.requests,
-                ...chunk(
-                  windows.filter((filter) =>
-                    joined.has(filter["#h"]?.[0] ?? ""),
-                  ),
+                ...chunk<ReadFilter>(
+                  [
+                    ...(walking ? [pass.walk.first()] : []),
+                    ...windows.filter((filter) =>
+                      joined.has(filter["#h"]?.[0] ?? ""),
+                    ),
+                  ],
                   UNREAD_WINDOW_BATCH,
                 ),
                 ...(joined.size || resample
@@ -3654,14 +3674,21 @@ export function createUnread({
           : bootstrap();
         const run: Run = { pass, generation, queue: requests, pooling: true };
         activePass = run;
+        // Whether the pass reads the bootstrap: routed to it, or catching up
+        // with a delta still full at its last page or never asked, or from a
+        // record whose evidence restore discarded (see `route`). In that pass
+        // the bootstrap's reads follow the delta's.
+        let bootstrapped = !catching;
         // Once the gate's reads have landed, or were dropped, the Inbox is no
         // longer loading; the reads still running show as `observing`. A
         // delta's gate waits for the restored record too, which it catches
-        // up: until then the Inbox shows it as restored.
+        // up: until then the Inbox shows it as restored. Once restore
+        // discards it, the bootstrap's gate is the Inbox's instead.
         const first = new Set<readonly ReadFilter[]>(gate);
         const loaded = () => {
           const ready = () => {
             if (closed || generation !== epoch || activePass !== run) return;
+            if (restore?.discarded && !bootstrapped) return;
             inboxLoading = false;
             publish();
           };
@@ -3692,9 +3719,15 @@ export function createUnread({
         // What the delta teaches as it lands: the newest time the viewer
         // wrote (see `walk.caught`), the threads it brought replies to (see
         // `ground`), and the channels the mark covers whose chunk read to its
-        // end, observed as a read window observes them.
+        // end, observed as a read window observes them. That observation
+        // counts the restored record too, so it is published once restore
+        // admits the record, and not when restore discards it.
         let authored: number | undefined;
         const touched = new Set<string>();
+        // Channels a delta page's evidence made known and no other read of
+        // this pass observed: once restore discards the record, what the
+        // delta read since the mark less the lookback is no count of them.
+        const deltaKnown = new Set<string>();
         const delta = (result: readonly RelayEvent[]) => {
           for (const event of result) {
             const channelId = channelOf(event);
@@ -3708,17 +3741,17 @@ export function createUnread({
           const reading = new Set(
             catching?.rest().flatMap((filter) => filter["#h"] ?? []),
           );
-          const observed = new Set(
-            ids.filter(
-              (id) =>
-                marked.has(id) &&
-                !joined.has(id) &&
-                !reading.has(id) &&
-                !known.has(id),
-            ),
+          const observed = ids.filter(
+            (id) => marked.has(id) && !joined.has(id) && !reading.has(id),
           );
-          for (const id of observed) known.add(id);
-          if (observed.size) publish(observed);
+          const observe = () => {
+            if (closed || generation !== epoch || restore?.discarded) return;
+            const fresh = new Set(observed.filter((id) => !known.has(id)));
+            for (const id of fresh) known.add(id);
+            if (fresh.size) publish(fresh);
+          };
+          if (restore && restoring) void restore.done.then(observe);
+          else observe();
         };
         const walkPage = (request: readonly ReadFilter[]) =>
           request.find((filter) => filter.authors);
@@ -3730,11 +3763,17 @@ export function createUnread({
           result: readonly RelayEvent[] | undefined,
           queue: ReadFilter[][],
         ) => {
-          for (const event of result ?? []) returned.add(event.id);
+          const caughtUp = !!catching?.owns(request);
+          for (const event of result ?? []) {
+            returned.add(event.id);
+            if (!caughtUp) deltaKnown.delete(channelOf(event) ?? "");
+          }
           let ok = true;
           const walk = walkPage(request);
-          if (catching?.owns(request)) {
+          if (caughtUp && catching) {
+            const unseen = ids.filter((id) => !known.has(id));
             ok = catching.landed(request, result, queue);
+            for (const id of unseen) if (known.has(id)) deltaKnown.add(id);
             if (ok && result) delta(result);
           } else if (request.some((filter) => filter["#e"] || filter.ids)) {
             ok = pass.landed(request, result, queue);
@@ -3780,8 +3819,9 @@ export function createUnread({
             }
             // The authored page teaches the viewer's newest threads at once;
             // their reads go ahead of the remaining windows, and the gate
-            // waits for them while it is shut.
-            if (ok && walk && walk.until === undefined) {
+            // waits for them while it is shut. Beside a delta, the threads it
+            // teaches are promoted once the delta's reads are in.
+            if (ok && walk && walk.until === undefined && bootstrapped) {
               pass.learn();
               const taught = pass.hot();
               queue.unshift(...taught);
@@ -3816,11 +3856,6 @@ export function createUnread({
               return false;
           return true;
         };
-        // Whether the pass reads the bootstrap: routed to it, or catching up
-        // with a delta still full at its last page or never asked, or from a
-        // record whose evidence restore discarded (see `route`). In that pass
-        // the bootstrap's reads follow the delta's.
-        let bootstrapped = !catching;
         try {
           if (!(await drain())) return;
           if (catching) {
@@ -3831,8 +3866,21 @@ export function createUnread({
               outcome === undefined ||
               outcome === "full" ||
               !!restore?.discarded;
+            // The record the delta caught up is gone: a channel only the
+            // delta observed is unknown again until the bootstrap observes
+            // it, and the Inbox loads once the bootstrap's gate has landed,
+            // as on a launch without the record.
+            if (restore?.discarded) {
+              const unknown = new Set<string>();
+              for (const id of deltaKnown)
+                if (!windowed.has(id) && known.delete(id)) unknown.add(id);
+              if (unknown.size) publish(unknown);
+            }
             if (bootstrapped) {
-              requests.push(...bootstrap().queue);
+              const { queue, gate } = bootstrap();
+              if (restore?.discarded)
+                for (const request of gate) first.add(request);
+              requests.push(...queue);
               if (!(await drain())) return;
             }
           }
@@ -3854,18 +3902,18 @@ export function createUnread({
         // Nothing landed: nothing was observed, so the repair failed.
         if (!progress.landed) throw progress.failure;
         // A delta read to its end confirms the mark, and has read what
-        // restored evidence owes and what the viewer wrote since it. One
-        // still full at its last page, or never asked, left the pass to the
-        // bootstrap; one that dropped leaves the mark for the next pass,
-        // which reads it again, and the Inbox says some activity could not
-        // be checked.
+        // restored evidence owes and, with no walk beside it, what the
+        // viewer wrote since it. One still full at its last page, or never
+        // asked, left the pass to the bootstrap; one that dropped leaves the
+        // mark for the next pass, which reads it again, and the Inbox says
+        // some activity could not be checked.
         const outcome = catching?.outcome();
         const caught = outcome === "read";
         if (outcome === "dropped") unchecked = true;
         if (caught) {
           confirm(catching?.newest());
           cover(ids, deltaSince);
-          if (!bootstrapped) pass.walk.caught(authored);
+          if (!bootstrapped && !walking) pass.walk.caught(authored);
         }
         // In a pass that reads the bootstrap, the roster sample landing whole
         // confirms the mark (design §3.5), once every read but the windows
@@ -3910,7 +3958,7 @@ export function createUnread({
             covered.add(id);
         if (resampled) resample = false;
         if (!(await settleDeletions(ids, generation, priority))) return;
-        unwalked = bootstrapped && !pass.walk.ended();
+        unwalked = (bootstrapped || walking) && !pass.walk.ended();
         pass.learn();
         pass.save();
         // A lookup that landed between the last drain and the pool's release

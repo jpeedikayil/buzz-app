@@ -67,6 +67,7 @@ export function isUnreadWindowBatch(value: unknown): boolean {
         "limit",
       ]) &&
       Number.isInteger(filter.until) &&
+      (filter.until as number) >= 0 &&
       hexes([filter.before_id], 1);
     if (resumed || keysAre(filter, ["kinds", "#e", "since", "limit"]))
       return (
