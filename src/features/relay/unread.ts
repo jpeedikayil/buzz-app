@@ -1916,12 +1916,17 @@ export function createUnread({
   // covered has its deletions since the record's mark read the same way,
   // DELETION_PAGES at most (see `settleDeletions`). Those read by ID (see
   // `vouch`) ride OVERLAY_BATCH filters of 100 IDs a request, within the
-  // 64 KiB of filters the reader and the browser host take.
+  // 64 KiB of filters the reader and the browser host take; one still full
+  // at its last page reads on in halves (see `scanner`), HALVES at most a
+  // read: enough to take one 100-ID filter down to single IDs (198), each
+  // DELETION_PAGES pages, so the halves add at most 400 requests. A read
+  // needing more is dropped.
   const DELTA_LOOKBACK = 900 + 960 + 5;
   const DELTA_PAGE = 500;
   const DELTA_PAGES = 6;
   const DELETION_PAGES = 2;
   const OVERLAY_BATCH = 9;
+  const HALVES = 200;
   const MARK_AGE = 24 * 60 * 60;
   const overlayKinds = UNREAD_OVERLAY_KINDS;
   const deadline = () =>
@@ -2156,6 +2161,10 @@ export function createUnread({
    * response, since the relay matched each event to the filter by a channel
    * the client may not see (see `relayMatches`); for one of several, what it
    * matches, as another's matches may reach below where its own stopped.
+   * A filter of event IDs (`#e`) still full at its last page reads on from
+   * there in two halves of its IDs, each with pages of its own, HALVES at
+   * most (more is `dropped`); one ID still full at its last page has read its
+   * newest edits and any deletion after the oldest of them, and is read.
    * Once its requests are read, `outcome` is `read` when every filter read to
    * its end, `full` when one was still full at its last page (nothing more of
    * it is read) and `dropped` when one was dropped; `newest` is the newest
@@ -2170,6 +2179,7 @@ export function createUnread({
     let open = filters.length;
     let full = false;
     let dropped = false;
+    let halves = 0;
     let newest: number | undefined;
     const owns = (request: readonly ReadFilter[]) =>
       request.length > 0 && request.every((filter) => depth.has(filter));
@@ -2214,6 +2224,27 @@ export function createUnread({
           };
           rest.set(from, next);
           const at = depth.get(filter) ?? 1;
+          const ids = filter["#e"];
+          if (ids && !full && at >= pages) {
+            if (ids.length > 1 && halves >= HALVES) {
+              dropped = true;
+              continue;
+            }
+            open--;
+            rest.delete(from);
+            if (ids.length === 1) continue;
+            const half = Math.ceil(ids.length / 2);
+            for (const part of [ids.slice(0, half), ids.slice(half)]) {
+              const piece = { ...next, "#e": part };
+              halves++;
+              open++;
+              depth.set(piece, 1);
+              origin.set(piece, piece);
+              rest.set(piece, piece);
+              queue.push([piece]);
+            }
+            continue;
+          }
           if (full || at >= pages) {
             full = true;
             continue;
@@ -2244,8 +2275,8 @@ export function createUnread({
       rest: () => [...rest.values()],
     };
   }
-  /** A scanner's reads in a pool of their own: the outcome, or undefined
-   * when retired. */
+  /** A scanner's reads in a pool of their own: the scanner once they are
+   * read, or undefined when retired. */
   async function scan(
     filters: readonly ReadFilter[],
     pages: number,
@@ -2262,7 +2293,7 @@ export function createUnread({
       reading.landed,
       reading.divided,
     );
-    return read ? reading.outcome() : undefined;
+    return read ? reading : undefined;
   }
   /** A read of these channels' edits and deletions to its end, from no
    * later than the record's mark less the lookback, has read what their
@@ -2281,10 +2312,10 @@ export function createUnread({
    * from where its pages stopped (`rest`). A read still full at its last
    * page, which holding the mark back would only widen, gives way to a read
    * by ID of the edits and deletions of the held content that is not
-   * `current` (returned by a read of the pass, or received while it ran),
-   * which `accept` applies as it does any. A dropped read, or one by ID still
-   * full, holds the mark back, for the next pass to retry. Undefined when
-   * retired. */
+   * `current` (returned by a read of the pass, or received while it ran) in
+   * the chunks not read to their end, which `accept` applies as it does any.
+   * The outcome: `read`, or `dropped` when a read was dropped, which holds
+   * the mark back for the next pass to retry. Undefined when retired. */
   async function vouch(
     ids: readonly string[],
     prior: UnreadMark,
@@ -2302,7 +2333,7 @@ export function createUnread({
     );
     const held = ids.filter((id) => holding.has(id));
     const since = Math.max(0, prior.at - DELTA_LOOKBACK);
-    let outcome = await scan(
+    const reading = await scan(
       rest
         ? rest.flatMap((gap) => {
             const part = gap["#h"]?.filter((id) => holding.has(id)) ?? [];
@@ -2323,8 +2354,11 @@ export function createUnread({
       generation,
       priority,
     );
+    let outcome = reading?.outcome();
     if (outcome === "full") {
-      const channels = new Set(held);
+      const channels = new Set(
+        reading?.rest().flatMap((gap) => gap["#h"] ?? []),
+      );
       const unreturned = [...events.values()].flatMap((event) =>
         contentKind(event) &&
         channels.has(channelOf(event) ?? "") &&
@@ -2332,7 +2366,7 @@ export function createUnread({
           ? [event.id]
           : [],
       );
-      outcome = await scan(
+      const byId = await scan(
         chunk(unreturned, 100).map(
           (part): ReadFilter => ({
             kinds: overlayKinds,
@@ -2346,10 +2380,11 @@ export function createUnread({
         priority,
         OVERLAY_BATCH,
       );
+      outcome = byId?.outcome();
     }
     if (!outcome) return;
     if (outcome === "read") cover(held, since);
-    return outcome === "read";
+    return outcome;
   }
   /** Restored evidence of roster channels no read has covered (see
    * `cover`) has its deletions since the record's mark read once restore is
@@ -2376,7 +2411,7 @@ export function createUnread({
     );
     const owing = ids.filter((id) => holding.has(id) && !owed.covered.has(id));
     if (!owing.length) return true;
-    const outcome =
+    const reading =
       since === undefined
         ? undefined
         : await scan(
@@ -2385,6 +2420,7 @@ export function createUnread({
             generation,
             priority,
           );
+    const outcome = reading?.outcome();
     if (closed || generation !== epoch) return false;
     if (outcome === "dropped") return true;
     if (outcome !== "read") {
@@ -3656,25 +3692,27 @@ export function createUnread({
         // In a pass that reads the bootstrap, the roster sample landing whole
         // confirms the mark (design §3.5), once every read but the windows
         // and the walk's later pages landed and, past a mark, the edits and
-        // deletions since it were read where evidence is held. In one that
-        // catches up, what it read once only adds to the roster set.
+        // deletions since it were read where evidence is held; when that
+        // read drops, the Inbox says so. In one that catches up, what it
+        // read once only adds to the roster set.
         const resampled = ids.every((id) => sampled.has(id));
         let moved = false;
         if (bootstrapped && resampled && !unvouched) {
-          const vouched =
-            !prior ||
-            (await vouch(
-              ids,
-              prior,
-              (id) =>
-                returned.has(id) || (!before.has(id) && !unconfirmed.has(id)),
-              catching?.rest(),
-              generation,
-              priority,
-            ));
+          const vouched = prior
+            ? await vouch(
+                ids,
+                prior,
+                (id) =>
+                  returned.has(id) || (!before.has(id) && !unconfirmed.has(id)),
+                catching?.rest(),
+                generation,
+                priority,
+              )
+            : "read";
           if (vouched === undefined) return;
-          if (vouched) confirm(sampledNewest);
-          moved = vouched;
+          if (vouched === "dropped") unchecked = true;
+          moved = vouched === "read";
+          if (moved) confirm(sampledNewest);
         }
         // The roster set (design §3.5–3.6): the channels whose windows and
         // sample landed, and those a delta read to its end kept reading. A

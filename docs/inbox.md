@@ -179,10 +179,15 @@ and the viewer's own recent messages it asked for and, after an earlier
 point, the edits and deletions since it in every channel holding events, so a
 message deleted meanwhile is not kept past it; after a catch-up that stopped
 short, only those it did not reach. When those edits and deletions are more
-than it reads, it reads instead those of each event held in those channels
-that none of its reads returned, and applies them, so nothing is dropped that
-was not deleted. The point moves once that read lands and stays where it was
-when it fails. A catch-up whose read fails leaves the point
+than it reads, it reads instead those of each event held in the channels it
+did not read to the end that none of its reads returned, and applies them, so
+nothing is dropped that was not deleted. When those of several events are more
+than it reads too, it reads on in halves, down to single events, and for one
+event its newest edits, with any deletion made after them, are enough. The
+point moves once that read lands. When it fails, or would need too many
+halves, the point stays where it was and the Inbox says some recent activity
+could not be checked until the next check reads it again. A catch-up whose
+read fails leaves the point
 where it was and the Inbox saying some recent activity could not be checked;
 the next check reads it again. Live events never move the point. The record
 keeps which channels that point covers: those read up to it, and those whose

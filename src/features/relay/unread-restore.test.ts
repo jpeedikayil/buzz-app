@@ -1874,7 +1874,8 @@ it("more edits and deletions since a stale mark than the bootstrap reads have th
     h.owner.capability
       .inbox()
       .items.some((item) => item.messageIds.includes(mention.id));
-  // That read dropped: nothing is forgotten, and the mark stays.
+  // That read dropped: nothing is forgotten, the mark stays, and the Inbox
+  // says some activity could not be checked.
   const sent = h.reader.read.mock.calls.map(([filters]) => filters);
   expect(sent.filter(overlayRead)).toHaveLength(4);
   expect(sent.filter(byIdRead)).toEqual([
@@ -1897,14 +1898,17 @@ it("more edits and deletions since a stale mark than the bootstrap reads have th
   ]);
   expect(h.count("team")).toBe(103);
   expect(mentioned()).toBe(true);
+  expect(h.owner.capability.inbox().partial).toBe(true);
   expect((await storage.read())?.mark).toEqual({
     at,
     checked: SECONDS - 86_401,
   });
-  // Landed, it returns the deletion, which applies; the rest stays.
+  // Landed on the next tick, it returns the deletion, which applies; the rest
+  // stays, and the notice clears.
   failing = false;
-  await h.owner.capability.refresh();
+  await h.reconnected();
   await save.mock.results.at(-1)?.value;
+  expect(h.owner.capability.inbox().partial).toBeUndefined();
   expect(h.owner.event(removal.id)).toBeDefined();
   expect(h.count("team")).toBe(102);
   expect(mentioned()).toBe(true);
@@ -1962,6 +1966,131 @@ it("of the reads by ID sharing a request, a full one pages on below the newest i
   expect(byId[0]?.map((filter) => filter["#e"]?.length)).toEqual([100, 1]);
   expect(h.owner.event(hidden.id)).toBeDefined();
   expect(h.count("team")).toBe(197);
+});
+
+it.each(["edited", "deleted"])(
+  "a held message %s after more edits since the mark than a read by ID pages through has that read halved down to it alone, whose newest edits read it, so the mark moves",
+  async (variant) => {
+    const at = T + 10_000;
+    const since = at - 1865;
+    const storage = await marked({ at, checked: SECONDS - 86_401 });
+    // Unread past the window's cut and outside the roster sample, read by ID
+    // together: one an agent edits more often than that read pages through,
+    // twice over, and one never edited.
+    const status = hashed("team", at - 2000);
+    const other = hashed("team", at - 1999);
+    const edits = Array.from({ length: 2001 }, (_, i) =>
+      hashed("team", since + i, 40003, [["e", status.id]]),
+    );
+    const removal = hashed("team", since + 2001, 5, [["e", status.id]]);
+    // Newer than all of those, more than the read by channel reaches.
+    const noise = Array.from({ length: 1000 }, (_, i) =>
+      hashed("team", since + 2002 + i, 5, [["e", "f".repeat(64)]]),
+    );
+    const newer = Array.from({ length: 100 }, (_, i) =>
+      hashed("team", at + 500 + i),
+    );
+    const deleted = variant === "deleted";
+    const h = await launch({
+      store: [
+        status,
+        other,
+        ...edits,
+        ...(deleted ? [removal] : []),
+        ...noise,
+        ...newer,
+        ...busy,
+      ],
+      storage,
+      frontiers: { ...BUSY_READ, team: at - 3000 },
+    });
+    h.owner.accept([status, other]);
+    const save = vi.spyOn(storage, "save");
+    await h.owner.capability.ensure();
+    await save.mock.results.at(-1)?.value;
+    expect(h.count("team")).toBe(deleted ? 101 : 102);
+    expect(h.owner.capability.inbox().partial).toBeUndefined();
+    expect((await storage.read())?.mark).toEqual({
+      at: T + 50_499,
+      checked: SECONDS,
+    });
+    // Two pages of both, then each half on from where they stopped: the
+    // unedited one is short, the edited one full at its last page.
+    const shift = deleted ? 1 : 0;
+    expect(
+      h.reader.read.mock.calls
+        .map(([filters]) => filters)
+        .filter(byIdRead)
+        .map(([filter]) => [filter?.["#e"], filter?.until]),
+    ).toEqual([
+      [[status.id, other.id], undefined],
+      [[status.id, other.id], since + 1501 + shift],
+      [[status.id], since + 1001 + shift],
+      [[other.id], since + 1001 + shift],
+      [[status.id], since + 501 + shift],
+    ]);
+  },
+);
+
+it("on a roster of more than 128 channels holding evidence, only the chunks whose edits and deletions were not read to their end have their held content read by ID", async () => {
+  const at = T + 10_000;
+  const since = at - 1865;
+  // The first 128 channels holding evidence, then a quiet one beside one
+  // whose 500 newer messages keep the quiet one's out of the roster sample.
+  const extra = Array.from({ length: 124 }, (_, i) => `c${i}`);
+  const ids = [...ROSTER, ...extra, "edge", "loud"];
+  const storage = await marked({ at, checked: SECONDS - 86_401 }, ids);
+  // Read, so no window returns it: one held in each channel but busy and
+  // loud, which the roster sample fills.
+  const held = ids
+    .filter((id) => id !== "busy" && id !== "loud")
+    .map((id) => hashed(id, T));
+  const loud = Array.from({ length: 500 }, (_, i) =>
+    hashed("loud", T + 60_000 + i),
+  );
+  // More edits and deletions in team than the read of them reaches.
+  const noise = Array.from({ length: 1000 }, (_, i) =>
+    hashed("team", since + i, 5, [["e", "f".repeat(64)]]),
+  );
+  const h = await launch({
+    store: [...held, ...loud, ...noise, ...busy],
+    storage,
+    roster: summaries(ids),
+    frontiers: {
+      ...Object.fromEntries(ids.map((id) => [id, T + 20_000])),
+      ...BUSY_READ,
+      loud: T + 70_000,
+    },
+  });
+  h.owner.accept(held);
+  const save = vi.spyOn(storage, "save");
+  await h.owner.capability.ensure();
+  await save.mock.results.at(-1)?.value;
+  const sent = h.reader.read.mock.calls.map(([filters]) => filters);
+  // Read by channel in two chunks, the first full and the second short.
+  expect(
+    sent
+      .filter((filters) => overlayRead(filters) && !byIdRead(filters))
+      .map(([filter]) => filter?.["#h"]?.length),
+  ).toEqual([128, 2, 128]);
+  const edge = held.at(-1);
+  expect(
+    sent
+      .filter(byIdRead)
+      .flat()
+      .flatMap((filter) => filter["#e"] ?? [])
+      .sort(),
+  ).toEqual(
+    held
+      .filter((item) => item !== edge)
+      .map((item) => item.id)
+      .sort(),
+  );
+  expect(h.owner.capability.inbox().partial).toBeUndefined();
+  expect((await storage.read())?.mark).toEqual({
+    at: T + 60_499,
+    checked: SECONDS,
+  });
 });
 
 it("unread messages in a channel whose window dropped beside a busy one's edits and deletions stay until the window is read again", async () => {
