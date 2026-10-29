@@ -1201,9 +1201,9 @@ it("a reconnect repair in which nothing lands keeps the observation stale instea
   });
   const count = h.query.mock.calls.length;
   h.reconnect();
-  // The delta since the mark is read twice, then dropped; the relay has
-  // stalled twice, so the window request and the roster sample beside it are
-  // read once each. Nothing was observed.
+  // The window request and the roster sample beside it are read twice
+  // each, then dropped. Nothing was observed, so the delta since the mark,
+  // which waits behind the window request, is not asked.
   await vi.waitFor(() =>
     expect(
       h.query.mock.calls
@@ -1218,6 +1218,11 @@ it("a reconnect repair in which nothing lands keeps the observation stale instea
       error: "Relay read timed out",
     }),
   );
+  expect(
+    h.query.mock.calls
+      .slice(count)
+      .filter(([filters]) => filters[0]?.kinds?.includes(40003)),
+  ).toEqual([]);
   expect(h.snapshot()).toMatchObject({ observedCount: 1, freshness: "stale" });
   expect(h.session.unread.inbox().partial).toBeUndefined();
 });
@@ -1440,8 +1445,10 @@ it("explicit refresh bypasses optional profiles for both markers and evidence", 
   try {
     await h.session.unread.refresh();
     expect(h.profileSignals[0]?.aborted).toBe(false);
+    // The refresh's sample confirms the mark again once the edits and
+    // deletions since the first repair's are read.
     expect(h.trace.map(({ kind }) => kind)).toEqual([
-      30078, 9, 9, 0, 30078, 9, 9,
+      30078, 9, 9, 0, 30078, 9, 9, 40003,
     ]);
   } finally {
     release();

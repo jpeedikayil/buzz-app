@@ -424,6 +424,14 @@ export function createUnread({
   };
   const lookups = new Map<string, Lookup>();
   const lookupEvents = new Map<string, RelayEvent>();
+  const rememberedRoot = (event: RelayEvent) =>
+    !threadReference(event) && pinned(event);
+  // How many remembered threads' roots the structure cache holds, counted
+  // for the remembered set as it was (which only grows in place), and
+  // counted again once it changes or structure is let go elsewhere.
+  let heldRoots:
+    | { of: typeof remembered; size: number; count: number }
+    | undefined;
   const queued = new Map<
     string,
     {
@@ -1323,6 +1331,7 @@ export function createUnread({
       if (!allowed(lookup.channelId)) lookups.delete(key);
     for (const [id, event] of lookupEvents)
       if (!allowed(channelOf(event) ?? "")) lookupEvents.delete(id);
+    heldRoots = undefined;
     for (const [id, event] of witnesses)
       if (!allowed(channelOf(event) ?? "")) witnesses.delete(id);
     for (const [key, { channelId }] of queued)
@@ -1504,6 +1513,7 @@ export function createUnread({
   function resetLookups() {
     lookups.clear();
     lookupEvents.clear();
+    heldRoots = undefined;
     queued.clear();
     retracted.clear();
     witnesses.clear();
@@ -1524,18 +1534,31 @@ export function createUnread({
     }
   }
   /** Fetched structure, 1,024 events besides the roots of remembered
-   * threads, which go last as their evidence does: a cold thread does not
-   * fetch its root again for a reply it already holds. Each thread has one
-   * root, so the remembered set bounds them and the oldest other event goes
-   * first. A root let go releases its structure lookup (see `want`). */
+   * threads it holds, which go last as their evidence does: a cold thread
+   * does not fetch its root again for a reply it already holds. Each thread
+   * has one root, so the remembered set bounds them and the oldest other
+   * event goes first; a root passed over moves to the newest end, so the
+   * next eviction does not walk it again. A root let go releases its
+   * structure lookup (see `want`). */
   function keep(event: RelayEvent) {
+    const size = remembered?.size ?? 0;
+    let roots = heldRoots;
+    if (!roots || roots.of !== remembered || roots.size !== size) {
+      let count = 0;
+      for (const held of lookupEvents.values())
+        if (rememberedRoot(held)) count++;
+      roots = heldRoots = { of: remembered, size, count };
+    }
+    if (!lookupEvents.has(event.id) && rememberedRoot(event)) roots.count++;
     lookupEvents.delete(event.id);
     lookupEvents.set(event.id, event);
-    const bound = 1024 + (remembered?.size ?? 0);
     for (const [id, oldest] of lookupEvents) {
-      if (lookupEvents.size <= bound) break;
-      if (!threadReference(oldest) && pinned(oldest)) continue;
+      if (lookupEvents.size - roots.count <= 1024) break;
       lookupEvents.delete(id);
+      if (rememberedRoot(oldest)) {
+        lookupEvents.set(id, oldest);
+        continue;
+      }
       const lookup = lookups.get(
         `${conversationKey(channelOf(oldest) ?? "", id)}:structure`,
       );
@@ -2077,46 +2100,63 @@ export function createUnread({
     const at = Math.max(mark?.at ?? -1, newest ?? -1);
     if (at >= 0) mark = { at, checked: Math.floor(now() / 1000) };
   }
-  /** Reads each single-filter request from its `since` to the end, newest
-   * first, accepting every page: a full page's next starts at its oldest
-   * (`until` with `before_id`; the relay orders a second's events by ID, so
-   * ties are neither skipped nor read twice), until a short page or `pages`.
-   * `read` when every filter read to its end, `full` when one was still
-   * full at its last page (nothing more is read), `dropped` when one was
-   * dropped, undefined when retired; `newest` is the newest time read. */
-  async function scan(
-    filters: readonly ReadFilter[],
-    pages: number,
-    generation: number,
-    priority: Priority,
-  ) {
+  /** One filter of `kinds` per SAMPLE_CHANNELS of `ids`, since `since`. */
+  const sinceReads = (
+    ids: readonly string[],
+    since: number,
+    kinds: readonly number[],
+  ) =>
+    chunk(ids, SAMPLE_CHANNELS).map(
+      (part): ReadFilter => ({ kinds, "#h": part, since, limit: DELTA_PAGE }),
+    );
+  /** Pages single-filter reads from their `since` to the end, newest first,
+   * accepting every page: a full page's next starts at its oldest (`until`
+   * with `before_id`; the relay orders a second's events by ID, so ties are
+   * neither skipped nor read twice), until a short page or `pages`. A page is
+   * the whole response, since the relay matched each event to the filter by
+   * a channel the client may not see (see `relayMatches`). Once its requests
+   * are read, `outcome` is `read` when every filter read to its end, `full`
+   * when one was still full at its last page (nothing more of it is read)
+   * and `dropped` when one was dropped; `newest` is the newest time read.
+   * The requests ride a pool of their own (`scan`) or the bootstrap's. */
+  function scanner(filters: readonly ReadFilter[], pages: number) {
     const depth = new Map(filters.map((filter) => [filter, 1]));
-    const progress: Pass = {
-      landed: false,
-      dropped: false,
-      failure: undefined,
-    };
+    let open = filters.length;
     let full = false;
+    let dropped = false;
     let newest: number | undefined;
-    const read = await pool(
-      filters.map((filter) => [filter]),
-      generation,
-      priority,
-      progress,
-      ([filter], result, queue) => {
-        if (!filter || !result) return true;
-        const page = result
-          .filter((event) => matchesEvent(event, filter))
-          .sort(byTime);
+    const owns = (request: readonly ReadFilter[]) =>
+      request.length === 1 && request.every((filter) => depth.has(filter));
+    return {
+      requests: filters.map((filter) => [filter]),
+      owns,
+      landed(
+        [filter]: readonly ReadFilter[],
+        result: readonly RelayEvent[] | undefined,
+        queue: ReadFilter[][],
+      ) {
+        if (!filter) return true;
+        if (!result) {
+          dropped = true;
+          return true;
+        }
+        const page = [
+          ...new Map(result.map((event) => [event.id, event])).values(),
+        ].sort(byTime);
         for (const event of page)
           newest = Math.max(newest ?? 0, event.created_at);
         if (!accept(result)) return false;
         const oldest = page.at(-1);
         const at = depth.get(filter) ?? 1;
-        if (full || !oldest || page.length < filter.limit) return true;
+        if (full) return true;
+        if (!oldest || page.length < filter.limit) {
+          open--;
+          return true;
+        }
         if (at >= pages) {
           full = true;
-          queue.length = 0;
+          const rest = queue.filter((request) => !owns(request));
+          queue.splice(0, queue.length, ...rest);
           return true;
         }
         const next = {
@@ -2128,53 +2168,83 @@ export function createUnread({
         queue.push([next]);
         return true;
       },
-      ([filter], parts) => {
+      divided(
+        [filter]: readonly ReadFilter[],
+        parts: readonly (readonly ReadFilter[])[],
+      ) {
         const part = parts[0]?.[0];
-        if (filter && part) depth.set(part, depth.get(filter) ?? 1);
+        const at = filter && depth.get(filter);
+        if (at && part) depth.set(part, at);
       },
-    );
-    if (!read) return;
-    return {
-      outcome: full ? "full" : progress.dropped ? "dropped" : "read",
-      newest,
-    } as const;
+      outcome: () =>
+        full ? "full" : dropped ? "dropped" : open ? undefined : "read",
+      newest: () => newest,
+    };
   }
-  /** The delta since the mark (see DELTA_LOOKBACK), confirming the mark when
-   * every chunk read to its end. One that read from no later than the
-   * record's mark less the lookback has read the restored evidence's
-   * deletions too (see `settleDeletions`). */
-  async function delta(
-    ids: readonly string[],
+  /** A scanner's reads in a pool of their own: the outcome, or undefined
+   * when retired. */
+  async function scan(
+    filters: readonly ReadFilter[],
+    pages: number,
     generation: number,
     priority: Priority,
   ) {
-    const since = Math.max(0, (mark?.at ?? 0) - DELTA_LOOKBACK);
-    const result = await scan(
-      chunk(ids, SAMPLE_CHANNELS).map(
-        (part): ReadFilter => ({
-          kinds: [...contentKinds, ...overlayKinds],
-          "#h": part,
-          since,
-          limit: DELTA_PAGE,
-        }),
-      ),
-      DELTA_PAGES,
+    const reading = scanner(filters, pages);
+    const read = await pool(
+      reading.requests,
       generation,
       priority,
+      { landed: false, dropped: false, failure: undefined },
+      reading.landed,
+      reading.divided,
     );
-    if (result?.outcome !== "read") return result?.outcome;
-    confirm(result.newest);
+    return read ? reading.outcome() : undefined;
+  }
+  /** A read of these channels' edits and deletions to its end, from no
+   * later than the record's mark less the lookback, has read what their
+   * restored evidence owes (see `settleDeletions`). */
+  function cover(ids: readonly string[], since: number) {
     const owed = owedDeletions;
     if (owed?.since !== undefined && since <= owed.since)
       for (const id of ids) owed.covered.add(id);
-    return result.outcome;
+  }
+  /** Whether the edits and deletions since `prior` less the lookback read to
+   * their end for every roster channel holding evidence, so the roster
+   * sample may confirm the mark past `prior`: the bootstrap's reads carry
+   * none, and a held event deleted meanwhile would otherwise be kept under a
+   * mark every later delta starts after. Undefined when retired. */
+  async function vouch(
+    ids: readonly string[],
+    prior: UnreadMark,
+    generation: number,
+    priority: Priority,
+  ) {
+    await restoring?.done;
+    if (closed || generation !== epoch) return;
+    const holding = new Set(
+      [...events.values()].flatMap((event) =>
+        contentKind(event) ? (channelOf(event) ?? []) : [],
+      ),
+    );
+    const held = ids.filter((id) => holding.has(id));
+    const since = Math.max(0, prior.at - DELTA_LOOKBACK);
+    const outcome = await scan(
+      sinceReads(held, since, overlayKinds),
+      DELETION_PAGES,
+      generation,
+      priority,
+    );
+    if (!outcome) return;
+    if (outcome === "read") cover(held, since);
+    return outcome === "read";
   }
   /** Restored evidence of roster channels no read has covered (see
-   * `delta`) has its deletions since the record's mark read once restore is
+   * `cover`) has its deletions since the record's mark read once restore is
    * in, so it does not stay restored when deleted while this device was
    * closed. When that read cannot reach its end, or the record had no mark,
    * the restored evidence no read returned is dropped, as a launch without
-   * the record would not show it. False when retired. */
+   * the record would not show it; when it is dropped, the channels stay
+   * owed, their evidence kept, for the next pass. False when retired. */
   async function settleDeletions(
     ids: readonly string[],
     generation: number,
@@ -2193,24 +2263,18 @@ export function createUnread({
     );
     const owing = ids.filter((id) => holding.has(id) && !owed.covered.has(id));
     if (!owing.length) return true;
-    const result =
+    const outcome =
       since === undefined
         ? undefined
         : await scan(
-            chunk(owing, SAMPLE_CHANNELS).map(
-              (part): ReadFilter => ({
-                kinds: overlayKinds,
-                "#h": part,
-                since,
-                limit: DELTA_PAGE,
-              }),
-            ),
+            sinceReads(owing, since, overlayKinds),
             DELETION_PAGES,
             generation,
             priority,
           );
     if (closed || generation !== epoch) return false;
-    if (result?.outcome !== "read") {
+    if (outcome === "dropped") return true;
+    if (outcome !== "read") {
       const channels = new Set(owing);
       forget(
         [...unconfirmed].filter((id) => {
@@ -2305,7 +2369,11 @@ export function createUnread({
       }
       admitRestored(verified);
     })()
-      .catch(() => {})
+      // The record's evidence is gone, so its mark no longer vouches for
+      // what this session holds: the pass reads the bootstrap.
+      .catch(() => {
+        complete = false;
+      })
       .finally(() => {
         if (restoring !== run) return;
         restoring = undefined;
@@ -2320,13 +2388,24 @@ export function createUnread({
         for (const [request, result] of landed) reconcile(request, result);
       });
   }
+  /** Whether the relay returns `event` for `filter`. It matches `#h` against
+   * the channel it filed an event under, which for one with no `h` tag (a
+   * deletion naming only its target, such as a reaction's removal) is its
+   * target's, out of the client's sight: such an event is taken to match. */
+  function relayMatches(event: RelayEvent, filter: ReadFilter) {
+    if (!filter["#h"] || event.tags.some(([name]) => name === "h"))
+      return matchesEvent(event, filter);
+    const { "#h": _, ...unscoped } = filter;
+    return matchesEvent(event, unscoped);
+  }
   /** Restored evidence a read should have returned and did not is gone from
    * the relay: deleted, or no longer readable, while this device was closed,
    * which no read tells. A read returns each filter's newest matches, so a
    * short page covers every match and a full one those down to its last; a
    * keyset page starts below the newest and is not judged. Other filters of
    * the request return older matches too, so a filter's page is the newest
-   * `limit` matches of the whole response.
+   * `limit` matches of the whole response, as the relay matched them (see
+   * `relayMatches`).
    *
    * The bootstrap's reads carry no deletions (the relay attaches edits and
    * deletions only to top-level and depth-limited reads), so restored
@@ -2348,7 +2427,7 @@ export function createUnread({
       const page = [
         ...new Map(
           result
-            .filter((event) => matchesEvent(event, filter))
+            .filter((event) => relayMatches(event, filter))
             .map((event) => [event.id, event]),
         ).values(),
       ].sort(byTime);
@@ -3165,17 +3244,24 @@ export function createUnread({
         error = undefined;
         return;
       }
+      // The mark this pass catches up from.
+      const prior = mark;
       try {
         // This repair reads again what retention dropped before it.
         dropped = [];
-        // A delta reads what the roster gained since the mark (see `route`).
-        // Until the cut-over the bootstrap still runs behind it, so a pass
-        // shows at least what the bootstrap alone does.
-        const caught =
+        // A delta reads what the roster gained since the mark (see `route`),
+        // with the edits and deletions `accept` admits, so those of a held
+        // event of any age arrive. Until the cut-over it rides the
+        // bootstrap's pool behind the reads the Inbox waits for, so a pass
+        // shows at least what the bootstrap alone does, as soon.
+        const deltaSince = Math.max(0, (prior?.at ?? 0) - DELTA_LOOKBACK);
+        const catching =
           route(catchUp) === "delta"
-            ? await delta(ids, generation, priority)
-            : "bootstrap";
-        if (!caught) return;
+            ? scanner(
+                sinceReads(ids, deltaSince, [...contentKinds, ...overlayKinds]),
+                DELTA_PAGES,
+              )
+            : undefined;
         // Keep roster scope: an unscoped read also includes unjoined open
         // channels. Each bounded request owns its queue-inclusive deadline
         // after marker sync; optional profiles must not block the initial
@@ -3204,11 +3290,9 @@ export function createUnread({
         const first = new Set<readonly ReadFilter[]>(
           requests.slice(0, 1 + hot.length),
         );
-        // A delta that dropped a request has seen the relay stall twice
-        // (see `pool`).
         const progress: Pass = {
           landed: false,
-          dropped: caught === "dropped",
+          dropped: false,
           failure: undefined,
         };
         // A dropped window, or the first request carrying them, leaves its
@@ -3231,6 +3315,8 @@ export function createUnread({
           result: readonly RelayEvent[] | undefined,
           queue: ReadFilter[][],
         ) => {
+          if (catching?.owns(request))
+            return catching.landed(request, result, queue);
           let ok = true;
           const walk = walkPage(request);
           if (request.some((filter) => filter["#e"] || filter.ids)) {
@@ -3278,6 +3364,9 @@ export function createUnread({
           if (first.delete(request) && !first.size) {
             inboxLoading = false;
             publish();
+            // A relay that answered none of these is not asked for the
+            // delta: the pass fails as soon as the bootstrap alone would.
+            if (catching && progress.landed) queue.push(...catching.requests);
           }
           return ok;
         };
@@ -3286,6 +3375,7 @@ export function createUnread({
           parts: readonly (readonly ReadFilter[])[],
         ) => {
           if (first.delete(request)) for (const part of parts) first.add(part);
+          catching?.divided(request, parts);
         };
         // The queue is drained until it stays empty: a lookup may put a
         // thread read at its head between a worker finding it empty and the
@@ -3318,7 +3408,22 @@ export function createUnread({
         }
         // Nothing landed: nothing was observed, so the repair failed.
         if (!progress.landed) throw progress.failure;
-        if (sampled === sample.length) confirm(sampledNewest);
+        // A delta read to its end confirms the mark, and has read what
+        // restored evidence owes.
+        const caught = catching?.outcome() === "read";
+        if (caught) {
+          confirm(catching?.newest());
+          cover(ids, deltaSince);
+        }
+        // The roster sample landing whole confirms the mark too (design
+        // §3.5), once every channel was checked and, past a mark, the edits
+        // and deletions since it were read where evidence is held.
+        if (sampled === sample.length && !unchecked) {
+          const vouched =
+            !prior || caught || (await vouch(ids, prior, generation, priority));
+          if (vouched === undefined) return;
+          if (vouched) confirm(sampledNewest);
+        }
         if (!(await settleDeletions(ids, generation, priority))) return;
         pass.learn();
         pass.save();
@@ -3442,7 +3547,7 @@ export function createUnread({
       retracted.add(id);
       witnesses.delete(id);
       // A deleted message must be fetched again, not reused from the cache.
-      lookupEvents.delete(id);
+      if (lookupEvents.delete(id)) heldRoots = undefined;
       for (const [key, lookup] of lookups) {
         if (lookup.evidence !== id) continue;
         changed.add(lookup.channelId);

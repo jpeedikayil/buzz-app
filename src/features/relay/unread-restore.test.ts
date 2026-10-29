@@ -106,8 +106,9 @@ afterEach(() => {
 });
 
 /** One launch against a relay holding `store`: its query returns each
- * filter's newest matches, leaves deleted events out, and, as the relay
- * does, attaches edits and deletions only to top-level and depth-limited
+ * filter's newest matches, leaves deleted events out, matches an event with
+ * no `h` tag to `#h` by its target's channel, and, as the relay does,
+ * attaches edits and deletions only to top-level and depth-limited
  * reads, which the repair does not send. `down` fails every evidence read
  * (the repair's, the delta's and the read of deletions), `fail` the ones it
  * matches; `now` is the device clock. */
@@ -141,6 +142,14 @@ async function launch({
     item.tags.some(
       ([tag, value]) => tag === name && values.includes(value ?? ""),
     );
+  const filedUnder = (item: RelayEvent): string[] => {
+    const own = item.tags.flatMap(([tag, value]) =>
+      tag === "h" && value ? [value] : [],
+    );
+    if (own.length) return own;
+    const target = store.find((other) => tagged(item, "e", [other.id]));
+    return target ? filedUnder(target) : [];
+  };
   let held: Promise<void> | undefined;
   let waiting: (filters: readonly ReadFilter[]) => void = () => {};
   const reader = {
@@ -178,7 +187,8 @@ async function launch({
                 item.created_at < filter.until ||
                 (item.created_at === filter.until &&
                   item.id > (filter.before_id ?? ""))) &&
-              (!filter["#h"] || tagged(item, "h", filter["#h"])) &&
+              (!filter["#h"] ||
+                filedUnder(item).some((id) => filter["#h"]?.includes(id))) &&
               (!filter["#e"] || tagged(item, "e", filter["#e"])),
           )
           .sort(
@@ -518,6 +528,10 @@ it("a tampered event discards the restored evidence, keeping the threads the rep
   await first.saved;
   first.owner.dispose();
   expect(await saved(saving)).toContain(answer.id);
+  expect(await saving.read()).toMatchObject({
+    complete: true,
+    mark: { checked: SECONDS },
+  });
   // Storage changed one event's content after it was signed.
   const storage: UnreadStorage = {
     ...saving,
@@ -545,6 +559,9 @@ it("a tampered event discards the restored evidence, keeping the threads the rep
   offline.owner.dispose();
   const online = await launch({ store, storage });
   await online.owner.capability.ensure();
+  // Its mark no longer vouches for what the session holds: the launch reads
+  // the bootstrap, not the delta.
+  expect(deltas(online)).toEqual([]);
   expect(online.reader.read.mock.calls.flat(2)).toContainEqual(
     expect.objectContaining({ "#h": ["team"], "#e": [root.id] }),
   );
@@ -650,6 +667,54 @@ it("restored evidence the relay no longer returns, deleted while this device was
   await repair;
   expect(thread(late)).not.toContain(alsoGone.id);
   expect(thread(late)).toContain(answers.at(-1)?.id);
+});
+
+it("restored evidence whose read of deletions is dropped stays, owed to the next pass", async () => {
+  const held = post(peerKey, "team", T);
+  const storage = memoryUnreadStorage();
+  await storage.save({
+    participation: { roots: new Map() },
+    events: [held],
+    structure: new Set(),
+    complete: true,
+    // Too old for a delta: the pass is the bootstrap.
+    mark: { at: T + 200, checked: SECONDS - 86_401 },
+  });
+  // Above it, more than the channel's window holds, so no window judges it.
+  const newer = Array.from({ length: 101 }, (_, i) =>
+    hashed("team", T + 1 + i),
+  );
+  const overlays = (h: Launch) =>
+    h.reader.read.mock.calls.flatMap(([filters]) =>
+      filters.filter((filter) => filter.kinds?.join() === "40003,5,9005"),
+    );
+  let stalling = true;
+  const h = await launch({
+    store: [held, ...newer],
+    storage,
+    frontiers: { team: T - 1 },
+    // The roster sample fails throughout, so no pass confirms the mark.
+    fail: (filters) =>
+      sampleRead(filters) ||
+      (stalling &&
+        filters.some((filter) => filter.kinds?.join() === "40003,5,9005")),
+  });
+  await h.owner.capability.ensure();
+  await h.saved;
+  const read = {
+    kinds: [40003, 5, 9005],
+    "#h": ["team"],
+    since: T + 200 - 1865,
+    limit: 500,
+  };
+  // Read, retried, and dropped.
+  expect(overlays(h)).toEqual([read, read]);
+  expect(h.owner.event(held.id)).toBeDefined();
+  expect(await saved(storage)).toContain(held.id);
+  stalling = false;
+  await h.reconnected();
+  expect(overlays(h)).toEqual([read, read, read]);
+  expect(h.owner.event(held.id)).toBeDefined();
 });
 
 it("restored evidence of a channel whose membership is not confirmed yet waits for it, and is saved meanwhile", async () => {
@@ -767,31 +832,37 @@ it("a full window's cut is its own limit-th match, and a deletion made while clo
     });
     let warm: Awaited<ReturnType<typeof launch>> | undefined;
     const restoring: boolean[] = [];
+    const inbox: string[] = [];
     warm = await launch({
       store: [...store, ...extra],
       storage: memory,
       frontiers,
       fail(filters) {
-        if (deltaRead(filters))
+        if (deltaRead(filters)) {
           restoring.push((warm?.verified() ?? 0) < record.events.length);
+          inbox.push(warm?.owner.capability.inbox().status ?? "");
+        }
         return false;
       },
     });
     await warm.owner.capability.ensure();
     await warm.saved;
-    return { warm, memory, restoring };
+    return { warm, memory, restoring, inbox };
   };
   // A mark confirmed within the day: the delta since it returns the
   // deletion, while restore is still verifying the evidence it deletes.
   const fresh = await relaunch(record.mark);
-  expect(fresh.warm.reader.read.mock.calls[0]?.[0]).toEqual([
-    {
-      kinds: DELTA_KINDS,
-      "#h": ["team", "quiet", "dm", "busy"],
-      since,
-      limit: 500,
-    },
-  ]);
+  // It rides behind the bootstrap's first request: the Inbox has painted.
+  expect(fresh.warm.reader.read.mock.calls[0]?.[0]).toContainEqual(
+    expect.objectContaining({ authors: [viewer] }),
+  );
+  expect(fresh.inbox).toEqual(["ready", "ready"]);
+  expect(deltas(fresh.warm)[0]).toEqual({
+    kinds: DELTA_KINDS,
+    "#h": ["team", "quiet", "dm", "busy"],
+    since,
+    limit: 500,
+  });
   expect(fresh.restoring).toEqual([true, true]);
   expect(fresh.warm.count("team")).toBe(129);
   expect(await saved(fresh.memory)).not.toContain(oldest.id);
@@ -799,8 +870,9 @@ it("a full window's cut is its own limit-th match, and a deletion made while clo
   fresh.warm.owner.dispose();
   // One confirmed longer ago: the bootstrap's reads alone. The window
   // returns the newest 100 beside the authored page's older match, so the
-  // 30 below its cut are not judged; the read of deletions since the mark
-  // returns this one.
+  // 30 below its cut are not judged; the read of edits and deletions since
+  // the mark in every channel holding evidence, which the roster sample
+  // needs to confirm it again, returns this one.
   const late = await relaunch(stale);
   const calls = late.warm.reader.read.mock.calls.map(([filters]) => filters);
   expect(calls.filter(deltaRead)).toEqual([]);
@@ -811,7 +883,7 @@ it("a full window's cut is its own limit-th match, and a deletion made while clo
     ]),
   );
   expect(calls).toContainEqual([
-    { kinds: [40003, 5, 9005], "#h": ["team"], since, limit: 500 },
+    { kinds: [40003, 5, 9005], "#h": ["team", "busy"], since, limit: 500 },
   ]);
   expect(late.warm.count("team")).toBe(129);
   expect(await saved(late.memory)).toEqual(
@@ -820,9 +892,10 @@ it("a full window's cut is its own limit-th match, and a deletion made while clo
   expect(await saved(late.memory)).not.toContain(oldest.id);
   expect(await saved(late.memory)).not.toContain(removal.id);
   late.warm.owner.dispose();
-  // More edits and deletions since the mark than that read reads: the
-  // restored evidence no read returned is dropped, as a launch without the
-  // record would not show it, and what the reads returned stays.
+  // More edits and deletions since the mark than that read reads, and than
+  // the read of the restored evidence's channel behind it: that evidence no
+  // read returned is dropped, as a launch without the record would not show
+  // it, and what the reads returned stays.
   const edits = Array.from({ length: 1001 }, (_, i) =>
     hashed("team", T + 200 + i, 40003, [["e", "f".repeat(64)]]),
   );
@@ -831,7 +904,7 @@ it("a full window's cut is its own limit-th match, and a deletion made while clo
     overflow.warm.reader.read.mock.calls.filter(([filters]) =>
       filters.some((filter) => filter.kinds?.join() === "40003,5,9005"),
     ),
-  ).toHaveLength(2);
+  ).toHaveLength(4);
   expect(overflow.warm.count("team")).toBe(100);
   expect(await saved(overflow.memory)).toEqual(
     expect.arrayContaining([mine, ...unread.slice(30)].map(({ id }) => id)),
@@ -996,11 +1069,26 @@ function rememberedThreads() {
 
 it("a remembered thread's root outlasts 1,024 other structure fetches, and a root let go is fetched again for a thread it teaches", async () => {
   const thread = rememberedThreads();
+  // Remembered threads besides, whose roots are gone: the cache holds no
+  // root of theirs, so it keeps no room for one.
+  const gone = Array.from(
+    { length: 100 },
+    (_, i): [string, { at: number; newestId: string }] => [
+      `team:${(i + 1).toString(16).padStart(64, "a")}`,
+      { at: T - 100 + i, newestId: (i + 1).toString(16).padStart(64, "b") },
+    ],
+  );
   const storage = memoryUnreadStorage();
-  await storage.save(thread.record);
+  await storage.save({
+    ...thread.record,
+    participation: {
+      ...thread.record.participation,
+      roots: new Map([...thread.record.participation.roots, ...gone]),
+    },
+  });
   // Read replies also sent to the channel, in threads the viewer is not
   // part of, each looked up for its root and none kept by a save: `first`,
-  // then more than the structure cache holds besides. Unsigned, as only a
+  // then as many as the structure cache holds besides. Unsigned, as only a
   // restore verifies and none of them is restored.
   const unsigned = (created_at: number, tags: string[][] = []): RelayEvent => {
     const template = {
@@ -1018,7 +1106,7 @@ it("a remembered thread's root outlasts 1,024 other structure fetches, and a roo
     };
   };
   const first = unsigned(T - 600_000);
-  const roots = Array.from({ length: 1100 }, (_, i) =>
+  const roots = Array.from({ length: 1024 }, (_, i) =>
     unsigned(T - 500_000 + i),
   );
   const replies = [first, ...roots].map((root, i) =>
@@ -1404,16 +1492,82 @@ it("a delta with a chunk that fails leaves the mark, so the next delta reads fro
   failing = false;
   await h.reconnected();
   await save.mock.results.at(-1)?.value;
-  // The failing chunk was read twice, then once more from the same mark.
+  // The failing chunk was read once, the roster sample having stalled the
+  // pass already, then once more from the same mark.
   expect(
     deltas(h)
       .filter((filter) => filter["#h"]?.includes("c129"))
       .map(({ since }) => since),
-  ).toEqual([at - 1865, at - 1865, at - 1865]);
+  ).toEqual([at - 1865, at - 1865]);
   expect((await storage.read())?.mark).toEqual({
     at: at + 20,
     checked: SECONDS,
   });
+});
+
+it("a delta page is the relay's whole response, so a reaction's removal naming no channel fills it, and restored evidence below its cut stays", async () => {
+  const at = SECONDS - 600;
+  const since = at - 1865;
+  const held = post(peerKey, "team", since + 50);
+  const storage = memoryUnreadStorage();
+  await storage.save({
+    participation: { roots: new Map() },
+    events: [held],
+    structure: new Set(),
+    complete: true,
+    mark: { at, checked: SECONDS - 60 },
+  });
+  // Above it, a page of messages less one, and a reaction taken off as
+  // buzz-mcp's `react` does: a deletion that tags the reaction alone, which
+  // the relay files under the reaction's channel.
+  const newer = Array.from({ length: 499 }, (_, i) =>
+    hashed("team", since + 100 + i),
+  );
+  const reaction = hashed("team", since + 700, 7, [["e", held.id]]);
+  const template = {
+    kind: 5,
+    pubkey: peerKey.pubkey,
+    created_at: since + 800,
+    content: "",
+    tags: [["e", reaction.id]],
+  };
+  const off: RelayEvent = {
+    ...template,
+    id: getEventHash(template),
+    sig: "0".repeat(128),
+    [verifiedSymbol]: true,
+  };
+  const h = await launch({
+    store: [held, ...newer, reaction, off],
+    storage,
+    frontiers: { team: held.created_at - 1 },
+    // The page below fails, as does the roster sample, so only the delta
+    // could move the mark.
+    fail: (filters) =>
+      sampleRead(filters) ||
+      (deltaRead(filters) && filters.some((filter) => filter.until)),
+  });
+  await h.owner.capability.ensure();
+  await h.saved;
+  // The first page was full, so it is read on from its oldest.
+  const [oldest] = newer;
+  assert(oldest);
+  expect(deltas(h)).toContainEqual({
+    kinds: DELTA_KINDS,
+    "#h": ["team", "quiet", "dm", "busy"],
+    since,
+    limit: 500,
+    until: oldest.created_at,
+    before_id: oldest.id,
+  });
+  // That page dropped, so the mark stays, and the restored message below
+  // the first page's cut is not judged gone.
+  expect((await storage.read())?.mark).toEqual({
+    at,
+    checked: SECONDS - 60,
+  });
+  expect(h.owner.event(held.id)).toBeDefined();
+  expect(await saved(storage)).toContain(held.id);
 });
 
 it("an event dated 900 s ahead raises the mark, and the next delta still reads a send the relay committed late before it", async () => {
@@ -1462,9 +1616,6 @@ it("a chunk still full at six delta pages leaves the pass to the bootstrap, whos
   expect((await deltaPages(h)).map((page) => page.length)).toEqual([
     500, 500, 500, 500, 500, 500,
   ]);
-  expect(h.reader.read.mock.calls[6]?.[0]).toContainEqual(
-    expect.objectContaining({ authors: [viewer] }),
-  );
   await h.saved;
   expect((await storage.read())?.mark).toEqual({
     at: newest,
@@ -1584,5 +1735,63 @@ it("a pass whose roster sample fails leaves the mark unconfirmed, though its thr
   expect((await storage.read())?.mark).toEqual({
     at: T,
     checked: SECONDS - 86_401,
+  });
+});
+
+it("a pass that could not check a channel leaves the mark unset, though its roster sample lands", async () => {
+  const storage = memoryUnreadStorage();
+  const h = await launch({
+    store: [hashed("team", T + 10), ...busy],
+    storage,
+    frontiers: { team: T, quiet: T, dm: T, busy: T },
+    // The windows, and the authored page beside them.
+    fail: (filters) =>
+      filters.some(
+        (filter) => filter["#h"] && filter.since !== undefined && !filter["#e"],
+      ),
+  });
+  await h.owner.capability.ensure();
+  await h.saved;
+  expect(
+    h.reader.read.mock.calls.filter(([filters]) => sampleRead(filters)),
+  ).not.toEqual([]);
+  expect(h.owner.capability.inbox().partial).toBe(true);
+  expect((await storage.read())?.mark).toBeUndefined();
+});
+
+it("a held message deleted since the mark is read gone by a bootstrap before its roster sample confirms the mark past the deletion", async () => {
+  const storage = memoryUnreadStorage();
+  const held = post(peerKey, "team", T);
+  const store = [held, ...busy];
+  const h = await launch({
+    store,
+    storage,
+    frontiers: { ...BUSY_READ, team: T - 1 },
+  });
+  const save = vi.spyOn(storage, "save");
+  await h.owner.capability.ensure();
+  await h.saved;
+  const prior = (await storage.read())?.mark;
+  expect(prior).toEqual({ at: T + 50_499, checked: SECONDS });
+  expect(h.count("team")).toBe(1);
+  // Deleted after that mark, and newer traffic moves the sample on.
+  store.push(
+    signed(peerKey, {
+      kind: 5,
+      content: "",
+      created_at: T + 51_000,
+      tags: [
+        ["h", "team"],
+        ["e", held.id],
+      ],
+    }),
+    hashed("busy", T + 59_000),
+  );
+  await h.owner.capability.refresh();
+  await save.mock.results.at(-1)?.value;
+  expect(h.count("team")).toBe(0);
+  expect((await storage.read())?.mark).toEqual({
+    at: T + 59_000,
+    checked: SECONDS,
   });
 });
