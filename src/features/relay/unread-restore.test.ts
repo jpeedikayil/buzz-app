@@ -1,3 +1,4 @@
+import { getEventHash, verifiedSymbol } from "nostr-tools";
 import { afterEach, assert, expect, it, vi } from "vitest";
 import type { ChannelQueries, ChannelSummary } from "./contracts";
 import type { ReadFilter, RelayEvent } from "./events";
@@ -78,7 +79,8 @@ afterEach(() => {
 /** One launch against a relay holding `store`: its query returns each
  * filter's newest matches, leaves deleted events out, and, as the relay
  * does, attaches edits and deletions only to top-level and depth-limited
- * reads, which the repair does not send. `down` fails every evidence read. */
+ * reads, which the repair does not send. `down` fails every evidence read,
+ * `fail` the ones it matches. */
 async function launch({
   store,
   storage,
@@ -93,6 +95,7 @@ async function launch({
     }),
   ),
   down = false,
+  fail = () => false,
 }: {
   store: readonly RelayEvent[];
   storage: UnreadStorage;
@@ -100,17 +103,11 @@ async function launch({
   follows?: ReturnType<typeof memoryThreadFollows>;
   roster?: readonly ChannelSummary[];
   down?: boolean;
+  fail?: (filters: readonly ReadFilter[]) => boolean;
 }) {
   const tagged = (item: RelayEvent, name: string, values: readonly string[]) =>
     item.tags.some(
       ([tag, value]) => tag === name && values.includes(value ?? ""),
-    );
-  const deleted = (item: RelayEvent) =>
-    store.some(
-      (other) =>
-        other.kind === 5 &&
-        other.pubkey === item.pubkey &&
-        tagged(other, "e", [item.id]),
     );
   let held: Promise<void> | undefined;
   let waiting: (filters: readonly ReadFilter[]) => void = () => {};
@@ -119,8 +116,19 @@ async function launch({
       if (filters.some((filter) => filter.kinds?.includes(9))) {
         if (held) waiting(filters);
         await held;
-        if (down) throw new Error("Relay read timed out");
+        if (down || fail(filters)) throw new Error("Relay read timed out");
       }
+      const removed = new Set(
+        store.flatMap((other) =>
+          other.kind === 5
+            ? other.tags.flatMap(([tag, id]) =>
+                tag === "e" ? [`${other.pubkey}:${id}`] : [],
+              )
+            : [],
+        ),
+      );
+      const deleted = (item: RelayEvent) =>
+        removed.has(`${item.pubkey}:${item.id}`);
       return filters.flatMap((filter) => {
         const matched = store
           .filter(
@@ -800,10 +808,6 @@ it("the viewer's root a thread read fetches is their membership of its thread, w
     structure: new Set(),
     complete: false,
   });
-  const row = expect.objectContaining({
-    rootId: started.id,
-    unreadCount: 1,
-  });
   const lookups = (h: Awaited<ReturnType<typeof launch>>) =>
     h.reader.read.mock.calls.flatMap(([filters]) =>
       filters.filter((filter) => filter.authors && filter["#e"]),
@@ -811,7 +815,15 @@ it("the viewer's root a thread read fetches is their membership of its thread, w
   const online = await launch({ store, storage, frontiers });
   await online.owner.capability.ensure();
   await online.saved;
-  expect(online.owner.capability.inbox().items).toContainEqual(row);
+  // Fetched by the thread read, the root is structure, so the row targets
+  // its newest message, as a lookup-fetched root's row does.
+  expect(online.owner.capability.inbox().items).toContainEqual(
+    expect.objectContaining({
+      rootId: started.id,
+      unreadCount: 1,
+      target: { kind: "message", channelId: "team", messageId: answer.id },
+    }),
+  );
   expect(online.count("team")).toBe(1);
   expect(lookups(online)).toEqual([]);
   online.owner.dispose();
@@ -823,9 +835,191 @@ it("the viewer's root a thread read fetches is their membership of its thread, w
   const offline = await launch({ store, storage, frontiers, down: true });
   await offline.owner.capability.ensure();
   await offline.restored(count);
-  expect(offline.owner.capability.inbox().items).toContainEqual(row);
+  // Restored as the witness, the root is evidence: the row targets the
+  // thread.
+  expect(offline.owner.capability.inbox().items).toContainEqual(
+    expect.objectContaining({
+      rootId: started.id,
+      unreadCount: 1,
+      target: { kind: "thread", channelId: "team", rootId: started.id },
+    }),
+  );
   expect(offline.count("team")).toBe(1);
   expect(lookups(offline)).toEqual([]);
+});
+
+/** Fifty threads the viewer wrote in recently, read whole on every repair,
+ * and an older one read since its mark: its unread answer is below the
+ * channel's catch-up mark and older than the roster sample, so only that
+ * cold read reaches it, and the answer's landing fetches its root by ID. */
+function rememberedThreads() {
+  const hot = Array.from({ length: 50 }, (_, i) => {
+    const root = post(peerKey, "team", T + 100 + 10 * i);
+    return [root, reply(viewerKey, "team", root, T + 101 + 10 * i)] as const;
+  });
+  const root = post(peerKey, "team", T);
+  const mine = reply(viewerKey, "team", root, T + 1);
+  const answer = reply(peerKey, "team", root, T + 2);
+  const marks = [...hot.map(([, theirs]) => theirs), mine].map(
+    (event): [string, { at: number; newestId: string }] => [
+      `team:${event.tags.find(([name]) => name === "e")?.[1]}`,
+      { at: event.created_at, newestId: event.id },
+    ],
+  );
+  return {
+    root,
+    answer,
+    store: [...hot.flat(), root, mine, answer],
+    frontiers: { ...BUSY_READ, "activity:team": T + 95_000 },
+    record: {
+      participation: { roots: new Map(marks), walk: { since: T + 10_000 } },
+      events: [],
+      structure: new Set<string>(),
+      complete: false,
+    },
+  };
+}
+
+it("a remembered thread's root outlasts 1,024 other structure fetches, and a root let go is fetched again for a thread it teaches", async () => {
+  const thread = rememberedThreads();
+  const storage = memoryUnreadStorage();
+  await storage.save(thread.record);
+  // Read replies also sent to the channel, in threads the viewer is not
+  // part of, each looked up for its root and none kept by a save: `first`,
+  // then more than the structure cache holds besides. Unsigned, as only a
+  // restore verifies and none of them is restored.
+  const unsigned = (created_at: number, tags: string[][] = []): RelayEvent => {
+    const template = {
+      kind: 9,
+      pubkey: peerKey.pubkey,
+      created_at,
+      content: `quiet ${created_at}`,
+      tags: [["h", "quiet"], ...tags],
+    };
+    return {
+      ...template,
+      id: getEventHash(template),
+      sig: "0".repeat(128),
+      [verifiedSymbol]: true,
+    };
+  };
+  const first = unsigned(T - 600_000);
+  const roots = Array.from({ length: 1100 }, (_, i) =>
+    unsigned(T - 500_000 + i),
+  );
+  const replies = [first, ...roots].map((root, i) =>
+    unsigned(T + 1000 + i, [
+      ["e", root.id, "", "reply"],
+      ["broadcast", "1"],
+    ]),
+  );
+  // A read mention in a later channel: its lookup goes behind a batch's, so
+  // its row grouping under its root says the batch has landed.
+  let barriers = 0;
+  const barrier = () => {
+    const root = post(peerKey, "busy", T - 400_000 + barriers++);
+    return {
+      root,
+      mention: reply(peerKey, "busy", root, T + 5000, [["p", viewer]]),
+    };
+  };
+  const batches = [barrier(), barrier(), barrier()];
+  const store = [
+    ...thread.store,
+    first,
+    ...roots,
+    ...batches.map(({ root }) => root),
+    ...busy,
+  ];
+  const h = await launch({
+    store,
+    storage,
+    frontiers: { ...thread.frontiers, quiet: T + 10_000 },
+  });
+  const save = vi.spyOn(storage, "save");
+  await h.owner.capability.ensure();
+  await h.saved;
+  // The membership lookup finds the viewer's reply the cold read passed
+  // over, and the thread is a row.
+  await h.inboxed(
+    (item) => item.rootId === thread.root.id && item.unreadCount === 1,
+  );
+  const grouped = expect.objectContaining({
+    rootId: thread.root.id,
+    unreadCount: 1,
+  });
+  const ungrouped: unknown[] = [];
+  h.owner.capability.subscribeInbox(() => {
+    const items = h.owner.capability.inbox().items;
+    if (
+      items.some(
+        (item) =>
+          item.messageIds.includes(thread.answer.id) &&
+          item.rootId !== thread.root.id,
+      )
+    )
+      ungrouped.push(items);
+  });
+  const asked = (id: string) =>
+    h.reader.read.mock.calls.filter(([filters]) =>
+      filters.some((filter) => filter.ids?.includes(id)),
+    ).length;
+  const landed = async (
+    batch: (typeof batches)[number],
+    ...live: RelayEvent[]
+  ) => {
+    h.owner.accept([...live, batch.mention]);
+    await h.inboxed((item) => item.rootId === batch.root.id);
+  };
+  const [one, two, three] = batches;
+  assert(one && two && three);
+  await landed(one, ...replies.slice(0, 1));
+  await landed(two, ...replies.slice(1));
+  // The remembered roots stayed and their replies grouped; `first`'s root,
+  // the oldest of the others, was let go, and with the read replies' own
+  // released lookups it is not fetched again.
+  expect(ungrouped).toEqual([]);
+  expect(h.owner.capability.inbox().items).toContainEqual(grouped);
+  expect(asked(first.id)).toBe(1);
+  expect(roots.map((root) => asked(root.id))).toEqual(roots.map(() => 1));
+  // A mention in its thread teaches the thread, so its root is fetched
+  // again and kept from then on.
+  const mention = reply(peerKey, "quiet", first, T + 6000, [["p", viewer]]);
+  await landed(three, mention);
+  expect(asked(first.id)).toBe(2);
+  expect(h.owner.capability.inbox().items).toContainEqual(
+    expect.objectContaining({ rootId: first.id, messageIds: [mention.id] }),
+  );
+  // The record, once every save has landed, holds the remembered thread's
+  // root as structure.
+  await h.owner.capability.refresh();
+  await Promise.all(save.mock.results.map(({ value }) => value));
+  const record = await storage.read();
+  expect(record?.structure.has(thread.root.id)).toBe(true);
+  expect(await saved(storage)).toEqual(
+    expect.arrayContaining([thread.root.id, thread.answer.id]),
+  );
+  expect(record?.complete).toBe(true);
+  expect(ungrouped).toEqual([]);
+});
+
+it("a remembered thread's reply saved without its root, whose fetch was dropped, leaves the record incomplete", async () => {
+  const thread = rememberedThreads();
+  const storage = memoryUnreadStorage();
+  await storage.save(thread.record);
+  const h = await launch({
+    store: [...thread.store, ...busy],
+    storage,
+    frontiers: thread.frontiers,
+    fail: (filters) =>
+      filters.some((filter) => filter.ids?.includes(thread.root.id)),
+  });
+  await h.owner.capability.ensure();
+  await h.saved;
+  expect(h.owner.capability.inbox().partial).toBe(true);
+  expect(await saved(storage)).toContain(thread.answer.id);
+  expect(await saved(storage)).not.toContain(thread.root.id);
+  expect((await storage.read())?.complete).toBe(false);
 });
 
 it("a save in flight is not written again, and one refused by a purge ends the session's saves", async () => {

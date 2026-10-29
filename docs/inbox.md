@@ -116,8 +116,9 @@ represented top-level mentions and local message marks, but not unrelated
 messages. Participation follows the shared unread owner's direct-parent policy,
 including its existing bounded lookups for replies whose membership is undecided.
 Fetched roots and participation witnesses remain structural, never extra Inbox rows.
-A lookup-only root uses the existing exact-message manual-unread target until counted
-root evidence arrives; its known root still supplies grouping and read-through.
+A root fetched only to group replies, by a lookup or a remembered thread's read, leaves
+its row the existing exact-message manual-unread target until counted root evidence
+arrives; its known root still supplies grouping and read-through.
 Relevant replies remain thread activity even when the root cannot be fetched.
 Multiple steps are not atomic: failures leave remaining evidence retryable. Manual unread is local to this device. Hosts without frontier-sync
 disable read mutations. Saved frontiers are not proof of remote reconciliation.
@@ -193,10 +194,11 @@ running repair, which reads it ahead of the remaining windows; after the
 repair it is read in the background and remembered at once, so it stays in
 the Inbox without a refresh. When the budget is full, the oldest evidence
 outside those threads goes first; the observation completes rather than
-resetting. A lazy addressed query returns up to 50 kind-9/40002
-messages. For those exact IDs and unresolved failed targets, general `#e`
-queries page signed kind-40003 edits and kind-5/9005 deletions, then deletions
-of the edits; `include_aux` on an ordinary `#p` query is not a supported relay
+resetting. Roots fetched only to group replies are bounded too, and those of
+remembered threads go last, so their replies stay grouped. A lazy addressed
+query returns up to 50 kind-9/40002 messages. For those exact IDs and
+unresolved failed targets, general `#e` queries page signed kind-40003 edits
+and kind-5/9005 deletions, then deletions of the edits; `include_aux` on an ordinary `#p` query is not a supported relay
 contract. Both auxiliary stages must finish before the feed is ready. Retained
 unread evidence can be provisionally admitted between queries, but exact target
 IDs are marked incomplete **before** unread subscribers are notified. The
