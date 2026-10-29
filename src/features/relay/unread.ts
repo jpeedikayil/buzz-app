@@ -257,7 +257,8 @@ export function createUnread({
   let repairAgain = false;
   // Whether the running repair catches up (see `route`): one an access
   // change retires is read again the same way, so a retired explicit refresh
-  // still reads the bootstrap.
+  // still reads the bootstrap, and an explicit refresh that finds it running
+  // has the next one read the bootstrap.
   let catchingUp = false;
   let freshness: UnreadSnapshot["freshness"] = "unknown";
   /** A repair failed or the stream dropped, and no repair has completed
@@ -1407,12 +1408,6 @@ export function createUnread({
           `${channel.channelType ?? ""}:${!!channel.huddle}:${!!channel.metadataPending}`,
         ]),
     );
-  const cachedIds = (list: ReturnType<ChannelQueries["list"]>) =>
-    new Set(
-      list.channels
-        .filter((channel) => channel.cached)
-        .map((channel) => channel.id),
-    );
   const inboxArchiveKey = (list: ReturnType<ChannelQueries["list"]>) =>
     list.channels
       .filter(
@@ -1426,7 +1421,6 @@ export function createUnread({
       .join(",");
   const initialList = channels.list();
   let archivedKey = inboxArchiveKey(initialList);
-  let cachedChannels = cachedIds(initialList);
   let channelTypes = types(initialList);
   let accessKey = [...channelTypes.keys()].sort().join(",");
   const stopChannels = channels.subscribeList(() => {
@@ -1438,11 +1432,6 @@ export function createUnread({
         channelTypes.get(id) !== type ? [id] : [],
       ),
     );
-    const confirmed = [...nextTypes.keys()].some((id) =>
-      cachedChannels.has(id),
-    );
-    const gained = [...nextTypes.keys()].some((id) => !channelTypes.has(id));
-    cachedChannels = cachedIds(list);
     channelTypes = nextTypes;
     // Channel archive changes Inbox eligibility, not membership or read intent.
     const nextArchived = inboxArchiveKey(list);
@@ -1456,10 +1445,11 @@ export function createUnread({
       if (waiting.length) admitRestored(waiting);
       // An initial observation made against a display-only roster still owes
       // evidence when membership becomes fresh, including during an active repair.
-      // A newly accessible channel has no evidence yet, and the epoch bump
-      // abandons any in-flight observation, so both also observe again,
-      // catching up: a channel the mark does not cover is read once.
-      if (requested && (confirmed || gained || refresh)) {
+      // A newly accessible channel has no evidence yet, a channel lost owes
+      // the roster sample again (see `uncover`), and the epoch bump abandons
+      // any in-flight observation, so each observes again at once, catching
+      // up: what the mark does not cover is read once.
+      if (requested) {
         repairAgain = true;
         if (!refresh) void repair("foreground", true);
       }
@@ -2118,11 +2108,17 @@ export function createUnread({
    * is complete and its mark was confirmed within MARK_AGE, with what the
    * mark does not cover read once (design §3.6): a channel outside the
    * roster set (joined, unconfirmed when the mark moved, or its window
-   * dropped) has its window read, and the roster sample is read with it or
-   * after a leave; a hot thread outside `whole` is read whole. Anything
-   * else, and an explicit refresh, reads the bootstrap. The age is of the
-   * confirmation, not of the mark's own time, so a quiet roster, whose
-   * newest event stays old, is not read whole every pass. */
+   * dropped) has its window and its cold threads read, and the roster
+   * sample is read with it or after a leave; a hot thread outside `whole`
+   * is read whole. Anything else, and an explicit refresh, reads the
+   * bootstrap. The age is of the confirmation, not of the mark's own time,
+   * so a quiet roster, whose newest event stays old, is not read whole
+   * every pass. A delta still full at DELTA_PAGES falls to the bootstrap in
+   * the same pass, whose sample confirms the mark; one that dropped keeps
+   * the mark, the pass is partial, and the next pass reads the delta again.
+   * Only a pass that reads the bootstrap lets the sample move the mark or
+   * rebuild the roster set. Until the cut-over the bootstrap's reads are
+   * made whatever the delta's outcome. */
   const route = (catchUp: boolean): "delta" | "bootstrap" =>
     catchUp &&
     complete &&
@@ -2245,14 +2241,21 @@ export function createUnread({
     if (owed?.since !== undefined && since <= owed.since)
       for (const id of ids) owed.covered.add(id);
   }
-  /** Whether the edits and deletions since `prior` less the lookback read to
-   * their end for every roster channel holding evidence, so the roster
-   * sample may confirm the mark past `prior`: the bootstrap's reads carry
-   * none, and a held event deleted meanwhile would otherwise be kept under a
-   * mark every later delta starts after. Undefined when retired. */
+  /** Whether the edits and deletions since `prior` less the lookback were
+   * read for every roster channel holding evidence, so the roster sample may
+   * confirm the mark past `prior`: the bootstrap's reads carry none, and a
+   * held event deleted meanwhile would otherwise be kept under a mark every
+   * later delta starts after. A read still full at its last page, which
+   * holding the mark back would only widen, vouches by forgetting the held
+   * content of those channels that is not `current` (returned by a read of
+   * the pass, or received while it ran), as a launch without it would not
+   * show it: the relay leaves deleted events out of what it returns. Only a
+   * dropped read holds the mark back, for the next pass to retry. Undefined
+   * when retired. */
   async function vouch(
     ids: readonly string[],
     prior: UnreadMark,
+    current: (id: string) => boolean,
     generation: number,
     priority: Priority,
   ) {
@@ -2273,7 +2276,19 @@ export function createUnread({
     );
     if (!outcome) return;
     if (outcome === "read") cover(held, since);
-    return outcome === "read";
+    if (outcome === "full") {
+      const channels = new Set(held);
+      forget(
+        [...events.values()].flatMap((event) =>
+          contentKind(event) &&
+          channels.has(channelOf(event) ?? "") &&
+          !current(event.id)
+            ? [event.id]
+            : [],
+        ),
+      );
+    }
+    return outcome !== "dropped";
   }
   /** Restored evidence of roster channels no read has covered (see
    * `cover`) has its deletions since the record's mark read once restore is
@@ -3021,13 +3036,13 @@ export function createUnread({
           ),
         );
       },
-      /** Reads of the other remembered roots not yet asked for, each for
-       * replies since the newest time seen in it, inclusive: a reply in the
-       * same second as that one is not passed over, and the one seen returns
-       * too, to be passed over by ID. */
-      cold(keys = newest().slice(HOT_THREADS)) {
+      /** Reads of the other remembered roots not yet asked for (or all of
+       * them, `again`), each for replies since the newest time seen in it,
+       * inclusive: a reply in the same second as that one is not passed
+       * over, and the one seen returns too, to be passed over by ID. */
+      cold(keys = newest().slice(HOT_THREADS), again = false) {
         return chunk(
-          [...group(keys)].flatMap(([channelId, rootIds]) =>
+          [...group(keys, again)].flatMap(([channelId, rootIds]) =>
             rootIds.map((rootId) => {
               const key = `${channelId}:${rootId}`;
               const mark = roots.get(key);
@@ -3036,6 +3051,18 @@ export function createUnread({
             }),
           ),
           UNREAD_WINDOW_BATCH,
+        );
+      },
+      /** Cold reads of the remembered roots in `channels`, which the mark
+       * does not cover, whether or not this pass asked for them (design
+       * §3.6): no delta read those channels meanwhile, and their window and
+       * sample hold only their newest events. */
+      uncovered(channels: ReadonlySet<string>) {
+        return this.cold(
+          newest()
+            .slice(HOT_THREADS)
+            .filter((key) => channels.has(key.slice(0, key.indexOf(":")))),
+          true,
         );
       },
       /** Learns a thread a lookup found the viewer in, or fetched the root
@@ -3326,7 +3353,15 @@ export function createUnread({
   async function repair(priority: Priority = "foreground", catchUp = false) {
     requested = true;
     if (closed) return;
-    if (refresh) return refresh;
+    if (refresh) {
+      // An explicit refresh reads the bootstrap: one that finds a pass
+      // catching up has the bootstrap read after it, and waits for that.
+      if (!catchUp && catchingUp) {
+        repairAgain = true;
+        catchingUp = false;
+      }
+      return repairAgain ? refresh.then(() => refresh) : refresh;
+    }
     repairAgain = false;
     catchingUp = catchUp;
     inboxLoading = true;
@@ -3347,6 +3382,10 @@ export function createUnread({
       const settled = new Set(
         [...whole].filter((key) => covered.has(key.slice(0, key.indexOf(":")))),
       );
+      // The evidence held before this pass, and what its reads return (see
+      // `vouch`).
+      const before = new Set(events.keys());
+      const returned = new Set<string>();
       try {
         // This repair reads again what retention dropped before it.
         dropped = [];
@@ -3368,21 +3407,6 @@ export function createUnread({
         // after marker sync; optional profiles must not block the initial
         // user-visible observation.
         const { marked, windows, sample } = rosterReads(ids);
-        // What the mark does not cover is read once beside the delta
-        // (design §3.6): the windows of channels outside the roster set, and
-        // the roster sample, whose chunks a join or leave changes.
-        const joined = new Set(ids.filter((id) => !covered.has(id)));
-        const once = catching
-          ? [
-              ...chunk(
-                windows.filter((filter) => joined.has(filter["#h"]?.[0] ?? "")),
-                UNREAD_WINDOW_BATCH,
-              ),
-              ...(joined.size || resample
-                ? sample.map((filter) => [filter])
-                : []),
-            ]
-          : [];
         // The viewer's newest messages ride the first request, and the
         // remembered threads most recently read or written in are read right
         // behind it, before the windows: the pinned rows are the ones the
@@ -3399,6 +3423,20 @@ export function createUnread({
         requests.splice(1, 0, ...hot);
         requests.push(...sample.map((filter) => [filter]), ...pass.cold());
         remembered = pass.roots;
+        // What the mark does not cover is read once beside the delta
+        // (design §3.6): the windows of channels outside the roster set, the
+        // roster sample, whose chunks a join or leave changes, and the cold
+        // threads in those channels, whose hot ones are promoted. Built when
+        // queued, so the cold reads are asked again after the bootstrap's.
+        const joined = new Set(ids.filter((id) => !covered.has(id)));
+        const once = () => [
+          ...chunk(
+            windows.filter((filter) => joined.has(filter["#h"]?.[0] ?? "")),
+            UNREAD_WINDOW_BATCH,
+          ),
+          ...(joined.size || resample ? sample.map((filter) => [filter]) : []),
+          ...pass.uncovered(joined),
+        ];
         const run: Run = { pass, generation, queue: requests, pooling: true };
         activePass = run;
         // Once those have landed, or were dropped, the Inbox is no longer
@@ -3434,6 +3472,7 @@ export function createUnread({
           result: readonly RelayEvent[] | undefined,
           queue: ReadFilter[][],
         ) => {
+          for (const event of result ?? []) returned.add(event.id);
           if (catching?.owns(request))
             return catching.landed(request, result, queue);
           let ok = true;
@@ -3491,7 +3530,7 @@ export function createUnread({
             // A relay that answered none of these is not asked for the
             // delta: the pass fails as soon as the bootstrap alone would.
             if (catching && progress.landed)
-              queue.push(...catching.requests, ...once);
+              queue.push(...catching.requests, ...once());
           }
           return ok;
         };
@@ -3537,24 +3576,39 @@ export function createUnread({
         // Nothing landed: nothing was observed, so the repair failed.
         if (!progress.landed) throw progress.failure;
         // A delta read to its end confirms the mark, and has read what
-        // restored evidence owes.
-        const caught = catching?.outcome() === "read";
+        // restored evidence owes. One still full at its last page leaves the
+        // pass to the bootstrap (see `route`); one that dropped leaves the
+        // mark for the next pass, which reads it again, and the Inbox says
+        // some activity could not be checked.
+        const outcome = catching?.outcome();
+        const caught = outcome === "read";
+        const bootstrapped = !catching || outcome === "full";
+        if (!caught && !bootstrapped) unchecked = true;
         if (caught) {
           confirm(catching?.newest());
           cover(ids, deltaSince);
         }
-        // The roster sample landing whole confirms the mark too (design
-        // §3.5), once every read but the windows and the walk's later pages
-        // landed and, past a mark, the edits and deletions since it were
-        // read where evidence is held.
+        // In a pass that reads the bootstrap, the roster sample landing whole
+        // confirms the mark (design §3.5), once every read but the windows
+        // and the walk's later pages landed and, past a mark, the edits and
+        // deletions since it were read where evidence is held. In one that
+        // catches up, what it read once only adds to the roster set.
         const resampled = ids.every((id) => sampled.has(id));
         let moved = false;
-        if (resampled && !unvouched) {
+        if (bootstrapped && resampled && !unvouched) {
           const vouched =
-            !prior || caught || (await vouch(ids, prior, generation, priority));
+            !prior ||
+            (await vouch(
+              ids,
+              prior,
+              (id) =>
+                returned.has(id) || (!before.has(id) && !unconfirmed.has(id)),
+              generation,
+              priority,
+            ));
           if (vouched === undefined) return;
           if (vouched) confirm(sampledNewest);
-          moved = vouched && !caught;
+          moved = vouched;
         }
         // The roster set (design §3.5–3.6): the channels whose windows and
         // sample landed, and those a delta read to its end kept reading. A

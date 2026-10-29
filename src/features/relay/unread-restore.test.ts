@@ -304,6 +304,7 @@ async function launch({
   return {
     owner,
     reader,
+    reads,
     /** How many restored events have been verified: restore admits them
      * once all have. */
     verified: () => verified,
@@ -896,10 +897,11 @@ it("a full window's cut is its own limit-th match, and a deletion made while clo
   expect(await saved(late.memory)).not.toContain(oldest.id);
   expect(await saved(late.memory)).not.toContain(removal.id);
   late.warm.owner.dispose();
-  // More edits and deletions since the mark than that read reads, and than
-  // the read of the restored evidence's channel behind it: that evidence no
-  // read returned is dropped, as a launch without the record would not show
-  // it, and what the reads returned stays.
+  // More edits and deletions since the mark than that read reads: the
+  // evidence no read of the pass returned is dropped, as a launch without
+  // the record would not show it, what the reads returned stays, and the
+  // roster sample moves the mark, so the restored evidence owes no second
+  // read.
   const edits = Array.from({ length: 1001 }, (_, i) =>
     hashed("team", T + 200 + i, 40003, [["e", "f".repeat(64)]]),
   );
@@ -908,7 +910,11 @@ it("a full window's cut is its own limit-th match, and a deletion made while clo
     overflow.warm.reader.read.mock.calls.filter(([filters]) =>
       filters.some((filter) => filter.kinds?.join() === "40003,5,9005"),
     ),
-  ).toHaveLength(4);
+  ).toHaveLength(2);
+  expect((await overflow.memory.read())?.mark).toEqual({
+    at: T + 50_499,
+    checked: SECONDS,
+  });
   expect(overflow.warm.count("team")).toBe(100);
   expect(await saved(overflow.memory)).toEqual(
     expect.arrayContaining([mine, ...unread.slice(30)].map(({ id }) => id)),
@@ -1806,6 +1812,63 @@ it("a held message deleted since the mark is read gone by a bootstrap before its
   });
 });
 
+const overlayRead = (filters: readonly ReadFilter[]) =>
+  filters.some((filter) => filter.kinds?.join() === "40003,5,9005");
+
+it("more edits and deletions since a stale mark than the bootstrap reads forget what no read of the pass returned, and the roster sample moves the mark, so the next pass catches up", async () => {
+  const at = T + 10_000;
+  // Confirmed over a day ago: the launch reads the bootstrap.
+  const storage = await marked({ at, checked: SECONDS - 86_401 });
+  // Held before the pass, read, and deleted by the oldest of more edits and
+  // deletions since the mark than the read of them reaches.
+  const old = hashed("team", at - 1000);
+  const removal = hashed("team", at - 1865, 5, [["e", old.id]]);
+  const noise = Array.from({ length: 1000 }, (_, i) =>
+    hashed("team", at - 1864 + i, 5, [["e", "f".repeat(64)]]),
+  );
+  // Unread, in the channel's window.
+  const kept = hashed("team", at + 500);
+  const h = await launch({
+    store: [old, removal, ...noise, kept, ...busy],
+    storage,
+    frontiers: { ...BUSY_READ, team: at },
+  });
+  h.owner.accept([old]);
+  expect(h.owner.event(old.id)).toBeDefined();
+  const save = vi.spyOn(storage, "save");
+  const { release, waiting } = h.hold();
+  const launched = h.owner.capability.ensure();
+  await waiting;
+  // Received while the pass reads, and returned by none of its reads.
+  const live = hashed("team", at + 600);
+  h.owner.accept([live]);
+  release();
+  await launched;
+  await save.mock.results.at(-1)?.value;
+  expect(
+    h.reader.read.mock.calls.filter(([filters]) => overlayRead(filters)),
+  ).toHaveLength(2);
+  expect(h.owner.event(old.id)).toBeUndefined();
+  expect(h.owner.event(kept.id)).toBeDefined();
+  expect(h.owner.event(live.id)).toBeDefined();
+  expect(h.count("team")).toBe(2);
+  expect((await storage.read())?.mark).toEqual({
+    at: T + 50_499,
+    checked: SECONDS,
+  });
+  const next = await sentDuring(h, () => h.reconnected());
+  await save.mock.results.at(-1)?.value;
+  expect(next.filter(deltaFilter)).toEqual([
+    expect.objectContaining({ since: T + 50_499 - 1865 }),
+    expect.objectContaining({ since: T + 50_499 - 1865, until: T + 50_000 }),
+  ]);
+  expect(next.filter((filter) => overlayRead([filter]))).toEqual([]);
+  expect((await storage.read())?.mark).toEqual({
+    at: T + 50_499,
+    checked: SECONDS,
+  });
+});
+
 // What the mark does not cover is read once beside the delta (design §3.6).
 // Until the cut-over the bootstrap still reads every window, the roster
 // sample and the hot threads whole each pass, so a read made once shows as
@@ -1882,18 +1945,21 @@ it("a channel joined while this device was closed is read once on the next launc
   expect(ticking.filter(windowOf("fresh"))).toHaveLength(1);
 });
 
-it("leaving a busy channel reads the roster sample once more, and rejoining it reads its window once", async () => {
+it("leaving a busy channel reads the roster sample once more at once, saving the record complete, and rejoining it reads its window once", async () => {
   const { h, storage } = await caughtUp([...busy]);
   const left = summaries(ROSTER.filter((id) => id !== "busy"));
-  h.roster(left);
-  const leaving = await sentDuring(h, () => h.reconnected());
+  const leaving = await sentDuring(h, () => {
+    h.roster(left);
+    return h.owner.capability.ensure();
+  });
   expect(leaving.filter(sampleFilter)).toEqual([
     expect.objectContaining({ "#h": ["team", "quiet", "dm"] }),
     expect.objectContaining({ "#h": ["team", "quiet", "dm"] }),
   ]);
-  expect((await storage.read())?.roster).toEqual(
-    new Set(["team", "quiet", "dm"]),
-  );
+  expect(await storage.read()).toMatchObject({
+    complete: true,
+    roster: new Set(["team", "quiet", "dm"]),
+  });
   const ticking = await sentDuring(h, () => h.reconnected());
   expect(ticking.filter(sampleFilter)).toHaveLength(1);
   // Its evidence was purged with it: a re-grant is a join.
@@ -1902,6 +1968,38 @@ it("leaving a busy channel reads the roster sample once more, and rejoining it r
     return h.owner.capability.ensure();
   });
   expect(rejoining.filter(windowOf("busy"))).toHaveLength(2);
+});
+
+it("a channel the mark does not cover has its remembered threads past the 50 hot ones read since their marks once beside the delta, and not again", async () => {
+  const hot = Array.from({ length: 50 }, (_, i) =>
+    post(peerKey, "team", T + 100 + i),
+  );
+  const cold = post(peerKey, "quiet", T);
+  const storage = memoryUnreadStorage();
+  await storage.save({
+    participation: {
+      roots: new Map([
+        ...hot.map((root): [string, { at: number }] => [
+          `team:${root.id}`,
+          { at: root.created_at },
+        ]),
+        [`quiet:${cold.id}`, { at: T }],
+      ]),
+    },
+    events: [],
+    structure: new Set(),
+    complete: true,
+    mark: { at: SECONDS - 600, checked: SECONDS - 60 },
+    roster: new Set(ROSTER.filter((id) => id !== "quiet")),
+  });
+  const h = await launch({ store: [...hot, cold], storage });
+  const coldOf = (filter: ReadFilter) =>
+    !!filter["#e"]?.includes(cold.id) && filter.since === T;
+  const launched = await sentDuring(h, () => h.owner.capability.ensure());
+  expect(launched.filter(deltaFilter)).not.toEqual([]);
+  expect(launched.filter(coldOf)).toHaveLength(2);
+  const ticking = await sentDuring(h, () => h.reconnected());
+  expect(ticking.filter(coldOf)).toHaveLength(1);
 });
 
 it("a reply of the viewer's in an old thread has the thread read whole once beside the delta, and not again", async () => {
@@ -1992,6 +2090,75 @@ it("a dropped whole read of a thread is read again on the next pass for that thr
   expect(ticking.filter(wholeOf(kept.id))).toHaveLength(1);
   expect(ticking.filter(wholeOf(lost.id))).toHaveLength(2);
   expect((await storage.read())?.whole).toEqual(new Set(keys));
+});
+
+it("a delta that drops keeps the mark though the roster sample lands, leaves the pass partial and adds what it read once to the roster set, and the next pass reads it from the same mark", async () => {
+  const at = SECONDS - 600;
+  const checked = SECONDS - 60;
+  const storage = await marked({ at, checked });
+  let failing = true;
+  const h = await launch({
+    store: [hashed("team", at + 10), post(peerKey, "fresh", T + 10)],
+    storage,
+    roster: summaries([...ROSTER, "fresh"]),
+    fail: (filters) => failing && deltaRead(filters),
+  });
+  const save = vi.spyOn(storage, "save");
+  await h.owner.capability.ensure();
+  await save.mock.results.at(-1)?.value;
+  expect(h.owner.capability.inbox().partial).toBe(true);
+  expect(h.count("fresh")).toBe(1);
+  expect(await storage.read()).toMatchObject({
+    mark: { at, checked },
+    roster: new Set([...ROSTER, "fresh"]),
+  });
+  failing = false;
+  const next = await sentDuring(h, () => h.reconnected());
+  await save.mock.results.at(-1)?.value;
+  expect(next.filter(deltaFilter)).toEqual([
+    expect.objectContaining({ since: at - 1865 }),
+  ]);
+  expect(h.owner.capability.inbox().partial).toBeUndefined();
+  expect((await storage.read())?.mark).toEqual({
+    at: at + 10,
+    checked: SECONDS,
+  });
+});
+
+it("Refresh pressed while a pass catches up has the bootstrap read after it, and each press settles once that has", async () => {
+  const storage = await marked({ at: SECONDS - 600, checked: SECONDS - 60 });
+  // The launch's pass and the reconnect's read the channel's window; the
+  // bootstrap after them cannot, so only its end leaves the Inbox partial.
+  let windows = 0;
+  const h = await launch({
+    store: [hashed("team", SECONDS - 300)],
+    storage,
+    fail: (filters) => filters.some(windowOf("team")) && ++windows > 2,
+  });
+  await h.owner.capability.ensure();
+  const from = h.reader.read.mock.calls.length;
+  const { release, waiting } = h.hold();
+  let pressed: Promise<void>[] = [];
+  try {
+    h.owner.reconnect();
+    await waiting;
+    const syncing = vi.spyOn(h.reads, "refresh");
+    pressed = [h.owner.capability.refresh(), h.owner.capability.refresh()];
+    // Each asks for its repair as soon as the read state settles, before
+    // anything awaiting that settles.
+    await Promise.all(syncing.mock.results.map(({ value }) => value));
+  } finally {
+    release();
+  }
+  for (const press of [pressed[1], pressed[0]]) {
+    await press;
+    expect(h.owner.capability.inbox().partial).toBe(true);
+  }
+  const sent = h.reader.read.mock.calls
+    .slice(from)
+    .flatMap(([filters]) => filters);
+  expect(sent.filter(deltaFilter)).toHaveLength(1);
+  expect(sent.filter(windowOf("team"))).toHaveLength(3);
 });
 
 it("a resume launch whose cached roster is confirmed unchanged catches up with the delta, reading no channel once", async () => {
