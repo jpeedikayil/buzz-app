@@ -33,6 +33,7 @@ test("unread record survives reload, keeps the last record over a refused write,
             roots: [...record.participation.roots],
             walk: record.participation.walk,
             events: record.events.map((event) => event.id),
+            structure: [...record.structure],
             complete: record.complete,
           };
         const before = describe(await store.read());
@@ -62,6 +63,7 @@ test("unread record survives reload, keeps the last record over a refused write,
                 ? event(id, { extra: () => {} })
                 : event(id),
             ),
+            structure: new Set(save.structure ?? []),
             complete: true,
           });
           return { before, saved: true };
@@ -79,7 +81,11 @@ test("unread record survives reload, keeps the last record over a refused write,
   const [one, two, three] = ["1", "2", "3"].map((digit) => digit.repeat(64));
   try {
     expect(
-      await session(page, "here", { root: "team:a", events: [one, two] }),
+      await session(page, "here", {
+        root: "team:a",
+        events: [one, two],
+        structure: [two],
+      }),
     ).toEqual({ before: undefined, saved: true });
     await session(page, "neighbor", { root: "team:n", events: [three] });
     await page.reload();
@@ -87,6 +93,7 @@ test("unread record survives reload, keeps the last record over a refused write,
       roots: [["team:a", { at: 5, newestId: "b".repeat(64) }]],
       walk: { since: 3 },
       events: [one, two],
+      structure: [two],
       complete: true,
     };
     expect(await session(page, "here")).toEqual({ before: record });
@@ -116,6 +123,7 @@ test("unread record survives reload, keeps the last record over a refused write,
         roots: [["team:n", { at: 5, newestId: "b".repeat(64) }]],
         walk: { since: 3 },
         events: [three],
+        structure: [],
         complete: true,
       },
     });

@@ -10,19 +10,30 @@ import {
  * viewer: the threads the viewer is part of and signed evidence. A record is
  * read whole or not at all, so nothing starts from part of one. Events are
  * signed wire records; read back from storage they are untrusted until the
- * owner re-verifies them, and one that fails discards them. `complete` says
- * the events hold everything the next warm repair would read. */
+ * owner re-verifies them, and one that fails discards them. `structure`
+ * names the events kept only to group replies (roots and parents a lookup
+ * fetched), which never count. `complete` says the events hold everything
+ * the next warm repair would read. */
 export type UnreadRecord<Event = RelayEvent> = Readonly<{
   participation: ThreadParticipation;
   events: readonly Event[];
+  structure: ReadonlySet<string>;
   complete: boolean;
 }>;
+/** A save refused because the partition was purged after this storage first
+ * read it: nothing the session holds may be saved back. */
+export class UnreadRecordPurged extends Error {
+  constructor() {
+    super("Unread record was purged by another window");
+  }
+}
 export type UnreadStorage = Readonly<{
   /** The saved record, or undefined when none is saved or it is unusable. */
   read(): Promise<UnreadRecord<unknown> | undefined>;
   /** Replaces the record: its events become exactly those given. A record
    * beyond the bounds is refused and the saved one kept, as is any record
-   * once the partition was purged after this storage first read it. */
+   * once the partition was purged after this storage first read it
+   * (`UnreadRecordPurged`). */
   save(record: UnreadRecord): Promise<void>;
   close(): void;
 }>;
@@ -38,6 +49,7 @@ type StoredMeta = {
     roots: ([string, number] | [string, number, string])[];
     walk?: { since: number };
   };
+  structure?: string[];
   complete?: boolean;
   /** The partition's last purge, kept by every record written after it. */
   purged?: string;
@@ -57,8 +69,9 @@ function parseRoot(entry: unknown): [string, ThreadMark] | undefined {
  * its participation, or events beyond the bounds, read as no record. Fields
  * added later under this version read leniently instead, a missing or
  * malformed one as incomplete, so a record from an older build keeps its
- * threads and only owes a full repair. Event validity is left to the owner's
- * re-verification. */
+ * threads and only owes a full repair; without `structure` no event can be
+ * told apart from structure, so none is restored. Event validity is left to
+ * the owner's re-verification. */
 function parse(
   raw: unknown,
   events: readonly unknown[],
@@ -87,12 +100,21 @@ function parse(
   } catch {
     return;
   }
+  const { structure, complete } = raw as {
+    structure?: unknown;
+    complete?: unknown;
+  };
+  const known =
+    Array.isArray(structure) &&
+    structure.length <= UNREAD_RECORD_EVENTS &&
+    structure.every((id) => typeof id === "string" && id.length <= 64);
   return {
     participation: time(since)
       ? { roots: marks, walk: { since } }
       : { roots: marks },
-    events,
-    complete: (raw as { complete?: unknown }).complete === true,
+    events: known ? events : [],
+    structure: new Set(known ? (structure as string[]) : []),
+    complete: known && complete === true,
   };
 }
 const purgeOf = (raw: unknown) => {
@@ -100,10 +122,12 @@ const purgeOf = (raw: unknown) => {
   return typeof purged === "string" ? purged : undefined;
 };
 /** The stored meta, refusing a record that would not read back. */
-function stored(
-  { participation, events, complete }: UnreadRecord,
-  purged?: string,
-): StoredMeta {
+function stored({
+  participation,
+  events,
+  structure,
+  complete,
+}: UnreadRecord): StoredMeta {
   const meta: StoredMeta = {
     version: VERSION,
     participation: {
@@ -114,8 +138,8 @@ function stored(
         ? { walk: { since: participation.walk.since } }
         : {}),
     },
+    structure: [...structure],
     complete,
-    ...(purged === undefined ? {} : { purged }),
   };
   if (
     events.length > UNREAD_RECORD_EVENTS ||
@@ -136,6 +160,7 @@ export function memoryUnreadStorage(): UnreadStorage {
       saved = {
         participation: { roots: new Map(roots), ...(walk ? { walk } : {}) },
         events: [...record.events],
+        structure: new Set(record.structure),
         complete: record.complete,
       };
     },
@@ -180,8 +205,10 @@ function settle(
  * hold a session for it, until that window reloads. Its saves would bring
  * the left community's evidence back, so each storage keeps the purge its
  * first read saw and refuses to save over a later one; a session started
- * after the purge, such as one for rejoining, saves as usual. A window whose
- * session first reads after the purge is not told apart from such a one. */
+ * after the purge, such as one for rejoining, saves as usual. A storage whose
+ * first read failed takes the purge its first save finds, rather than refuse
+ * every save over an earlier purge it never saw. A window whose session first
+ * reads, or so saves, after the purge is not told apart from a rejoin. */
 export function browserUnreadStorage(scope: string): UnreadStorage {
   let database: Promise<IDBDatabase> | undefined;
   let closed = false;
@@ -227,7 +254,7 @@ export function browserUnreadStorage(scope: string): UnreadStorage {
      * holds, puts the missing ones, deletes the rest and writes the meta, so
      * saves from two windows leave exactly the last writer's record. */
     async save(record) {
-      const meta = stored(record, purged);
+      const meta = stored(record);
       const db = await open();
       return new Promise((resolve, reject) => {
         const tx = db.transaction(["meta", "events"], "readwrite");
@@ -239,10 +266,11 @@ export function browserUnreadStorage(scope: string): UnreadStorage {
         const keys = events.index("scope").getAllKeys(IDBKeyRange.only(scope));
         // Requests succeed in order, so the meta has been read by now.
         keys.onsuccess = () => {
-          if (purgeOf(current.result) !== purged)
-            return reject(
-              new Error("Unread record was purged by another window"),
-            );
+          if (!read) {
+            purged = purgeOf(current.result);
+            read = true;
+          } else if (purgeOf(current.result) !== purged)
+            return reject(new UnreadRecordPurged());
           const held = new Set<string>();
           for (const key of keys.result) {
             const id = (key as [string, string])[1];
@@ -251,7 +279,10 @@ export function browserUnreadStorage(scope: string): UnreadStorage {
           }
           for (const [id, event] of selected)
             if (!held.has(id)) events.put({ scope, id, event });
-          tx.objectStore("meta").put(meta, scope);
+          tx.objectStore("meta").put(
+            purged === undefined ? meta : { ...meta, purged },
+            scope,
+          );
         };
         settle(tx, resolve, reject);
       });

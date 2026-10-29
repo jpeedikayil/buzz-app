@@ -54,7 +54,12 @@ const NOW = 10_000_000;
 const remembered = async (storage: UnreadStorage) =>
   (await storage.read())?.participation ?? NO_THREAD_PARTICIPATION;
 const remember = (storage: UnreadStorage, participation: ThreadParticipation) =>
-  storage.save({ participation, events: [], complete: false });
+  storage.save({
+    participation,
+    events: [],
+    structure: new Set(),
+    complete: false,
+  });
 
 const owners: ReturnType<typeof createUnread>[] = [];
 afterEach(() => {
@@ -2097,9 +2102,15 @@ it("clearing the owner while a walk page reads retires the walk: no further page
   // The page's result is retired with its epoch: the first request, the
   // roster sample beside it and the page are all that was read.
   expect(h.reader.read).toHaveBeenCalledTimes(3);
-  expect(save).not.toHaveBeenCalled();
+  // Clearing wipes the saved record; the retired page saves nothing after.
+  expect(save).toHaveBeenCalledTimes(1);
   expect(h.owner.capability.inbox()).toMatchObject({ freshness: "unknown" });
-  expect(await storage.read()).toBeUndefined();
+  expect(await storage.read()).toEqual({
+    participation: { roots: new Map() },
+    events: [],
+    structure: new Set(),
+    complete: false,
+  });
 });
 
 it("a lookup that finds the viewer's reply while the windows read puts the thread's read ahead of the remaining windows", async () => {

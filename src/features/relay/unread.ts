@@ -23,6 +23,7 @@ import { isOversizedResponse } from "./errors";
 import { listByteSize } from "./budget";
 import { matchesEvent } from "./projection";
 import { yieldToHost } from "./yield";
+import { clientMetrics } from "../developer/client-metrics";
 import { foldMessages, deletionApplies, messageAuthor } from "./fold";
 import { eventMs } from "./message-order";
 import { threadReference } from "./thread-reference";
@@ -46,6 +47,7 @@ import {
   memoryUnreadStorage,
   UNREAD_RECORD_BYTES,
   UNREAD_RECORD_EVENTS,
+  UnreadRecordPurged,
   type UnreadRecord,
   type UnreadStorage,
 } from "./unread-storage";
@@ -1983,9 +1985,11 @@ export function createUnread({
   let early: [readonly ReadFilter[], readonly RelayEvent[]][] = [];
   // Restored content no read has returned yet (see `reconcile`).
   const unconfirmed = new Set<string>();
-  // Restored evidence of channels listed but not yet confirmed, which
-  // `accept` refuses: offered again as access changes, and saved meanwhile.
+  // Restored events of channels listed but not yet confirmed, which `accept`
+  // refuses: offered again as access changes, and saved meanwhile, with the
+  // saved record's structure (see `admitRestored`).
   let waiting: RelayEvent[] = [];
+  let restoredStructure: ReadonlySet<string> = new Set();
   const awaitingAccess = (event: RelayEvent) => {
     const channelId = channelOf(event);
     return (
@@ -1999,12 +2003,20 @@ export function createUnread({
         )
     );
   };
+  /** Restored evidence is accepted; a root or parent a lookup fetched goes
+   * back to the lookup cache, where it groups replies and never counts. */
   function admitRestored(batch: readonly RelayEvent[]) {
-    accept(batch);
+    accept(batch.filter((event) => !restoredStructure.has(event.id)));
     for (const event of batch)
-      if (contentKind(event) && events.has(event.id)) unconfirmed.add(event.id);
+      if (!restoredStructure.has(event.id)) {
+        if (contentKind(event) && events.has(event.id))
+          unconfirmed.add(event.id);
+      } else if (allowed(channelOf(event) ?? "")) keep(event);
     waiting = batch.filter(
-      (event) => !events.has(event.id) && awaitingAccess(event),
+      (event) =>
+        !events.has(event.id) &&
+        !lookupEvents.has(event.id) &&
+        awaitingAccess(event),
     );
   }
   /** Re-verifies the saved evidence in yielding batches, as the channel
@@ -2012,16 +2024,25 @@ export function createUnread({
    * untrusted, and one event failing verification discards the evidence,
    * which the repair reads again. Reads that landed meanwhile are then
    * reconciled against it. */
-  function restore(saved: readonly unknown[]) {
+  function restore(saved: readonly unknown[], structure: ReadonlySet<string>) {
     const run = { done: Promise.resolve() };
     restoring = run;
+    restoredStructure = structure;
     run.done = (async () => {
       const verified: RelayEvent[] = [];
       for (let index = 0; index < saved.length; index += 8) {
         if (index) await yieldToHost();
         if (closed || restoring !== run) return;
-        for (const value of saved.slice(index, index + 8))
-          verified.push(eventDto(JSON.parse(JSON.stringify(value))));
+        const started = performance.now();
+        const batch = saved
+          .slice(index, index + 8)
+          .map((value) => eventDto(JSON.parse(JSON.stringify(value))));
+        clientMetrics.cpu(
+          "verify.restore",
+          performance.now() - started,
+          batch.length,
+        );
+        verified.push(...batch);
       }
       admitRestored(verified);
     })()
@@ -2037,10 +2058,18 @@ export function createUnread({
   /** Restored evidence a read should have returned and did not is gone from
    * the relay: deleted, or no longer readable, while this device was closed,
    * which no read tells. A read returns each filter's newest matches, so a
-   * short page covers every match and a full one those newer than its last;
-   * a keyset page starts below the newest and is not judged. Plain channel
-   * reads leave deletions out, so without this a deleted message would be
-   * restored, and saved again, for good. */
+   * short page covers every match and a full one those down to its last; a
+   * keyset page starts below the newest and is not judged. Other filters of
+   * the request return older matches too, so a filter's page is the newest
+   * `limit` matches of the whole response.
+   *
+   * The repair's reads carry no deletions (the relay attaches edits and
+   * deletions only to top-level and depth-limited reads), so restored
+   * evidence no read reaches — unread past a full window's cut and outside
+   * the roster sample — is not judged, and stays restored when deleted while
+   * this device was closed, until its deletion arrives: `accept` takes it
+   * like any other and the next save drops both. A read of deletions since
+   * the record's mark would deliver them the same way. */
   function reconcile(
     request: readonly ReadFilter[],
     result: readonly RelayEvent[],
@@ -2051,10 +2080,15 @@ export function createUnread({
     const gone = new Set<string>();
     for (const filter of request) {
       if (filter.until !== undefined) continue;
-      const page = result
-        .filter((event) => matchesEvent(event, filter))
-        .sort(byTime);
-      const last = page.length < filter.limit ? undefined : page.at(-1);
+      const page = [
+        ...new Map(
+          result
+            .filter((event) => matchesEvent(event, filter))
+            .map((event) => [event.id, event]),
+        ).values(),
+      ].sort(byTime);
+      const last =
+        page.length < filter.limit ? undefined : page[filter.limit - 1];
       for (const id of unconfirmed) {
         const event = events.get(id);
         if (!event) unconfirmed.delete(id);
@@ -2110,13 +2144,21 @@ export function createUnread({
     const heldIds = new Map(held.map((event) => [event.id, event]));
     const inChannel = new Map<string, RelayEvent[]>();
     const tagged = new Map<string, RelayEvent[]>();
+    const add = (
+      map: Map<string, RelayEvent[]>,
+      key: string,
+      event: RelayEvent,
+    ) => {
+      const list = map.get(key);
+      if (list) list.push(event);
+      else map.set(key, [event]);
+    };
     for (const event of held) {
       const channelId = channelOf(event);
       if (!channelId) continue;
-      inChannel.set(channelId, [...(inChannel.get(channelId) ?? []), event]);
+      add(inChannel, channelId, event);
       for (const [name, id] of event.tags)
-        if (name === "e" && id)
-          tagged.set(id, [...(tagged.get(id) ?? []), event]);
+        if (name === "e" && id) add(tagged, id, event);
     }
     const kept = new Set<RelayEvent>();
     const read = (
@@ -2221,17 +2263,41 @@ export function createUnread({
     const fits =
       retained.length <= UNREAD_RECORD_EVENTS &&
       listByteSize(retained) <= UNREAD_RECORD_BYTES;
-    return { events: fits ? retained : [], complete: fits && !lost };
+    // Held only by the lookup cache, or restored from it and waiting.
+    const structure = new Set(
+      retained.flatMap(({ id }) =>
+        !events.has(id) &&
+        !witnesses.has(id) &&
+        (lookupEvents.has(id) || restoredStructure.has(id))
+          ? [id]
+          : [],
+      ),
+    );
+    return fits
+      ? { events: retained, structure, complete: !lost }
+      : { events: [], structure: new Set<string>(), complete: false };
   }
-  // The last record a save landed, so a save writes only a change: a save
-  // that is refused or aborted leaves it, and the next save writes again.
-  let savedKey: string | undefined;
+  // The record the saves issued leave once they land, so a save writes only
+  // a change: one that fails clears it unless a later save was issued since,
+  // and the next save writes again.
+  let issuedKey: string | undefined;
+  // A save refused because the partition was purged after this session
+  // first read it: nothing it holds is saved again.
+  let fenced = false;
   let owed: ThreadParticipation | undefined;
+  function save(record: UnreadRecord, key?: string) {
+    issuedKey = key;
+    void storage.save(record).catch((cause: unknown) => {
+      if (cause instanceof UnreadRecordPurged) fenced = true;
+      if (issuedKey === key) issuedKey = undefined;
+    });
+  }
   /** The one way the record is saved: the threads with the evidence kept
    * for them (see `retention`), so a save carrying new threads never drops
    * saved evidence. While restored evidence is still being verified the
    * save waits for it, rather than replace it with what is held so far. */
   function persist(participation: ThreadParticipation) {
+    if (fenced) return;
     if (restoring) {
       if (!owed) {
         const generation = epoch;
@@ -2249,18 +2315,14 @@ export function createUnread({
       [...participation.roots],
       participation.walk?.since,
       record.events.map((event) => event.id).sort(),
+      [...record.structure].sort(),
       record.complete,
     ]);
-    if (key === savedKey) return;
-    void storage.save(record).then(
-      () => {
-        savedKey = key;
-      },
-      () => {},
-    );
+    if (key !== issuedKey) save(record, key);
   }
   async function rememberedRoots(): Promise<ThreadParticipation> {
     if (!persisted) {
+      const generation = epoch;
       let record: UnreadRecord<unknown> | undefined;
       try {
         record = await storage.read();
@@ -2268,11 +2330,15 @@ export function createUnread({
         // Unreadable storage forgets nothing durable: this repair relearns
         // what the relay still shows and saves that.
       }
+      // A cache clear meanwhile wiped what was read; the repair is retired
+      // and the next one reads again.
+      if (generation !== epoch) return NO_THREAD_PARTICIPATION;
       persisted = record?.participation ?? NO_THREAD_PARTICIPATION;
       remembered = new Map(persisted.roots);
-      // Once a session: a cache reset reads the threads again, not the
-      // evidence it cleared.
-      if (!restored && record?.events.length) restore(record.events);
+      // Once a session: a cache clear wipes the record, so the threads read
+      // again are only those saved since.
+      if (!restored && record?.events.length)
+        restore(record.events, record.structure);
       restored = true;
     }
     return {
@@ -3970,6 +4036,14 @@ export function createUnread({
       waiting = [];
       owed = undefined;
       dropped = [];
+      // Wiped as the channel heads are; the next repair saves afresh.
+      if (!fenced)
+        save({
+          participation: NO_THREAD_PARTICIPATION,
+          events: [],
+          structure: new Set(),
+          complete: false,
+        });
       partial = false;
       events.clear();
       known.clear();

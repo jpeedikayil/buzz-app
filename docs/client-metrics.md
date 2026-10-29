@@ -34,7 +34,7 @@ the other build with the same roster and the same order.
 | Source | Where the rows came from, tracked apart from freshness (a dropped socket marks relay rows stale, which does not make them disk rows). `memory`: rows a relay read already fetched this session. `disk`: restored from IndexedDB before the open. `disk-late`: the open waited, then a disk restore arrived before the network read did. `network`: the open waited for a relay read. |
 | Cache-hit rate | Share of opens served from `memory` or `disk`, with no network wait. |
 | Long tasks | Long-task entries where the engine supports them (Chromium). WebKit has none, so it uses event-loop lag of at least 50 ms instead. |
-| CPU | Time spent verifying signatures (`verify.read`, `verify.restore`) and folding rows (`fold`), measured per batch or window, never per event. |
+| CPU | Time spent verifying signatures (`verify.read` for relay reads, `verify.restore` for disk restores of channel heads and the Inbox's saved evidence) and folding rows (`fold`), measured per batch or window, never per event. |
 | Reads | `/query` calls (and the broker's channel-activity reads), with decoded response size in UTF-16 code units (about bytes for JSON). They are grouped by phase: the app open, then each reconnect. |
 | Live coverage | Per phase: time from connecting to the socket authenticating, and to every channel route settling: live, or failed (refused, or over the live capacity). The panel counts every settled route that is not live as failed. Also each route's pending→live time after authentication. |
 
