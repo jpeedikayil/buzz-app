@@ -165,15 +165,29 @@ a read should have returned and did not, deleted while the device was closed,
 is dropped, and one whose channel membership is not confirmed yet waits for
 it. The record also keeps how far this device last read the whole roster. When
 it is complete and that read was confirmed within the last day, a launch,
-reconnect or periodic check also reads everything the joined channels gained
-since then—messages, edits, reactions and deletions, from far enough before
-that point that a send the relay committed late is still read. That read is
-asked once the Inbox is ready, so it never delays it, and not at all when the
-relay answered none of the reads before it. The point moves once that read
-reaches its end in every channel, or once the full repair has checked every
-channel and, after an earlier point, has read the edits and deletions since it
-to their end in every channel holding events, so a message deleted meanwhile
-is not kept past it; live events never move it. A channel with more new events
+reconnect, periodic check or change to the viewer's channels also reads
+everything the joined channels gained since then—messages, edits, reactions
+and deletions, from far enough before that point that a send the relay
+committed late is still read. That read is asked once the Inbox is ready, so
+it never delays it, and not at all when the relay answered none of the reads
+before it. The point moves once that read reaches its end in every channel,
+or once the full repair has read the newest events across the roster and
+every thread and the viewer's own recent messages it asked for and, after an
+earlier point, has read the edits and deletions since it to their end in
+every channel holding events, so a message deleted meanwhile is not kept past
+it; live events never move it. The record keeps which channels that point
+covers: those read up to it, and those whose window and the roster's newest
+events were read since. A channel it does not cover—joined, regained after
+lost access, not yet confirmed when the point moved, or whose window failed—
+has its window and the roster's newest events read once beside the catch-up,
+and leaving a channel has the roster's newest events read once more, so they
+reach as far back as they would have without it. The record also keeps which
+remembered threads were read whole: beside the catch-up, any of the 50 most
+recently read or written in that was not—one the viewer just replied in, was
+mentioned in or followed, or whose read failed—is read whole once, and one
+that leaves those 50, is unfollowed or loses its channel's coverage is read
+whole again when it returns. The full repair still runs beside these reads,
+so for now they repeat some of its own. A channel with more new events
 than the catch-up takes, a record not caught up within the day, or one that
 fails verification, leaves the catch-up to the full repair, which then reads
 the deletions made since that point in the channels holding restored events

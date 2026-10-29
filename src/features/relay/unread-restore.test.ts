@@ -99,6 +99,17 @@ const hashed = (
   };
 };
 
+const ROSTER = ["team", "quiet", "dm", "busy"];
+const summaries = (ids: readonly string[]) =>
+  ids.map(
+    (id): ChannelSummary => ({
+      id,
+      name: id,
+      members: [viewer],
+      ...(id === "dm" ? { channelType: "dm" as const } : {}),
+    }),
+  );
+
 const owners: ReturnType<typeof createUnread>[] = [];
 afterEach(() => {
   for (const owner of owners.splice(0)) owner.dispose();
@@ -117,14 +128,7 @@ async function launch({
   storage,
   frontiers = {},
   follows = memoryThreadFollows(),
-  roster = ["team", "quiet", "dm", "busy"].map(
-    (id): ChannelSummary => ({
-      id,
-      name: id,
-      members: [viewer],
-      ...(id === "dm" ? { channelType: "dm" as const } : {}),
-    }),
-  ),
+  roster = summaries(ROSTER),
   down = false,
   fail = () => false,
   now = () => NOW,
@@ -1383,8 +1387,12 @@ it("a cache clear settles once the record is wiped, and rejects when the wipe fa
   await expect(h.owner.clear()).resolves.toBeUndefined();
 });
 
-/** A record that holds no evidence, complete, with `mark`. */
-async function marked(mark: { at: number; checked: number }) {
+/** A record that holds no evidence, complete, with `mark` covering
+ * `roster`. */
+async function marked(
+  mark: { at: number; checked: number },
+  roster: readonly string[] = ROSTER,
+) {
   const storage = memoryUnreadStorage();
   await storage.save({
     participation: { roots: new Map() },
@@ -1392,17 +1400,18 @@ async function marked(mark: { at: number; checked: number }) {
     structure: new Set(),
     complete: true,
     mark,
+    roster: new Set(roster),
   });
   return storage;
 }
 const members = (ids: readonly string[]) =>
   ids.map((id): ChannelSummary => ({ id, name: id, members: [viewer] }));
+const sampleFilter = (filter: ReadFilter) =>
+  !!filter["#h"] && filter.since === undefined && !filter["#e"];
 // The roster sample fails where a test isolates the mark a delta confirms
 // from the one the bootstrap's sample confirms.
 const sampleRead = (filters: readonly ReadFilter[]) =>
-  filters.some(
-    (filter) => filter["#h"] && filter.since === undefined && !filter["#e"],
-  );
+  filters.some(sampleFilter);
 type Launch = Awaited<ReturnType<typeof launch>>;
 const deltas = (h: Launch) =>
   h.reader.read.mock.calls.flatMap(([filters]) =>
@@ -1419,7 +1428,7 @@ const deltaPages = (h: Launch) =>
 it("the delta reads each 128 channels of the roster from the mark less 1,865 s, paging across a second's ties to a short page", async () => {
   const ids = Array.from({ length: 130 }, (_, i) => `c${i}`);
   const at = SECONDS - 600;
-  const storage = await marked({ at, checked: SECONDS - 60 });
+  const storage = await marked({ at, checked: SECONDS - 60 }, ids);
   // More events in one second than a page holds.
   const tied = Array.from({ length: 600 }, () => hashed("c0", at + 30));
   const h = await launch({ store: tied, storage, roster: members(ids) });
@@ -1470,7 +1479,7 @@ it("a delta with a chunk that fails leaves the mark, so the next delta reads fro
   const ids = Array.from({ length: 130 }, (_, i) => `c${i}`);
   const at = SECONDS - 600;
   const checked = SECONDS - 60;
-  const storage = await marked({ at, checked });
+  const storage = await marked({ at, checked }, ids);
   const store = [hashed("c0", at + 10), hashed("c129", at + 20)];
   let failing = true;
   const h = await launch({
@@ -1738,13 +1747,14 @@ it("a pass whose roster sample fails leaves the mark unconfirmed, though its thr
   });
 });
 
-it("a pass that could not check a channel leaves the mark unset, though its roster sample lands", async () => {
+it("a pass that could not read the viewer's authored page leaves the mark unset, though its roster sample lands", async () => {
   const storage = memoryUnreadStorage();
   const h = await launch({
     store: [hashed("team", T + 10), ...busy],
     storage,
     frontiers: { team: T, quiet: T, dm: T, busy: T },
-    // The windows, and the authored page beside them.
+    // The windows, and the authored page beside them: the channels alone
+    // would only stay out of the roster set the mark covers.
     fail: (filters) =>
       filters.some(
         (filter) => filter["#h"] && filter.since !== undefined && !filter["#e"],
@@ -1794,4 +1804,263 @@ it("a held message deleted since the mark is read gone by a bootstrap before its
     at: T + 59_000,
     checked: SECONDS,
   });
+});
+
+// What the mark does not cover is read once beside the delta (design §3.6).
+// Until the cut-over the bootstrap still reads every window, the roster
+// sample and the hot threads whole each pass, so a read made once shows as
+// one more than the bootstrap's.
+/** The filters of the reads sent while `pass` ran. */
+async function sentDuring(h: Launch, pass: () => Promise<unknown>) {
+  const from = h.reader.read.mock.calls.length;
+  await pass();
+  return h.reader.read.mock.calls.slice(from).flatMap(([filters]) => filters);
+}
+const windowOf = (id: string) => (filter: ReadFilter) =>
+  filter.include_aux === true &&
+  filter.since !== undefined &&
+  !filter["#e"] &&
+  filter["#h"]?.join() === id;
+const wholeOf = (rootId: string) => (filter: ReadFilter) =>
+  !!filter["#e"]?.includes(rootId) && filter.since === undefined;
+const deltaFilter = (filter: ReadFilter) => deltaRead([filter]);
+/** A launch from a complete record whose mark covers the default roster. */
+async function caughtUp(store: RelayEvent[], roster = summaries(ROSTER)) {
+  const storage = await marked({
+    at: SECONDS - 600,
+    checked: SECONDS - 60,
+  });
+  const h = await launch({ store, storage, roster });
+  await h.owner.capability.ensure();
+  return { h, storage };
+}
+
+it("joining a channel holding an old unread message, and a DM, reads each once beside the delta, and not again on the next tick", async () => {
+  // Older than the delta reaches.
+  const old = post(peerKey, "fresh", T + 10);
+  const direct = post(peerKey, "dm2", T + 20);
+  const { h, storage } = await caughtUp([old, direct]);
+  const joined = [
+    ...summaries([...ROSTER, "fresh"]),
+    {
+      id: "dm2",
+      name: "dm2",
+      members: [viewer, peerKey.pubkey],
+      channelType: "dm" as const,
+    },
+  ];
+  const joining = await sentDuring(h, () => {
+    h.roster(joined);
+    return h.owner.capability.ensure();
+  });
+  expect(joining.filter(deltaFilter)).not.toEqual([]);
+  for (const id of ["fresh", "dm2"])
+    expect(joining.filter(windowOf(id))).toHaveLength(2);
+  expect(joining.filter(windowOf("team"))).toHaveLength(1);
+  expect(joining.filter(sampleFilter)).toHaveLength(2);
+  expect(h.count("fresh")).toBe(1);
+  expect(h.count("dm2")).toBe(1);
+  expect((await storage.read())?.roster).toEqual(
+    new Set([...ROSTER, "fresh", "dm2"]),
+  );
+  const ticking = await sentDuring(h, () => h.reconnected());
+  for (const id of ["fresh", "dm2"])
+    expect(ticking.filter(windowOf(id))).toHaveLength(1);
+  expect(ticking.filter(sampleFilter)).toHaveLength(1);
+});
+
+it("a channel joined while this device was closed is read once on the next launch, not trusted to the mark", async () => {
+  const old = post(peerKey, "fresh", T + 10);
+  const { h, storage } = await caughtUp([old], summaries([...ROSTER, "fresh"]));
+  const launched = h.reader.read.mock.calls.flatMap(([filters]) => filters);
+  expect(launched.filter(deltaFilter)).not.toEqual([]);
+  expect(launched.filter(windowOf("fresh"))).toHaveLength(2);
+  expect(launched.filter(windowOf("team"))).toHaveLength(1);
+  expect(h.count("fresh")).toBe(1);
+  expect((await storage.read())?.roster).toEqual(new Set([...ROSTER, "fresh"]));
+  const ticking = await sentDuring(h, () => h.reconnected());
+  expect(ticking.filter(windowOf("fresh"))).toHaveLength(1);
+});
+
+it("leaving a busy channel reads the roster sample once more, and rejoining it reads its window once", async () => {
+  const { h, storage } = await caughtUp([...busy]);
+  const left = summaries(ROSTER.filter((id) => id !== "busy"));
+  h.roster(left);
+  const leaving = await sentDuring(h, () => h.reconnected());
+  expect(leaving.filter(sampleFilter)).toEqual([
+    expect.objectContaining({ "#h": ["team", "quiet", "dm"] }),
+    expect.objectContaining({ "#h": ["team", "quiet", "dm"] }),
+  ]);
+  expect((await storage.read())?.roster).toEqual(
+    new Set(["team", "quiet", "dm"]),
+  );
+  const ticking = await sentDuring(h, () => h.reconnected());
+  expect(ticking.filter(sampleFilter)).toHaveLength(1);
+  // Its evidence was purged with it: a re-grant is a join.
+  const rejoining = await sentDuring(h, () => {
+    h.roster(summaries(ROSTER));
+    return h.owner.capability.ensure();
+  });
+  expect(rejoining.filter(windowOf("busy"))).toHaveLength(2);
+});
+
+it("a reply of the viewer's in an old thread has the thread read whole once beside the delta, and not again", async () => {
+  const root = post(peerKey, "team", T);
+  const store = [root, reply(peerKey, "team", root, T + 1)];
+  const { h, storage } = await caughtUp(store);
+  const mine = reply(viewerKey, "team", root, SECONDS - 10);
+  store.push(mine);
+  h.owner.accept([mine]);
+  const replied = await sentDuring(h, () => h.reconnected());
+  expect(replied.filter(wholeOf(root.id))).toHaveLength(2);
+  expect((await storage.read())?.whole).toEqual(new Set([`team:${root.id}`]));
+  const ticking = await sentDuring(h, () => h.reconnected());
+  expect(ticking.filter(wholeOf(root.id))).toHaveLength(1);
+});
+
+/** A launch caught up on a thread the viewer has no part in, and a pass
+ * after following it or not. */
+async function following() {
+  const root = post(peerKey, "team", T);
+  const { h, storage } = await caughtUp([
+    root,
+    reply(peerKey, "team", root, T + 1),
+  ]);
+  const follow = async (on: boolean) => {
+    h.owner.capability.follow("team", root.id, on);
+    return (await sentDuring(h, () => h.reconnected())).filter(
+      wholeOf(root.id),
+    );
+  };
+  return { h, storage, root, follow };
+}
+
+it("following a thread has it read whole once beside the delta", async () => {
+  const { h, root, follow } = await following();
+  expect(await follow(true)).toHaveLength(2);
+  const ticking = await sentDuring(h, () => h.reconnected());
+  expect(ticking.filter(wholeOf(root.id))).toHaveLength(1);
+});
+
+it("unfollowing a thread drops it from the threads read whole, so following it again reads it whole again", async () => {
+  const { storage, root, follow } = await following();
+  await follow(true);
+  expect((await storage.read())?.whole).toEqual(new Set([`team:${root.id}`]));
+  expect(await follow(false)).toEqual([]);
+  expect((await storage.read())?.whole).toBeUndefined();
+  expect(await follow(true)).toHaveLength(2);
+});
+
+it("a dropped whole read of a thread is read again on the next pass for that thread alone", async () => {
+  const kept = post(peerKey, "team", T);
+  const lost = post(peerKey, "quiet", T + 5);
+  const keys = [`team:${kept.id}`, `quiet:${lost.id}`];
+  const storage = memoryUnreadStorage();
+  await storage.save({
+    participation: {
+      roots: new Map([
+        [keys[0] ?? "", { at: T + 1 }],
+        [keys[1] ?? "", { at: T + 6 }],
+      ]),
+    },
+    events: [],
+    structure: new Set(),
+    complete: true,
+    mark: { at: SECONDS - 600, checked: SECONDS - 60 },
+    roster: new Set(ROSTER),
+    whole: new Set([keys[0] ?? ""]),
+  });
+  let failing = true;
+  const h = await launch({
+    store: [
+      kept,
+      reply(peerKey, "team", kept, T + 1),
+      lost,
+      reply(peerKey, "quiet", lost, T + 6),
+    ],
+    storage,
+    fail: (filters) =>
+      failing && filters.some((filter) => filter["#e"]?.includes(lost.id)),
+  });
+  const launched = await sentDuring(h, () => h.owner.capability.ensure());
+  // The bootstrap's read of both, retried once, and the promotion of the
+  // one not read whole, all dropped.
+  expect(launched.filter(wholeOf(lost.id))).toHaveLength(3);
+  expect((await storage.read())?.whole).toEqual(new Set([keys[0]]));
+  failing = false;
+  const ticking = await sentDuring(h, () => h.reconnected());
+  expect(ticking.filter(wholeOf(kept.id))).toHaveLength(1);
+  expect(ticking.filter(wholeOf(lost.id))).toHaveLength(2);
+  expect((await storage.read())?.whole).toEqual(new Set(keys));
+});
+
+it("a resume launch whose cached roster is confirmed unchanged catches up with the delta, reading no channel once", async () => {
+  const cached = summaries(ROSTER).map((channel) => ({
+    ...channel,
+    cached: true as const,
+  }));
+  const { h } = await caughtUp([hashed("team", SECONDS - 300)], cached);
+  // The launch's pass found no confirmed channel to read.
+  expect(deltas(h)).toEqual([]);
+  const confirming = await sentDuring(h, () => {
+    h.roster(summaries(ROSTER));
+    return h.owner.capability.ensure();
+  });
+  expect(confirming.filter(deltaFilter)).toEqual([
+    expect.objectContaining({ since: SECONDS - 600 - 1865 }),
+  ]);
+  for (const id of ROSTER)
+    expect(confirming.filter(windowOf(id))).toHaveLength(1);
+  expect(confirming.filter(sampleFilter)).toHaveLength(1);
+});
+
+it("a channel whose window dropped stays out of the roster set the mark covers, and is read once on the next pass", async () => {
+  const ids = Array.from({ length: 130 }, (_, i) => `c${i}`);
+  const storage = memoryUnreadStorage();
+  let failing = true;
+  const h = await launch({
+    store: [hashed("c129", T + 10)],
+    storage,
+    roster: members(ids),
+    // The windows past those riding with the viewer's authored page.
+    fail: (filters) =>
+      failing &&
+      filters.some(windowOf("c129")) &&
+      !filters.some((filter) => filter.authors),
+  });
+  await h.owner.capability.ensure();
+  const record = await storage.read();
+  expect(record?.mark).toEqual({ at: T + 10, checked: SECONDS });
+  expect(record?.roster).toEqual(new Set(ids.slice(0, 127)));
+  failing = false;
+  const next = await sentDuring(h, () => h.reconnected());
+  expect(next.filter(deltaFilter)).not.toEqual([]);
+  for (const id of ids.slice(127))
+    expect(next.filter(windowOf(id))).toHaveLength(2);
+  expect(next.filter(windowOf("c0"))).toHaveLength(1);
+  expect((await storage.read())?.roster).toEqual(new Set(ids));
+});
+
+it("a delta over a partly confirmed roster keeps covering only the channels it read, and the rest are read once when confirmed", async () => {
+  const partly = summaries(ROSTER).map((channel) =>
+    channel.id === "dm" || channel.id === "busy"
+      ? { ...channel, cached: true as const }
+      : channel,
+  );
+  const { h, storage } = await caughtUp(
+    [hashed("team", SECONDS - 300)],
+    partly,
+  );
+  expect(deltas(h)).toEqual([
+    expect.objectContaining({ "#h": ["team", "quiet"] }),
+  ]);
+  expect((await storage.read())?.roster).toEqual(new Set(["team", "quiet"]));
+  const confirming = await sentDuring(h, () => {
+    h.roster(summaries(ROSTER));
+    return h.owner.capability.ensure();
+  });
+  for (const id of ["dm", "busy"])
+    expect(confirming.filter(windowOf(id))).toHaveLength(2);
+  expect(confirming.filter(windowOf("team"))).toHaveLength(1);
+  expect((await storage.read())?.roster).toEqual(new Set(ROSTER));
 });

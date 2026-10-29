@@ -15,15 +15,20 @@ import {
  * fetched), which never count. `complete` says the events hold everything
  * the next warm repair would read. `mark` is the newest relay time the last
  * catch-up that read every chunk of the roster returned, with when this
- * device confirmed it, in its own clock's seconds; `absent` names roots the
- * relay returned nothing for when asked by ID, so a deleted root does not
- * leave the record incomplete. */
+ * device confirmed it, in its own clock's seconds; `roster` names the
+ * channels that mark covers, each read since this device saw it joined, so
+ * one outside it is read once before the mark vouches for it; `whole` names
+ * remembered threads read whole, whose later replies the mark's reads bring;
+ * `absent` names roots the relay returned nothing for when asked by ID, so a
+ * deleted root does not leave the record incomplete. */
 export type UnreadRecord<Event = RelayEvent> = Readonly<{
   participation: ThreadParticipation;
   events: readonly Event[];
   structure: ReadonlySet<string>;
   complete: boolean;
   mark?: UnreadMark;
+  roster?: ReadonlySet<string>;
+  whole?: ReadonlySet<string>;
   absent?: ReadonlySet<string>;
 }>;
 export type UnreadMark = Readonly<{ at: number; checked: number }>;
@@ -48,6 +53,8 @@ export type UnreadStorage = Readonly<{
 /** What one launch re-verifies, and half the in-memory evidence budget. */
 export const UNREAD_RECORD_EVENTS = 2048;
 export const UNREAD_RECORD_BYTES = 4 * 1024 * 1024;
+/** Far beyond any roster seen. */
+const ROSTER_LIMIT = 4096;
 const VERSION = 1;
 
 type StoredMeta = {
@@ -59,6 +66,8 @@ type StoredMeta = {
   structure?: string[];
   complete?: boolean;
   mark?: { at: number; checked: number };
+  roster?: string[];
+  whole?: string[];
   absent?: string[];
   /** The partition's last purge, kept by every record written after it. */
   purged?: string;
@@ -78,17 +87,17 @@ function parseMark(raw: unknown): UnreadMark | undefined {
   const { at, checked } = (raw ?? {}) as { at?: unknown; checked?: unknown };
   return time(at) && time(checked) ? { at, checked } : undefined;
 }
-const ids = (raw: unknown, bound: number): raw is string[] =>
+const ids = (raw: unknown, bound: number, length = 64): raw is string[] =>
   Array.isArray(raw) &&
   raw.length <= bound &&
-  raw.every((id) => typeof id === "string" && id.length <= 64);
+  raw.every((id) => typeof id === "string" && id.length <= length);
 /** Storage is untrusted: a meta of another version or any malformed part of
  * its participation, or events beyond the bounds, read as no record. Fields
  * added later under this version read leniently instead, a missing or
  * malformed one as incomplete, so a record from an older build keeps its
- * threads and only owes a full repair (a missing or malformed `mark` or
- * `absent` reads as none); without `structure` no event can be told apart
- * from structure, so none is restored. Event validity is left to
+ * threads and only owes a full repair (a missing or malformed `mark`,
+ * `whole` or `absent` reads as none); without `structure` no event can be
+ * told apart from structure, so none is restored. Event validity is left to
  * the owner's re-verification. */
 function parse(
   raw: unknown,
@@ -118,12 +127,15 @@ function parse(
   } catch {
     return;
   }
-  const { structure, complete, absent } = raw as {
+  const { structure, complete, roster, whole, absent } = raw as {
     structure?: unknown;
     complete?: unknown;
+    roster?: unknown;
+    whole?: unknown;
     absent?: unknown;
   };
   const known = ids(structure, UNREAD_RECORD_EVENTS);
+  const covered = ids(roster, ROSTER_LIMIT, 128);
   const mark = parseMark((raw as { mark?: unknown }).mark);
   return {
     participation: time(since)
@@ -131,8 +143,12 @@ function parse(
       : { roots: marks },
     events: known ? events : [],
     structure: new Set(known ? structure : []),
-    complete: known && complete === true,
+    complete: known && covered && complete === true,
     ...(mark ? { mark } : {}),
+    ...(covered && roster.length ? { roster: new Set(roster) } : {}),
+    ...(ids(whole, THREAD_PARTICIPATION_LIMIT, 256) && whole.length
+      ? { whole: new Set(whole) }
+      : {}),
     ...(ids(absent, THREAD_PARTICIPATION_LIMIT) && absent.length
       ? { absent: new Set(absent) }
       : {}),
@@ -151,6 +167,8 @@ function stored({
   structure,
   complete,
   mark,
+  roster,
+  whole,
   absent,
 }: UnreadRecord): StoredMeta {
   const meta: StoredMeta = {
@@ -166,6 +184,8 @@ function stored({
     structure: [...structure],
     complete,
     ...(mark ? { mark: { at: mark.at, checked: mark.checked } } : {}),
+    roster: [...(roster ?? [])],
+    ...(whole?.size ? { whole: [...whole] } : {}),
     ...(absent?.size ? { absent: [...absent] } : {}),
   };
   if (
@@ -190,6 +210,8 @@ export function memoryUnreadStorage(): UnreadStorage {
         structure: new Set(record.structure),
         complete: record.complete,
         ...(record.mark ? { mark: { ...record.mark } } : {}),
+        ...(record.roster?.size ? { roster: new Set(record.roster) } : {}),
+        ...(record.whole?.size ? { whole: new Set(record.whole) } : {}),
         ...(record.absent?.size ? { absent: new Set(record.absent) } : {}),
       };
     },

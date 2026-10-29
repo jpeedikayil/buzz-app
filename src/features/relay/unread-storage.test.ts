@@ -176,13 +176,16 @@ const meta = (participation: unknown) => ({
   version: 1,
   participation,
   structure: [],
+  roster: [],
 });
 
-it("a record round-trips with its threads, walk mark, events, structure, mark and absent roots", async () => {
+it("a record round-trips with its threads, walk mark, events, structure, mark, roster, whole threads and absent roots", async () => {
   memoryIndexedDB();
   const events = [event("first"), event("second")];
   const structure = new Set([(events[0] as RelayEvent).id]);
   const mark = { at: 1700, checked: 1800 };
+  const roster = new Set(["c0", "c".repeat(128)]);
+  const whole = new Set(["c0:other"]);
   const absent = new Set(["c".repeat(64)]);
   await browserUnreadStorage(scope).save({
     participation: threads,
@@ -190,6 +193,8 @@ it("a record round-trips with its threads, walk mark, events, structure, mark an
     structure,
     complete: true,
     mark,
+    roster,
+    whole,
     absent,
   });
   // The next launch reads it through its own connection.
@@ -199,6 +204,8 @@ it("a record round-trips with its threads, walk mark, events, structure, mark an
     structure,
     complete: true,
     mark,
+    roster,
+    whole,
     absent,
   });
   await browserUnreadStorage(scope).save({
@@ -294,19 +301,46 @@ it("a field added after the participation reads as incomplete when missing or ma
     structure: new Set([held.id]),
     complete: true,
   });
-  // A mark or absent roots that cannot be read are none: the record stays,
-  // and the next repair reads it whole.
-  for (const [mark, absent] of [
-    [{ at: 1.5, checked: 1800 }, "c".repeat(64)],
-    [{ at: 1700 }, [7]],
-    ["1700", ["c".repeat(65)]],
-    [null, Array.from({ length: 1025 }, () => "c".repeat(64))],
+  // A record from before the roster set says nothing of what its mark
+  // covered, so every channel is read again.
+  for (const roster of [
+    undefined,
+    "c0",
+    [7],
+    ["c".repeat(129)],
+    Array.from({ length: 4097 }, (_, i) => `c${i}`),
+  ]) {
+    idb.seed("meta", scope, {
+      ...meta(participation),
+      structure: [],
+      complete: true,
+      roster,
+    });
+    await expect(storage.read()).resolves.toEqual({
+      participation: { roots: new Map([["c0:root", { at: 1000 }]]) },
+      events: [held],
+      structure: none,
+      complete: false,
+    });
+  }
+  // A mark, threads read whole or absent roots that cannot be read are
+  // none: the record stays, and the next repair reads them whole.
+  for (const [mark, whole, absent] of [
+    [{ at: 1.5, checked: 1800 }, "c0:root", "c".repeat(64)],
+    [{ at: 1700 }, [7], [7]],
+    ["1700", [`c0:${"r".repeat(254)}`], ["c".repeat(65)]],
+    [
+      null,
+      Array.from({ length: 1001 }, (_, i) => `c0:${i}`),
+      Array.from({ length: 1025 }, () => "c".repeat(64)),
+    ],
   ]) {
     idb.seed("meta", scope, {
       ...meta(participation),
       structure: [],
       complete: true,
       mark,
+      whole,
       absent,
     });
     await expect(storage.read()).resolves.toEqual({
