@@ -20,8 +20,8 @@ export type UnreadRecord<Event = RelayEvent> = Readonly<{
   structure: ReadonlySet<string>;
   complete: boolean;
 }>;
-/** A save refused because the partition was purged after this storage first
- * read it: nothing the session holds may be saved back. */
+/** A save refused because the partition was purged during this storage's
+ * session: nothing the session holds may be saved back. */
 export class UnreadRecordPurged extends Error {
   constructor() {
     super("Unread record was purged by another window");
@@ -32,7 +32,7 @@ export type UnreadStorage = Readonly<{
   read(): Promise<UnreadRecord<unknown> | undefined>;
   /** Replaces the record: its events become exactly those given. A record
    * beyond the bounds is refused and the saved one kept, as is any record
-   * once the partition was purged after this storage first read it
+   * once the partition was purged during this storage's session
    * (`UnreadRecordPurged`). */
   save(record: UnreadRecord): Promise<void>;
   close(): void;
@@ -121,6 +121,8 @@ const purgeOf = (raw: unknown) => {
   const purged = (raw as { purged?: unknown } | null | undefined)?.purged;
   return typeof purged === "string" ? purged : undefined;
 };
+/** When a purge was made: it is written as `time:token`. */
+const purgedAt = (purge: string) => Number(purge.split(":", 1)[0]);
 /** The stored meta, refusing a record that would not read back. */
 function stored({
   participation,
@@ -203,17 +205,27 @@ function settle(
  *
  * Leaving a community purges its partition while another window may still
  * hold a session for it, until that window reloads. Its saves would bring
- * the left community's evidence back, so each storage keeps the purge its
- * first read saw and refuses to save over a later one; a session started
- * after the purge, such as one for rejoining, saves as usual. A storage whose
- * first read failed takes the purge its first save finds, rather than refuse
- * every save over an earlier purge it never saw. A window whose session first
- * reads, or so saves, after the purge is not told apart from a rejoin. */
+ * the left community's evidence back, so each storage keeps the purge it
+ * first finds, by read or save, and refuses to save over a later one; a
+ * session started after the purge, such as one for rejoining, saves as usual.
+ * A purge it first finds that is newer than the storage itself was made
+ * during its session, and refuses its saves too, so a first read that failed
+ * neither holds an earlier purge against it nor lets it save over a later
+ * one. A host without IndexedDB keeps nothing: a read finds no record, and a
+ * save has nothing to write. */
 export function browserUnreadStorage(scope: string): UnreadStorage {
+  const created = Date.now();
   let database: Promise<IDBDatabase> | undefined;
   let closed = false;
   let read = false;
   let purged: string | undefined;
+  let refused = false;
+  function first(found: string | undefined) {
+    if (read) return;
+    read = true;
+    purged = found;
+    refused = found !== undefined && purgedAt(found) > created;
+  }
   function open() {
     if (closed) return Promise.reject(new Error("Unread storage closed"));
     // A failed open is not held against the next read or save.
@@ -225,6 +237,7 @@ export function browserUnreadStorage(scope: string): UnreadStorage {
   }
   return {
     async read() {
+      if (typeof indexedDB === "undefined") return undefined;
       const db = await open();
       return new Promise((resolve, reject) => {
         const tx = db.transaction(["meta", "events"], "readonly");
@@ -237,8 +250,7 @@ export function browserUnreadStorage(scope: string): UnreadStorage {
         settle(
           tx,
           () => {
-            if (!read) purged = purgeOf(meta.result);
-            read = true;
+            first(purgeOf(meta.result));
             resolve(
               parse(
                 meta.result,
@@ -255,6 +267,7 @@ export function browserUnreadStorage(scope: string): UnreadStorage {
      * saves from two windows leave exactly the last writer's record. */
     async save(record) {
       const meta = stored(record);
+      if (typeof indexedDB === "undefined") return;
       const db = await open();
       return new Promise((resolve, reject) => {
         const tx = db.transaction(["meta", "events"], "readwrite");
@@ -266,10 +279,8 @@ export function browserUnreadStorage(scope: string): UnreadStorage {
         const keys = events.index("scope").getAllKeys(IDBKeyRange.only(scope));
         // Requests succeed in order, so the meta has been read by now.
         keys.onsuccess = () => {
-          if (!read) {
-            purged = purgeOf(current.result);
-            read = true;
-          } else if (purgeOf(current.result) !== purged)
+          first(purgeOf(current.result));
+          if (refused || purgeOf(current.result) !== purged)
             return reject(new UnreadRecordPurged());
           const held = new Set<string>();
           for (const key of keys.result) {
@@ -310,7 +321,7 @@ export async function purgeUnreadStorage(scope: string) {
         for (const key of keys.result) events.delete(key);
       };
       tx.objectStore("meta").put(
-        { version: VERSION, purged: crypto.randomUUID() },
+        { version: VERSION, purged: `${Date.now()}:${crypto.randomUUID()}` },
         scope,
       );
       settle(tx, resolve, reject);

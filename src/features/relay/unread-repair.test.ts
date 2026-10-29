@@ -120,6 +120,16 @@ async function setup({
         throw new Error("Relay read timed out");
       if (windows.some((id) => transient.delete(id)))
         throw new DOMException("Relay read timed out", "TimeoutError");
+      // Deleted events, by author and target, as the relay leaves them out.
+      const deleted = new Set(
+        store.flatMap((item) =>
+          item.kind === 5
+            ? item.tags.flatMap(([tag, id]) =>
+                tag === "e" ? [`${item.pubkey}:${id}`] : [],
+              )
+            : [],
+        ),
+      );
       return filters.flatMap((filter) => {
         if (filter.authors && !filter["#e"] && !authoredPage) return [];
         if (sample(filter) && !sampled) return [];
@@ -132,6 +142,7 @@ async function setup({
         const matched = store
           .filter(
             (item) =>
+              !deleted.has(`${item.pubkey}:${item.id}`) &&
               (!filter.kinds || filter.kinds.includes(item.kind)) &&
               (!filter.ids || filter.ids.includes(item.id)) &&
               (!filter.authors || filter.authors.includes(item.pubkey)) &&
@@ -144,13 +155,18 @@ async function setup({
             (a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id),
           )
           .slice(0, filter.limit);
-        // `include_aux`: the relay adds the deletions of what matched.
+        // As the relay does, deleted events are left out, and edits and
+        // deletions are attached only to top-level and depth-limited reads,
+        // which the repair does not send.
         const ids = matched.map((item) => item.id);
-        return filter.include_aux
+        return filter.include_aux &&
+          (filter.top_level || filter.depth_limit !== undefined)
           ? [
               ...matched,
               ...store.filter(
-                (item) => item.kind === 5 && tagged(item, "e", ids),
+                (item) =>
+                  (item.kind === 5 || item.kind === 40003) &&
+                  tagged(item, "e", ids),
               ),
             ]
           : matched;
@@ -1233,8 +1249,9 @@ it("a remembered thread the viewer's deleted reply joined leaves the Inbox after
   h.store.push(root, mine, retraction);
   for (let i = 0; i < 200; i++) h.store.push(reply("c0", peer, 1020 + i, root));
   await h.owner.capability.ensure();
-  // Projecting the read replies asks for the viewer's membership; the
-  // deletion rides the answer, so no witness is kept and the thread leaves.
+  // Projecting the read replies asks for the viewer's membership; the relay
+  // leaves the deleted reply out of the answer, so no witness is kept and
+  // the thread leaves.
   await vi.waitFor(() => {
     h.owner.capability.inbox();
     expect(h.filters()).toContainEqual(

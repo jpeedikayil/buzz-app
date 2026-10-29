@@ -153,21 +153,23 @@ With those threads, each repair keeps on this device the signed events the
 next one would read of what is held, every unread or undecided row, and what
 those rows depend on—roots, parents, the viewer's own messages in their
 threads, edits and deletions—up to 2,048 events and 4 MiB, beyond which it
-keeps none. A root or parent fetched only to group replies is restored as
-such and never counts. A launch verifies the events again beside the repair,
-not ahead of it, and shows them once all have passed, which may be before or
-after the relay's first answer; one that fails verification discards them
-all, keeping the threads. The full repair still runs on every launch, and
-restored events only add to what it reads: one that a read should have
-returned and did not, deleted while the device was closed, is dropped, and
-one whose channel membership is not confirmed yet waits for it. The repair's
-reads return no deletions, so a restored event none of them reaches—an unread
-message older than its channel's window and outside the newest events across
-the roster—stays even if it was deleted while the device was closed, until
-its deletion arrives. Leaving a community clears its record, and a window
-still open on it cannot save it back; a session that first reads the record
-after that, as when rejoining, saves as usual. Clearing the cache clears the
-record too.
+keeps none. A root or parent fetched only to group replies, by a lookup or a
+thread read, counts only once a channel's window or the newest events across
+the roster return it, and is restored as such. A launch verifies the events
+again beside the repair, not ahead of it, and shows them once all have
+passed, which may be before or after the relay's first answer; one that fails
+verification discards them all, keeping the threads. The full repair still
+runs on every launch, and restored events only add to what it reads: one that
+a read should have returned and did not, deleted while the device was closed,
+is dropped, and one whose channel membership is not confirmed yet waits for
+it. The repair's reads return no deletions, so a restored event none of them
+reaches—an unread message older than its channel's window and outside the
+newest events across the roster—stays even if it was deleted while the device
+was closed, until its deletion arrives. Leaving a community clears its record,
+and a window still open on it cannot save it back; a session started after
+that, as when rejoining, saves as usual. Clearing the cache clears the record
+too, remembered threads included, so the next repair walks back through the
+viewer's messages again as a device's first does.
 The windows, the viewer's own recent messages and the thread reads ride
 together, up to 128 filters per request with two requests in flight, so a
 roster costs one or two round trips; the newest events across the roster are

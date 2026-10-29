@@ -1512,6 +1512,26 @@ export function createUnread({
       lookupEvents.delete(oldest);
     }
   }
+  /** A root the participation pass fetched by ID is structure, as a
+   * lookup's fetch is: it groups its thread's replies and counts only once a
+   * window or the roster sample returns it, so a repair counts the same
+   * whether the root came from a lookup, a thread read or storage. The
+   * viewer's own root witnesses their membership of its thread, as it does
+   * for a lookup that fetched it. */
+  function keepRoot(event: RelayEvent) {
+    const channelId = channelOf(event);
+    if (!channelId || (event.pubkey === viewer && retracted.has(event.id)))
+      return;
+    keep(event);
+    if (event.pubkey !== viewer) return;
+    const key = conversationKey(channelId, event.id);
+    const found = lookups.get(key);
+    const lookup: Lookup = found?.done
+      ? found
+      : { channelId, done: true, evidence: undefined, more: false };
+    remember(key, lookup);
+    witness(lookup, event);
+  }
   const contentKinds = UNREAD_CONTENT_KINDS;
   type Target = { parentId: string; rootId: string | undefined };
   /** The viewer's reply decides this lookup: it answers the parent, or is
@@ -1981,6 +2001,8 @@ export function createUnread({
   // path; `restoring` is that verification, and the reads that land during
   // it wait in `early` to be reconciled once it is in.
   let restored = false;
+  // Cache clears, each of which wipes the record a launch may be reading.
+  let clears = 0;
   let restoring: { done: Promise<void> } | undefined;
   let early: [readonly ReadFilter[], readonly RelayEvent[]][] = [];
   // Restored content no read has returned yet (see `reconcile`).
@@ -2003,15 +2025,21 @@ export function createUnread({
         )
     );
   };
-  /** Restored evidence is accepted; a root or parent a lookup fetched goes
-   * back to the lookup cache, where it groups replies and never counts. */
+  /** Restored evidence is accepted; a root or parent fetched to group
+   * replies goes back to the lookup cache first, so the replies accepted
+   * with it group under it at once, and never counts. */
   function admitRestored(batch: readonly RelayEvent[]) {
+    for (const event of batch)
+      if (restoredStructure.has(event.id) && allowed(channelOf(event) ?? ""))
+        keep(event);
     accept(batch.filter((event) => !restoredStructure.has(event.id)));
     for (const event of batch)
-      if (!restoredStructure.has(event.id)) {
-        if (contentKind(event) && events.has(event.id))
-          unconfirmed.add(event.id);
-      } else if (allowed(channelOf(event) ?? "")) keep(event);
+      if (
+        !restoredStructure.has(event.id) &&
+        contentKind(event) &&
+        events.has(event.id)
+      )
+        unconfirmed.add(event.id);
     waiting = batch.filter(
       (event) =>
         !events.has(event.id) &&
@@ -2287,10 +2315,12 @@ export function createUnread({
   let owed: ThreadParticipation | undefined;
   function save(record: UnreadRecord, key?: string) {
     issuedKey = key;
-    void storage.save(record).catch((cause: unknown) => {
+    const saving = storage.save(record);
+    void saving.catch((cause: unknown) => {
       if (cause instanceof UnreadRecordPurged) fenced = true;
       if (issuedKey === key) issuedKey = undefined;
     });
+    return saving;
   }
   /** The one way the record is saved: the threads with the evidence kept
    * for them (see `retention`), so a save carrying new threads never drops
@@ -2322,7 +2352,7 @@ export function createUnread({
   }
   async function rememberedRoots(): Promise<ThreadParticipation> {
     if (!persisted) {
-      const generation = epoch;
+      const cleared = clears;
       let record: UnreadRecord<unknown> | undefined;
       try {
         record = await storage.read();
@@ -2331,8 +2361,9 @@ export function createUnread({
         // what the relay still shows and saves that.
       }
       // A cache clear meanwhile wiped what was read; the repair is retired
-      // and the next one reads again.
-      if (generation !== epoch) return NO_THREAD_PARTICIPATION;
+      // and the next one reads again. An access change retires the repair
+      // too, but the record read stands.
+      if (cleared !== clears) return NO_THREAD_PARTICIPATION;
       persisted = record?.participation ?? NO_THREAD_PARTICIPATION;
       remembered = new Map(persisted.roots);
       // Once a session: a cache clear wipes the record, so the threads read
@@ -2710,6 +2741,17 @@ export function createUnread({
             !reply(event) || admitted.has(event.id) || !!structural(event.id),
         );
         for (const event of kept) rows.set(event.id, event);
+        // A root fetched by ID is structure (see `keepRoot`), kept before the
+        // replies are accepted so they group under it at once.
+        const fetchedRoots = new Set(
+          kept.filter(
+            (event) =>
+              !reply(event) &&
+              fetchedIds.has(event.id) &&
+              !events.has(event.id),
+          ),
+        );
+        for (const event of fetchedRoots) keepRoot(event);
         // A root an admitted reply names that nothing holds is fetched, so
         // the reply groups under it rather than standing as its own row.
         const missing = [
@@ -2725,7 +2767,18 @@ export function createUnread({
         );
         if (missing.length)
           requests.unshift(...chunk(byId(missing), UNREAD_WINDOW_BATCH));
-        return accept(kept);
+        const accepted = accept(
+          kept.filter((event) => !fetchedRoots.has(event)),
+        );
+        if (fetchedRoots.size) {
+          indexed = false;
+          publish(
+            new Set(
+              [...fetchedRoots].flatMap((event) => channelOf(event) ?? []),
+            ),
+          );
+        }
+        return accepted;
       },
       /** Learns roots and their newest times from retained evidence and the
        * thread reads so far. */
@@ -4021,8 +4074,10 @@ export function createUnread({
       reads.stale();
       publish();
     },
+    /** Settles once the saved record is wiped, rejecting when it was not. */
     clear() {
       epoch++;
+      clears++;
       channelReadGenerations.clear();
       resetLookups();
       repairAgain = false;
@@ -4036,14 +4091,18 @@ export function createUnread({
       waiting = [];
       owed = undefined;
       dropped = [];
-      // Wiped as the channel heads are; the next repair saves afresh.
-      if (!fenced)
-        save({
-          participation: NO_THREAD_PARTICIPATION,
-          events: [],
-          structure: new Set(),
-          complete: false,
-        });
+      // Wiped as the channel heads are, remembered threads and walk mark
+      // included; the next repair saves afresh. A purge has wiped it already.
+      const wiped = fenced
+        ? Promise.resolve()
+        : save({
+            participation: NO_THREAD_PARTICIPATION,
+            events: [],
+            structure: new Set(),
+            complete: false,
+          }).catch((cause: unknown) => {
+            if (!(cause instanceof UnreadRecordPurged)) throw cause;
+          });
       partial = false;
       events.clear();
       known.clear();
@@ -4053,6 +4112,7 @@ export function createUnread({
       freshness = "unknown";
       error = undefined;
       publish();
+      return wiped;
     },
     dispose() {
       closed = true;

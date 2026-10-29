@@ -1,6 +1,7 @@
 import { afterEach, assert, expect, it, vi } from "vitest";
 import type { ChannelQueries, ChannelSummary } from "./contracts";
 import type { ReadFilter, RelayEvent } from "./events";
+import type { InboxItem } from "./inbox";
 import { createReadState } from "./read-state";
 import {
   newReadJournal,
@@ -112,9 +113,11 @@ async function launch({
         tagged(other, "e", [item.id]),
     );
   let held: Promise<void> | undefined;
+  let waiting: (filters: readonly ReadFilter[]) => void = () => {};
   const reader = {
     read: vi.fn(async (filters: readonly ReadFilter[]) => {
       if (filters.some((filter) => filter.kinds?.includes(9))) {
+        if (held) waiting(filters);
         await held;
         if (down) throw new Error("Relay read timed out");
       }
@@ -188,19 +191,70 @@ async function launch({
     ensure() {},
     loadOlder() {},
   };
+  // Barriers. Restore reports each verified batch and admits the evidence
+  // right after the last, so the reported count reaching the record's is the
+  // moment it is in. A save waits for restore and the reconciles behind it,
+  // so the session's first save, landed, is past both when online.
+  let verified = 0;
+  const verifying: [number, () => void][] = [];
+  cpu.mockImplementation((stage: string, _ms: number, count: number) => {
+    if (stage !== "verify.restore") return;
+    verified += count;
+    for (const waiter of [...verifying])
+      if (verified >= waiter[0]) {
+        verifying.splice(verifying.indexOf(waiter), 1);
+        waiter[1]();
+      }
+  });
+  let issued: (landed: Promise<void>) => void = () => {};
+  const firstSave = new Promise<void>((resolve) => {
+    issued = resolve;
+  });
+  // A test of a refused save may never await it.
+  firstSave.catch(() => {});
   const owner = createUnread({
     reads,
     channels,
     reader,
     viewer,
     follows,
-    storage,
+    // Spies a test puts on `storage` later still see each call.
+    storage: {
+      read: () => storage.read(),
+      save(record) {
+        const landed = storage.save(record);
+        issued(landed);
+        return landed;
+      },
+      close: () => storage.close(),
+    },
     now: () => NOW,
   });
   owners.push(owner);
   return {
     owner,
     reader,
+    /** Resolves once restore has admitted a record of `count` events. */
+    restored(count: number) {
+      return new Promise<void>((resolve) => {
+        if (verified >= count) resolve();
+        else verifying.push([count, resolve]);
+      });
+    },
+    /** The session's first save, landed. */
+    saved: firstSave,
+    /** Resolves once the Inbox publishes a row that `matches`. */
+    inboxed(matches: (item: InboxItem) => boolean) {
+      return new Promise<void>((resolve) => {
+        const check = () => {
+          if (!owner.capability.inbox().items.some(matches)) return;
+          stop();
+          resolve();
+        };
+        const stop = owner.capability.subscribeInbox(check);
+        check();
+      });
+    },
     rows: () =>
       owner.capability
         .inbox()
@@ -212,13 +266,17 @@ async function launch({
         })),
     count: (channelId: string) =>
       owner.capability.snapshot({ kind: "channel", channelId }).observedCount,
-    /** Evidence reads wait until the returned release. */
+    /** Evidence reads wait until `release`; `waiting` resolves with the
+     * first that does. */
     hold() {
       let release = () => {};
       held = new Promise((resolve) => {
         release = resolve;
       });
-      return release;
+      const first = new Promise<readonly ReadFilter[]>((resolve) => {
+        waiting = resolve;
+      });
+      return { release, waiting: first };
     },
     roster(next: readonly ChannelSummary[]) {
       list = next;
@@ -234,8 +292,8 @@ const saved = async (storage: UnreadStorage) =>
 it("a relaunch that reads only storage shows every row and count the warm repair shows", async () => {
   const storage = memoryUnreadStorage();
   const follows = memoryThreadFollows();
-  // A lost thread: the viewer replied long ago, and only the thread reads
-  // reach it; its unread answer was edited.
+  // A lost thread, as in #buzz-team: the viewer replied long ago, and only
+  // the thread reads reach it; its unread answer was edited.
   const lost = post(peerKey, "team", T);
   const mine = reply(viewerKey, "team", lost, T + 1);
   const answer = reply(peerKey, "team", lost, T + 2);
@@ -259,6 +317,10 @@ it("a relaunch that reads only storage shows every row and count the warm repair
   // A quiet channel's unread top-level message, and a DM.
   const quiet = post(peerKey, "quiet", T + 30);
   const direct = post(peerKey, "dm", T + 40);
+  // A thread the viewer started long ago, whose answer arrived live: later,
+  // only the thread reads reach the viewer's root, which makes it theirs.
+  const begun = post(viewerKey, "team", T + 50);
+  const answered = reply(peerKey, "team", begun, T + 51);
   // R1: an unread reply below the channel's catch-up mark, in a thread the
   // viewer started, which only the roster sample reads.
   const started = post(viewerKey, "team", T + 90_000);
@@ -274,6 +336,8 @@ it("a relaunch that reads only storage shows every row and count the warm repair
     followedReply,
     quiet,
     direct,
+    begun,
+    answered,
     ...busy,
     started,
     r1,
@@ -287,37 +351,35 @@ it("a relaunch that reads only storage shows every row and count the warm repair
   // A fresh launch, then a warm one, against the relay. The repair's reads
   // carry no edits: this one arrived live, once its target was read.
   const fresh = await launch({ store, storage, frontiers, follows });
-  fresh.owner.accept([asked, mention]);
+  fresh.owner.accept([asked, mention, answered]);
   await fresh.owner.capability.ensure();
   fresh.owner.accept([edit]);
   await fresh.owner.capability.refresh();
   fresh.owner.dispose();
   const warm = await launch({ store, storage, frontiers, follows });
   await warm.owner.capability.ensure();
+  await warm.saved;
   const expected = [
     { rootId: lost.id, unreadCount: 1, preview: "edited" },
     { rootId: asked.id, unreadCount: 0 },
     { rootId: followed.id, unreadCount: 1 },
+    { rootId: begun.id, unreadCount: 1 },
     { rootId: started.id, unreadCount: 1 },
     { channelId: "dm", unreadCount: 1 },
   ];
-  await vi.waitFor(() =>
-    expect(warm.owner.capability.inbox().items).toEqual(
-      expect.arrayContaining(
-        expected.map((row) => expect.objectContaining(row)),
-      ),
-    ),
+  expect(warm.owner.capability.inbox().items).toEqual(
+    expect.arrayContaining(expected.map((row) => expect.objectContaining(row))),
   );
   expect(warm.count("quiet")).toBe(1);
+  expect(warm.count("team")).toBe(4);
   const rows = warm.rows();
   const shown = rows.flatMap((row) => row.messageIds);
-  await vi.waitFor(async () =>
-    expect(await saved(storage)).toEqual(expect.arrayContaining(shown)),
-  );
+  expect(await saved(storage)).toEqual(expect.arrayContaining(shown));
   expect((await storage.read())?.complete).toBe(true);
   warm.owner.dispose();
   // The relay cannot be read: the rows and counts come from storage alone,
   // verified as the channel heads' restore is.
+  const count = (await saved(storage)).length;
   cpu.mockClear();
   const offline = await launch({
     store,
@@ -327,15 +389,15 @@ it("a relaunch that reads only storage shows every row and count the warm repair
     down: true,
   });
   await offline.owner.capability.ensure();
-  await vi.waitFor(() =>
-    expect(offline.rows()).toEqual(expect.arrayContaining(rows)),
-  );
+  await offline.restored(count);
+  expect(offline.rows()).toEqual(expect.arrayContaining(rows));
   expect(offline.count("quiet")).toBe(1);
+  expect(offline.count("team")).toBe(4);
   expect(
     cpu.mock.calls
       .filter(([stage]) => stage === "verify.restore")
       .reduce((total, [, , count]) => total + count, 0),
-  ).toBe((await saved(storage)).length);
+  ).toBe(count);
   expect(direct.id).toBeDefined();
   expect(quiet.id).toBeDefined();
 });
@@ -361,14 +423,15 @@ it("a cold thread's read root, which only a fresh launch's walk lists, is not re
   const row = expect.objectContaining({ rootId: cold.root.id });
   const fresh = await launch({ store, storage, frontiers });
   await fresh.owner.capability.ensure();
-  await vi.waitFor(() =>
-    expect(fresh.owner.capability.inbox().items).toContainEqual(row),
-  );
+  await fresh.saved;
+  expect(fresh.owner.capability.inbox().items).toContainEqual(row);
   fresh.owner.dispose();
   expect(await saved(storage)).not.toContain(cold.root.id);
   // Neither a warm repair nor what it restores lists it again.
+  const count = (await saved(storage)).length;
   const warm = await launch({ store, storage, frontiers });
   await warm.owner.capability.ensure();
+  await warm.saved;
   expect(warm.owner.capability.inbox().items).not.toContainEqual(row);
   expect(warm.owner.capability.inbox().items).toContainEqual(
     expect.objectContaining({ rootId: threads.at(-1)?.root.id }),
@@ -376,10 +439,9 @@ it("a cold thread's read root, which only a fresh launch's walk lists, is not re
   warm.owner.dispose();
   const offline = await launch({ store, storage, frontiers, down: true });
   await offline.owner.capability.ensure();
-  await vi.waitFor(() =>
-    expect(offline.owner.capability.inbox().items).toContainEqual(
-      expect.objectContaining({ rootId: threads.at(-1)?.root.id }),
-    ),
+  await offline.restored(count);
+  expect(offline.owner.capability.inbox().items).toContainEqual(
+    expect.objectContaining({ rootId: threads.at(-1)?.root.id }),
   );
   expect(offline.owner.capability.inbox().items).not.toContainEqual(row);
 });
@@ -392,6 +454,7 @@ it("a tampered event discards the restored evidence, keeping the threads the rep
   const store = [root, mine, answer, post(peerKey, "quiet", T + 3)];
   const first = await launch({ store, storage: saving });
   await first.owner.capability.ensure();
+  await first.saved;
   first.owner.dispose();
   expect(await saved(saving)).toContain(answer.id);
   // Storage changed one event's content after it was signed.
@@ -413,7 +476,9 @@ it("a tampered event discards the restored evidence, keeping the threads the rep
   };
   const offline = await launch({ store, storage, down: true });
   await offline.owner.capability.ensure();
-  // Nothing is restored, not even the events that verify.
+  // Nothing is restored, not even the events that verify. A record of at
+  // most eight events is verified in one batch, within the launch's storage
+  // read, so the repair that just ended is past it.
   expect(offline.rows()).toEqual([]);
   expect(offline.count("quiet")).toBeNull();
   offline.owner.dispose();
@@ -438,9 +503,8 @@ it("a selection over the record's bounds, or one retention dropped, saves an inc
   const first = await launch({ store: many, storage: over });
   await first.owner.capability.ensure();
   expect(first.count("quiet")).toBe(5);
-  await vi.waitFor(async () =>
-    expect(await over.read()).toMatchObject({ events: [], complete: false }),
-  );
+  await first.saved;
+  expect(await over.read()).toMatchObject({ events: [], complete: false });
   // The viewer's message, which the authored page returns, is refused room:
   // traffic that arrived during the repair filled the byte budget with newer
   // evidence of its channel. The page selects it, so the record is not
@@ -465,13 +529,11 @@ it("a selection over the record's bounds, or one retention dropped, saves an inc
       members: [viewer],
     })),
   });
-  const release = second.hold();
+  const { release, waiting } = second.hold();
   const repair = second.owner.capability.ensure();
   try {
-    await vi.waitFor(() =>
-      expect(second.reader.read.mock.calls.flat(2)).toContainEqual(
-        expect.objectContaining({ authors: [viewer] }),
-      ),
+    expect(await waiting).toContainEqual(
+      expect.objectContaining({ authors: [viewer] }),
     );
     second.owner.accept(later);
   } finally {
@@ -479,9 +541,8 @@ it("a selection over the record's bounds, or one retention dropped, saves an inc
   }
   await repair;
   expect(second.owner.event(authored.id)).toBeUndefined();
-  await vi.waitFor(async () =>
-    expect((await dropped.read())?.events).toHaveLength(busy.length),
-  );
+  await second.saved;
+  expect((await dropped.read())?.events).toHaveLength(busy.length);
   expect((await dropped.read())?.complete).toBe(false);
 });
 
@@ -496,6 +557,7 @@ it("restored evidence the relay no longer returns, deleted while this device was
   const store = [root, mine, ...answers];
   const first = await launch({ store, storage });
   await first.owner.capability.ensure();
+  await first.saved;
   first.owner.dispose();
   expect(await saved(storage)).toEqual(
     expect.arrayContaining([gone.id, alsoGone.id]),
@@ -507,19 +569,20 @@ it("restored evidence the relay no longer returns, deleted while this device was
   store.push(deletion(peerKey, "team", gone));
   const early = await launch({ store, storage });
   await early.owner.capability.ensure();
-  await vi.waitFor(() => expect(thread(early)).toContain(answers.at(-1)?.id));
+  await early.saved;
+  expect(thread(early)).toContain(answers.at(-1)?.id);
   expect(thread(early)).not.toContain(gone.id);
-  await vi.waitFor(async () =>
-    expect(await saved(storage)).not.toContain(gone.id),
-  );
+  expect(await saved(storage)).not.toContain(gone.id);
   early.owner.dispose();
   // Reads that land once it is in.
   store.push(deletion(peerKey, "team", alsoGone));
+  const count = (await saved(storage)).length;
   const late = await launch({ store, storage });
-  const release = late.hold();
+  const { release } = late.hold();
   const repair = late.owner.capability.ensure();
   try {
-    await vi.waitFor(() => expect(thread(late)).toContain(alsoGone.id));
+    await late.restored(count);
+    expect(thread(late)).toContain(alsoGone.id);
   } finally {
     release();
   }
@@ -544,6 +607,7 @@ it("restored evidence of a channel whose membership is not confirmed yet waits f
   ];
   const first = await launch({ store, storage, roster: channels(false) });
   await first.owner.capability.ensure();
+  await first.saved;
   first.owner.dispose();
   expect(await saved(storage)).toContain(direct.id);
   // The roster starts from the downloaded membership; the repair reads, and
@@ -553,15 +617,12 @@ it("restored evidence of a channel whose membership is not confirmed yet waits f
     storage,
     roster: channels(true),
   });
-  const save = vi.spyOn(storage, "save");
   await next.owner.capability.ensure();
-  await vi.waitFor(() => expect(save).toHaveBeenCalled(), { timeout: 20_000 });
+  await next.saved;
   expect(await saved(storage)).toContain(direct.id);
   next.roster(channels(false));
-  await vi.waitFor(() =>
-    expect(next.owner.capability.inbox().items).toContainEqual(
-      expect.objectContaining({ channelId: "dm", messageIds: [direct.id] }),
-    ),
+  expect(next.owner.capability.inbox().items).toContainEqual(
+    expect.objectContaining({ channelId: "dm", messageIds: [direct.id] }),
   );
 });
 
@@ -597,12 +658,11 @@ it("a save that is refused is written again, and one carrying only threads keeps
     channelId: "team",
     rootId: root.id,
   });
-  await vi.waitFor(async () =>
-    expect(
-      (await memory.read())?.participation.roots.get(`team:${root.id}`),
-    ).toMatchObject({ at: root.created_at }),
-  );
   expect(save).toHaveBeenCalledTimes(3);
+  await save.mock.results[2]?.value;
+  expect(
+    (await memory.read())?.participation.roots.get(`team:${root.id}`),
+  ).toMatchObject({ at: root.created_at });
   expect(await saved(memory)).toEqual(
     expect.arrayContaining([root.id, mine.id, answer.id]),
   );
@@ -622,6 +682,7 @@ it("a full window's cut is its own limit-th match, not an older match another fi
   const first = await launch({ store, storage, frontiers });
   await first.owner.capability.ensure();
   expect(first.count("team")).toBe(130);
+  await first.saved;
   first.owner.dispose();
   expect(await saved(storage)).toEqual(
     expect.arrayContaining(unread.map(({ id }) => id)),
@@ -643,7 +704,7 @@ it("a full window's cut is its own limit-th match, not an older match another fi
   // Saved once restore and every reconcile are done. The window returned
   // the newest 100 beside the authored page's older match: the 30 below its
   // cut are not judged, so the deleted one stays until its deletion arrives.
-  await vi.waitFor(() => expect(save).toHaveBeenCalled());
+  await warm.saved;
   expect(warm.count("team")).toBe(130);
   expect(await saved(storage)).toEqual(
     expect.arrayContaining(unread.map(({ id }) => id)),
@@ -651,13 +712,12 @@ it("a full window's cut is its own limit-th match, not an older match another fi
   warm.owner.accept([removal]);
   expect(warm.count("team")).toBe(129);
   await warm.owner.capability.refresh();
-  await vi.waitFor(async () =>
-    expect(await saved(storage)).not.toContain(oldest.id),
-  );
+  await save.mock.results.at(-1)?.value;
+  expect(await saved(storage)).not.toContain(oldest.id);
   expect(await saved(storage)).not.toContain(removal.id);
 });
 
-it("a root a lookup fetched is restored as structure: it groups the mention and never counts", async () => {
+it("a root a lookup fetched stays structure on every relaunch: it groups the mention and never counts", async () => {
   const storage = memoryUnreadStorage();
   // Older than the window's week, in a channel the viewer never opened:
   // only the structure lookup of a read mention that arrived live fetches it.
@@ -668,27 +728,104 @@ it("a root a lookup fetched is restored as structure: it groups the mention and 
   const row = expect.objectContaining({ rootId: old.id, unreadCount: 0 });
   const first = await launch({ store, storage, frontiers });
   await first.owner.capability.ensure();
+  await first.saved;
   store.push(mention);
   first.owner.accept([mention]);
-  await vi.waitFor(() =>
-    expect(first.owner.capability.inbox().items).toContainEqual(row),
-  );
+  await first.inboxed((item) => item.rootId === old.id);
+  const save = vi.spyOn(storage, "save");
   await first.owner.capability.refresh();
+  expect(save).toHaveBeenCalled();
+  await save.mock.results.at(-1)?.value;
+  expect(first.owner.capability.inbox().items).toContainEqual(row);
+  expect(first.count("team")).toBe(0);
   expect(first.owner.event(old.id)).toBeUndefined();
-  await vi.waitFor(async () =>
-    expect((await storage.read())?.structure).toEqual(new Set([old.id])),
-  );
+  const record = await storage.read();
+  assert(record);
+  expect(record.structure).toEqual(new Set([old.id]));
   expect(await saved(storage)).toEqual(
     expect.arrayContaining([old.id, mention.id]),
   );
   first.owner.dispose();
+  // Online, the mention taught the pass its thread, whose read fetches the
+  // root by ID: from the saved record, and from one holding only threads.
+  for (const restored of [
+    record,
+    { ...record, events: [], structure: new Set<string>(), complete: false },
+  ]) {
+    const memory = memoryUnreadStorage();
+    await memory.save(restored as typeof record & { events: RelayEvent[] });
+    const online = await launch({ store, storage: memory, frontiers });
+    await online.owner.capability.ensure();
+    await online.saved;
+    expect(online.owner.capability.inbox().items).toContainEqual(row);
+    expect(online.count("team")).toBe(0);
+    expect(online.owner.event(old.id)).toBeUndefined();
+    online.owner.dispose();
+  }
+  // Offline, restore puts the root back before it admits the mention, so no
+  // published Inbox shows the mention outside its thread.
   const offline = await launch({ store, storage, frontiers, down: true });
+  const ungrouped: unknown[] = [];
+  offline.owner.capability.subscribeInbox(() => {
+    const items = offline.owner.capability.inbox().items;
+    if (
+      offline.owner.event(mention.id) &&
+      !items.some((item) => item.rootId === old.id)
+    )
+      ungrouped.push(items);
+  });
   await offline.owner.capability.ensure();
-  await vi.waitFor(() =>
-    expect(offline.owner.capability.inbox().items).toContainEqual(row),
-  );
+  await offline.restored(record.events.length);
+  expect(ungrouped).toEqual([]);
+  expect(offline.owner.capability.inbox().items).toContainEqual(row);
   expect(offline.count("team")).toBe(0);
   expect(offline.owner.event(old.id)).toBeUndefined();
+});
+
+it("the viewer's root a thread read fetches is their membership of its thread, with no lookup", async () => {
+  // The viewer started the thread long ago; its unread answer is below the
+  // channel's catch-up mark and older than the roster sample, so only the
+  // remembered thread's read reaches either.
+  const started = post(viewerKey, "team", T);
+  const answer = reply(peerKey, "team", started, T + 1);
+  const store = [started, answer, ...busy];
+  const frontiers = { ...BUSY_READ, "activity:team": T + 95_000 };
+  const storage = memoryUnreadStorage();
+  await storage.save({
+    participation: {
+      roots: new Map([[`team:${started.id}`, { at: answer.created_at }]]),
+      walk: { since: T + 10 },
+    },
+    events: [],
+    structure: new Set(),
+    complete: false,
+  });
+  const row = expect.objectContaining({
+    rootId: started.id,
+    unreadCount: 1,
+  });
+  const lookups = (h: Awaited<ReturnType<typeof launch>>) =>
+    h.reader.read.mock.calls.flatMap(([filters]) =>
+      filters.filter((filter) => filter.authors && filter["#e"]),
+    );
+  const online = await launch({ store, storage, frontiers });
+  await online.owner.capability.ensure();
+  await online.saved;
+  expect(online.owner.capability.inbox().items).toContainEqual(row);
+  expect(online.count("team")).toBe(1);
+  expect(lookups(online)).toEqual([]);
+  online.owner.dispose();
+  // Saved as the thread's witness, the root keeps the row offline.
+  const count = (await saved(storage)).length;
+  expect(await saved(storage)).toEqual(
+    expect.arrayContaining([started.id, answer.id]),
+  );
+  const offline = await launch({ store, storage, frontiers, down: true });
+  await offline.owner.capability.ensure();
+  await offline.restored(count);
+  expect(offline.owner.capability.inbox().items).toContainEqual(row);
+  expect(offline.count("team")).toBe(1);
+  expect(lookups(offline)).toEqual([]);
 });
 
 it("a save in flight is not written again, and one refused by a purge ends the session's saves", async () => {
@@ -717,9 +854,8 @@ it("a save in flight is not written again, and one refused by a purge ends the s
   await h.owner.capability.refresh();
   expect(save).toHaveBeenCalledTimes(1);
   release();
-  await vi.waitFor(async () =>
-    expect(await saved(memory)).toContain(answer.id),
-  );
+  await save.mock.results[0]?.value;
+  expect(await saved(memory)).toContain(answer.id);
   // Another window left the community: this session's next save is refused,
   // and nothing it holds is saved again.
   purged = true;
@@ -740,6 +876,7 @@ it("a cache clear wipes the saved record, including what the launch was still re
   const store = [root, mine, answer];
   const first = await launch({ store, storage });
   await first.owner.capability.ensure();
+  await first.saved;
   first.owner.dispose();
   expect(await saved(storage)).toContain(answer.id);
   // The clear lands while the launch's storage read is in flight.
@@ -760,9 +897,10 @@ it("a cache clear wipes the saved record, including what the launch was still re
     down: true,
   });
   const repair = h.owner.capability.ensure();
-  h.owner.clear();
+  const wiped = h.owner.clear();
   release();
   await repair.catch(() => {});
+  await wiped;
   expect(h.owner.capability.inbox().items).toEqual([]);
   expect(await storage.read()).toEqual({
     participation: { roots: new Map() },
@@ -770,4 +908,81 @@ it("a cache clear wipes the saved record, including what the launch was still re
     structure: new Set(),
     complete: false,
   });
+});
+
+it("an access change while the launch reads storage keeps the record it read", async () => {
+  const storage = memoryUnreadStorage();
+  const root = post(peerKey, "team", T);
+  const mine = reply(viewerKey, "team", root, T + 1);
+  const answer = reply(peerKey, "team", root, T + 2);
+  const store = [root, mine, answer];
+  const first = await launch({ store, storage });
+  await first.owner.capability.ensure();
+  await first.saved;
+  first.owner.dispose();
+  // The membership is confirmed while the launch's storage read is in flight.
+  const team = (cached: boolean): ChannelSummary[] => [
+    {
+      id: "team",
+      name: "team",
+      members: [viewer],
+      ...(cached ? { cached: true as const } : {}),
+    },
+  ];
+  let release = () => {};
+  const reading = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let started = () => {};
+  const begun = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const read = vi.fn(async () => {
+    started();
+    const record = await storage.read();
+    await reading;
+    return record;
+  });
+  const h = await launch({
+    store,
+    storage: { ...storage, read },
+    roster: team(true),
+    down: true,
+  });
+  const repair = h.owner.capability.ensure();
+  await begun;
+  h.roster(team(false));
+  release();
+  await repair.catch(() => {});
+  // A record of at most 8 events is admitted within the storage read.
+  expect(h.owner.event(answer.id)).toBeDefined();
+  expect(h.owner.capability.inbox().items).toContainEqual(
+    expect.objectContaining({ rootId: root.id, unreadCount: 1 }),
+  );
+  expect(read).toHaveBeenCalledTimes(1);
+});
+
+it("a cache clear settles once the record is wiped, and rejects when the wipe fails", async () => {
+  const memory = memoryUnreadStorage();
+  let refusal: Error | undefined;
+  const storage: UnreadStorage = {
+    ...memory,
+    async save(record) {
+      if (refusal) throw refusal;
+      return memory.save(record);
+    },
+  };
+  const root = post(peerKey, "team", T);
+  const answer = reply(peerKey, "team", root, T + 1);
+  const h = await launch({ store: [root, answer], storage });
+  await h.owner.capability.ensure();
+  await h.saved;
+  expect(await saved(memory)).toContain(answer.id);
+  await h.owner.clear();
+  expect(await memory.read()).toMatchObject({ events: [], complete: false });
+  refusal = new DOMException("Quota exceeded", "QuotaExceededError");
+  await expect(h.owner.clear()).rejects.toThrow("Quota exceeded");
+  // A purge has wiped it already.
+  refusal = new UnreadRecordPurged();
+  await expect(h.owner.clear()).resolves.toBeUndefined();
 });

@@ -12,7 +12,10 @@ import {
   type UnreadRecord,
 } from "./unread-storage";
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
 
 // An in-memory IndexedDB shared by every connection. Transactions run one at
 // a time in the order they were created, as overlapping readwrite
@@ -534,4 +537,42 @@ it("a storage whose first read failed saves over a purge it never saw, and is fe
   await expect(session.save(record([event()]))).rejects.toThrow(
     UnreadRecordPurged,
   );
+});
+
+it("a purge made during a storage's session refuses its saves, however it first finds the purge", async () => {
+  const idb = memoryIndexedDB();
+  const record = (events: RelayEvent[]): UnreadRecord => ({
+    participation: threads,
+    events,
+    structure: none,
+    complete: true,
+  });
+  const now = vi.spyOn(Date, "now").mockReturnValue(1000);
+  await browserUnreadStorage(scope).save(record([event()]));
+  // Two sessions for the community, live since before another window left it.
+  const failed = browserUnreadStorage(scope);
+  const late = browserUnreadStorage(scope);
+  idb.block(1);
+  await expect(failed.read()).rejects.toThrow("Close other Buzz windows");
+  now.mockReturnValue(2000);
+  await purgeUnreadStorage(scope);
+  // Its first read failed, so its first save finds the purge.
+  await expect(failed.save(record([event()]))).rejects.toThrow(
+    UnreadRecordPurged,
+  );
+  // Its first read finds the purge.
+  await expect(late.read()).resolves.toBeUndefined();
+  await expect(late.save(record([event()]))).rejects.toThrow(
+    UnreadRecordPurged,
+  );
+  expect(idb.keys("events")).toEqual([]);
+  // A session started after the purge, as for rejoining, saves.
+  now.mockReturnValue(3000);
+  const rejoined = browserUnreadStorage(scope);
+  const kept = event();
+  await rejoined.save(record([kept]));
+  await expect(rejoined.read()).resolves.toEqual({
+    ...record([kept]),
+    events: [wire(kept)],
+  });
 });
