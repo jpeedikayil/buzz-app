@@ -29,6 +29,7 @@ import { eventMs } from "./message-order";
 import { threadReference } from "./thread-reference";
 import {
   UNREAD_CONTENT_KINDS,
+  UNREAD_OVERLAY_KINDS,
   UNREAD_WINDOW_BATCH,
 } from "./unread-window-batch";
 import {
@@ -255,11 +256,12 @@ export function createUnread({
     epoch = 0;
   let requested = false;
   let repairAgain = false;
-  // Whether the running repair catches up (see `route`): one an access
-  // change retires is read again the same way, so a retired explicit refresh
-  // still reads the bootstrap, and an explicit refresh that finds it running
-  // has the next one read the bootstrap.
+  // Whether the running repair may catch up (see `route`), and whether it
+  // routed to the delta: an explicit refresh that finds it running reads the
+  // bootstrap, in it when it has not routed yet and next when it reads the
+  // delta. One an access change retires is read again in the mode it had.
   let catchingUp = false;
+  let readingDelta = false;
   let freshness: UnreadSnapshot["freshness"] = "unknown";
   /** A repair failed or the stream dropped, and no repair has completed
    * since. Live traffic marks evidence observed again but does not pay this. */
@@ -1912,13 +1914,16 @@ export function createUnread({
   // still full at DELTA_PAGES, or a mark confirmed more than MARK_AGE ago,
   // leaves the pass to the bootstrap. Restored evidence a delta has not
   // covered has its deletions since the record's mark read the same way,
-  // DELETION_PAGES at most (see `settleDeletions`).
+  // DELETION_PAGES at most (see `settleDeletions`). Those read by ID (see
+  // `vouch`) ride OVERLAY_BATCH filters of 100 IDs a request, within the
+  // 64 KiB of filters the reader and the browser host take.
   const DELTA_LOOKBACK = 900 + 960 + 5;
   const DELTA_PAGE = 500;
   const DELTA_PAGES = 6;
   const DELETION_PAGES = 2;
+  const OVERLAY_BATCH = 9;
   const MARK_AGE = 24 * 60 * 60;
-  const overlayKinds = [40003, 5, 9005];
+  const overlayKinds = UNREAD_OVERLAY_KINDS;
   const deadline = () =>
     AbortSignal.any([lifetime.signal, AbortSignal.timeout(10000)]);
   const chunk = <T>(items: readonly T[], size: number) =>
@@ -2142,63 +2147,85 @@ export function createUnread({
     chunk(ids, SAMPLE_CHANNELS).map(
       (part): ReadFilter => ({ kinds, "#h": part, since, limit: DELTA_PAGE }),
     );
-  /** Pages single-filter reads from their `since` to the end, newest first,
-   * accepting every page: a full page's next starts at its oldest (`until`
-   * with `before_id`; the relay orders a second's events by ID, so ties are
-   * neither skipped nor read twice), until a short page or `pages`. A page is
-   * the whole response, since the relay matched each event to the filter by
-   * a channel the client may not see (see `relayMatches`). Once its requests
-   * are read, `outcome` is `read` when every filter read to its end, `full`
-   * when one was still full at its last page (nothing more of it is read)
-   * and `dropped` when one was dropped; `newest` is the newest time read.
-   * The requests ride a pool of their own (`scan`) or the bootstrap's. */
-  function scanner(filters: readonly ReadFilter[], pages: number) {
+  /** Pages reads from their `since` to the end, newest first, accepting
+   * every page: a full page's next starts at its oldest (`until` with
+   * `before_id`; the relay orders a second's events by ID, so ties are
+   * neither skipped nor read twice) and is read alone, until a short page or
+   * `pages`. The filters ride `batch` to a request. A filter's page is the
+   * newest `limit` of the response it matches: for a lone filter the whole
+   * response, since the relay matched each event to the filter by a channel
+   * the client may not see (see `relayMatches`); for one of several, what it
+   * matches, as another's matches may reach below where its own stopped.
+   * Once its requests are read, `outcome` is `read` when every filter read to
+   * its end, `full` when one was still full at its last page (nothing more of
+   * it is read) and `dropped` when one was dropped; `newest` is the newest
+   * time read, and `rest` each filter not read to its end from where its read
+   * stopped. The requests ride a pool of their own (`scan`) or the
+   * bootstrap's. */
+  function scanner(filters: readonly ReadFilter[], pages: number, batch = 1) {
     const depth = new Map(filters.map((filter) => [filter, 1]));
+    // The filter each page reads on from, and that filter's next page.
+    const origin = new Map(filters.map((filter) => [filter, filter]));
+    const rest = new Map(filters.map((filter) => [filter, filter]));
     let open = filters.length;
     let full = false;
     let dropped = false;
     let newest: number | undefined;
     const owns = (request: readonly ReadFilter[]) =>
-      request.length === 1 && request.every((filter) => depth.has(filter));
+      request.length > 0 && request.every((filter) => depth.has(filter));
     return {
-      requests: filters.map((filter) => [filter]),
+      requests: chunk(filters, batch),
       owns,
       landed(
-        [filter]: readonly ReadFilter[],
+        request: readonly ReadFilter[],
         result: readonly RelayEvent[] | undefined,
         queue: ReadFilter[][],
       ) {
-        if (!filter) return true;
+        if (!request.length) return true;
         if (!result) {
           dropped = true;
           return true;
         }
-        const page = [
-          ...new Map(result.map((event) => [event.id, event])).values(),
-        ].sort(byTime);
-        for (const event of page)
+        for (const event of result)
           newest = Math.max(newest ?? 0, event.created_at);
         if (!accept(result)) return false;
-        const oldest = page.at(-1);
-        const at = depth.get(filter) ?? 1;
-        if (full) return true;
-        if (!oldest || page.length < filter.limit) {
-          open--;
-          return true;
+        for (const filter of request) {
+          const page = [
+            ...new Map(
+              (request.length === 1
+                ? result
+                : result.filter((event) => relayMatches(event, filter))
+              ).map((event) => [event.id, event]),
+            ).values(),
+          ]
+            .sort(byTime)
+            .slice(0, filter.limit);
+          const from = origin.get(filter) ?? filter;
+          const oldest = page.at(-1);
+          if (!oldest || page.length < filter.limit) {
+            open--;
+            rest.delete(from);
+            continue;
+          }
+          const next = {
+            ...filter,
+            until: oldest.created_at,
+            before_id: oldest.id,
+          };
+          rest.set(from, next);
+          const at = depth.get(filter) ?? 1;
+          if (full || at >= pages) {
+            full = true;
+            continue;
+          }
+          depth.set(next, at + 1);
+          origin.set(next, from);
+          queue.push([next]);
         }
-        if (at >= pages) {
-          full = true;
-          const rest = queue.filter((request) => !owns(request));
-          queue.splice(0, queue.length, ...rest);
-          return true;
+        if (full) {
+          const others = queue.filter((request) => !owns(request));
+          queue.splice(0, queue.length, ...others);
         }
-        const next = {
-          ...filter,
-          until: oldest.created_at,
-          before_id: oldest.id,
-        };
-        depth.set(next, at + 1);
-        queue.push([next]);
         return true;
       },
       divided(
@@ -2207,11 +2234,14 @@ export function createUnread({
       ) {
         const part = parts[0]?.[0];
         const at = filter && depth.get(filter);
+        const from = filter && origin.get(filter);
         if (at && part) depth.set(part, at);
+        if (from && part) origin.set(part, from);
       },
       outcome: () =>
         full ? "full" : dropped ? "dropped" : open ? undefined : "read",
       newest: () => newest,
+      rest: () => [...rest.values()],
     };
   }
   /** A scanner's reads in a pool of their own: the outcome, or undefined
@@ -2221,8 +2251,9 @@ export function createUnread({
     pages: number,
     generation: number,
     priority: Priority,
+    batch?: number,
   ) {
-    const reading = scanner(filters, pages);
+    const reading = scanner(filters, pages, batch);
     const read = await pool(
       reading.requests,
       generation,
@@ -2245,17 +2276,20 @@ export function createUnread({
    * read for every roster channel holding evidence, so the roster sample may
    * confirm the mark past `prior`: the bootstrap's reads carry none, and a
    * held event deleted meanwhile would otherwise be kept under a mark every
-   * later delta starts after. A read still full at its last page, which
-   * holding the mark back would only widen, vouches by forgetting the held
-   * content of those channels that is not `current` (returned by a read of
-   * the pass, or received while it ran), as a launch without it would not
-   * show it: the relay leaves deleted events out of what it returns. Only a
-   * dropped read holds the mark back, for the next pass to retry. Undefined
-   * when retired. */
+   * later delta starts after. After a delta still full at its last page,
+   * which read them too, only what it did not reach is read: each chunk on
+   * from where its pages stopped (`rest`). A read still full at its last
+   * page, which holding the mark back would only widen, gives way to a read
+   * by ID of the edits and deletions of the held content that is not
+   * `current` (returned by a read of the pass, or received while it ran),
+   * which `accept` applies as it does any. A dropped read, or one by ID still
+   * full, holds the mark back, for the next pass to retry. Undefined when
+   * retired. */
   async function vouch(
     ids: readonly string[],
     prior: UnreadMark,
     current: (id: string) => boolean,
+    rest: readonly ReadFilter[] | undefined,
     generation: number,
     priority: Priority,
   ) {
@@ -2268,27 +2302,54 @@ export function createUnread({
     );
     const held = ids.filter((id) => holding.has(id));
     const since = Math.max(0, prior.at - DELTA_LOOKBACK);
-    const outcome = await scan(
-      sinceReads(held, since, overlayKinds),
+    let outcome = await scan(
+      rest
+        ? rest.flatMap((gap) => {
+            const part = gap["#h"]?.filter((id) => holding.has(id)) ?? [];
+            return part.length
+              ? [
+                  {
+                    ...gap,
+                    kinds: overlayKinds,
+                    "#h": part,
+                    since,
+                    limit: DELTA_PAGE,
+                  },
+                ]
+              : [];
+          })
+        : sinceReads(held, since, overlayKinds),
       DELETION_PAGES,
       generation,
       priority,
     );
-    if (!outcome) return;
-    if (outcome === "read") cover(held, since);
     if (outcome === "full") {
       const channels = new Set(held);
-      forget(
-        [...events.values()].flatMap((event) =>
-          contentKind(event) &&
-          channels.has(channelOf(event) ?? "") &&
-          !current(event.id)
-            ? [event.id]
-            : [],
+      const unreturned = [...events.values()].flatMap((event) =>
+        contentKind(event) &&
+        channels.has(channelOf(event) ?? "") &&
+        !current(event.id)
+          ? [event.id]
+          : [],
+      );
+      outcome = await scan(
+        chunk(unreturned, 100).map(
+          (part): ReadFilter => ({
+            kinds: overlayKinds,
+            "#e": part,
+            since,
+            limit: DELTA_PAGE,
+          }),
         ),
+        DELETION_PAGES,
+        generation,
+        priority,
+        OVERLAY_BATCH,
       );
     }
-    return outcome !== "dropped";
+    if (!outcome) return;
+    if (outcome === "read") cover(held, since);
+    return outcome === "read";
   }
   /** Restored evidence of roster channels no read has covered (see
    * `cover`) has its deletions since the record's mark read once restore is
@@ -3350,20 +3411,23 @@ export function createUnread({
       run.pooling = false;
     }
   }
+  /** The running repair, then each it has run after it: an access change
+   * retired it, or a refresh found it reading the delta. */
+  const settled = (): Promise<void> | undefined =>
+    refresh?.then(() => settled());
   async function repair(priority: Priority = "foreground", catchUp = false) {
     requested = true;
     if (closed) return;
     if (refresh) {
-      // An explicit refresh reads the bootstrap: one that finds a pass
-      // catching up has the bootstrap read after it, and waits for that.
       if (!catchUp && catchingUp) {
-        repairAgain = true;
         catchingUp = false;
+        if (readingDelta) repairAgain = true;
       }
-      return repairAgain ? refresh.then(() => refresh) : refresh;
+      return settled();
     }
     repairAgain = false;
     catchingUp = catchUp;
+    readingDelta = false;
     inboxLoading = true;
     const generation = epoch;
     refresh = (async () => {
@@ -3396,12 +3460,13 @@ export function createUnread({
         // shows at least what the bootstrap alone does, as soon.
         const deltaSince = Math.max(0, (prior?.at ?? 0) - DELTA_LOOKBACK);
         const catching =
-          route(catchUp) === "delta"
+          route(catchingUp) === "delta"
             ? scanner(
                 sinceReads(ids, deltaSince, [...contentKinds, ...overlayKinds]),
                 DELTA_PAGES,
               )
             : undefined;
+        readingDelta = !!catching;
         // Keep roster scope: an unscoped read also includes unjoined open
         // channels. Each bounded request owns its queue-inclusive deadline
         // after marker sync; optional profiles must not block the initial
@@ -3576,14 +3641,14 @@ export function createUnread({
         // Nothing landed: nothing was observed, so the repair failed.
         if (!progress.landed) throw progress.failure;
         // A delta read to its end confirms the mark, and has read what
-        // restored evidence owes. One still full at its last page leaves the
-        // pass to the bootstrap (see `route`); one that dropped leaves the
-        // mark for the next pass, which reads it again, and the Inbox says
-        // some activity could not be checked.
+        // restored evidence owes. One still full at its last page, or never
+        // asked, leaves the pass to the bootstrap (see `route`); one that
+        // dropped leaves the mark for the next pass, which reads it again,
+        // and the Inbox says some activity could not be checked.
         const outcome = catching?.outcome();
         const caught = outcome === "read";
-        const bootstrapped = !catching || outcome === "full";
-        if (!caught && !bootstrapped) unchecked = true;
+        const bootstrapped = outcome === undefined || outcome === "full";
+        if (outcome === "dropped") unchecked = true;
         if (caught) {
           confirm(catching?.newest());
           cover(ids, deltaSince);
@@ -3603,6 +3668,7 @@ export function createUnread({
               prior,
               (id) =>
                 returned.has(id) || (!before.has(id) && !unconfirmed.has(id)),
+              catching?.rest(),
               generation,
               priority,
             ));
@@ -3654,7 +3720,7 @@ export function createUnread({
       if (!closed && repairAgain) void repair("foreground", catchingUp);
     });
     publish();
-    return refresh;
+    return settled();
   }
   // Marked messages already asked for this session, found or not.
   const askedHomes = new Set<string>();
@@ -4118,7 +4184,7 @@ export function createUnread({
       };
     },
     ensure: () =>
-      refresh ?? (requested ? Promise.resolve() : repair("foreground", true)),
+      settled() ?? (requested ? Promise.resolve() : repair("foreground", true)),
     refresh: async () => {
       await reads.refresh("foreground");
       await repair();

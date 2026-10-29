@@ -857,17 +857,18 @@ it.each(["clear", "dispose", "revoke", "join"])(
       h.receive([roster(h.relay, "new-room", [h.viewer.pubkey], 20)]);
     else h.receive([roster(h.relay, "other", [], 20)]);
     held.release();
-    await repair;
     if (boundary === "clear" || boundary === "dispose") {
+      await repair;
       expect(windows()).toHaveLength(2);
       expect(h.snapshot().observedCount).toBeNull();
       return;
     }
-    // The abandoned read starts over against the current membership.
+    // The abandoned read starts over against the current membership once
+    // the late chunks have landed, and the launch's wait settles with it.
     await vi.waitFor(() => expect(windows()).toHaveLength(4));
     expect(h.snapshot().observedCount).toBeNull();
     fresh.release();
-    await h.session.unread.ensure();
+    await repair;
     const reread = windows().slice(2).flat();
     if (boundary === "join") {
       expect(reread).toContain("new-room");

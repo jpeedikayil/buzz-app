@@ -356,6 +356,40 @@ it("admits an unread repair batch of up to 128 content filters, and nothing shap
   await rejected;
 });
 
+it("admits an unread repair batch of edits and deletions read by up to 100 event IDs each, within the request budget, and nothing shaped otherwise", async () => {
+  const { read, next, pending } = setup();
+  const ids = (i: number, length = 100) =>
+    Array.from({ length }, (_, j) =>
+      (i * 100 + j).toString(16).padStart(64, "0"),
+    );
+  const filter = (i: number, length?: number): ReadFilter => ({
+    kinds: [40003, 5, 9005],
+    "#e": ids(i, length),
+    since: 1000,
+    limit: 500,
+  });
+  const batch = Array.from({ length: 9 }, (_, i) => filter(i));
+  const result = read(batch);
+  expect(next().filters).toHaveLength(9);
+  for (const invalid of [
+    Array.from({ length: 129 }, (_, i) => filter(i, 1)),
+    batch.map((f) => ({ ...f, kinds: [5] })),
+    batch.map((f) => ({ ...f, "#e": [...(f["#e"] ?? []), "f".repeat(64)] })),
+    batch.map(({ since: _since, ...f }) => f),
+    batch.map((f) => ({ ...f, include_aux: true })),
+    batch.map((f) => ({ ...f, "#h": ["team"] })),
+    batch.map((f) => ({ ...f, until: 2000 })),
+  ] as ReadFilter[][])
+    await expect(read(invalid)).rejects.toThrow("1–4 filters");
+  await expect(read([...batch, filter(9)])).rejects.toThrow(
+    "Relay filters exceed the request budget",
+  );
+  expect(pending).toHaveLength(0);
+  const rejected = expect(result).rejects.toMatchObject({ name: "AbortError" });
+  owners.at(-1)?.dispose();
+  await rejected;
+});
+
 it("admits only the bounded workflow batch exception without relaxing other read budgets", async () => {
   const { read, next, pending } = setup();
   const batch = Array.from({ length: 128 }, (_, i) => ({

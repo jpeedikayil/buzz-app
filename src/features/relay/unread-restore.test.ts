@@ -897,29 +897,30 @@ it("a full window's cut is its own limit-th match, and a deletion made while clo
   expect(await saved(late.memory)).not.toContain(oldest.id);
   expect(await saved(late.memory)).not.toContain(removal.id);
   late.warm.owner.dispose();
-  // More edits and deletions since the mark than that read reads: the
-  // evidence no read of the pass returned is dropped, as a launch without
-  // the record would not show it, what the reads returned stays, and the
-  // roster sample moves the mark, so the restored evidence owes no second
-  // read.
+  // More edits and deletions since the mark than that read reads: those of
+  // the restored evidence no read of the pass returned are read by ID, which
+  // returns this deletion, the rest stays, and the roster sample moves the
+  // mark, so the restored evidence owes no second read.
   const edits = Array.from({ length: 1001 }, (_, i) =>
     hashed("team", T + 200 + i, 40003, [["e", "f".repeat(64)]]),
   );
   const overflow = await relaunch(stale, edits);
-  expect(
-    overflow.warm.reader.read.mock.calls.filter(([filters]) =>
-      filters.some((filter) => filter.kinds?.join() === "40003,5,9005"),
-    ),
-  ).toHaveLength(2);
+  const overlays = overflow.warm.reader.read.mock.calls.filter(([filters]) =>
+    filters.some((filter) => filter.kinds?.join() === "40003,5,9005"),
+  );
+  expect(overlays).toHaveLength(3);
+  expect(new Set(overlays[2]?.[0][0]?.["#e"])).toEqual(
+    new Set(unread.slice(0, 30).map(({ id }) => id)),
+  );
   expect((await overflow.memory.read())?.mark).toEqual({
     at: T + 50_499,
     checked: SECONDS,
   });
-  expect(overflow.warm.count("team")).toBe(100);
+  expect(overflow.warm.count("team")).toBe(129);
   expect(await saved(overflow.memory)).toEqual(
-    expect.arrayContaining([mine, ...unread.slice(30)].map(({ id }) => id)),
+    expect.arrayContaining(unread.slice(1).map(({ id }) => id)),
   );
-  expect(await saved(overflow.memory)).not.toContain(unread[29]?.id);
+  expect(await saved(overflow.memory)).not.toContain(oldest.id);
 });
 
 it("a root a lookup fetched stays structure on every relaunch: it groups the mention and never counts", async () => {
@@ -1631,6 +1632,22 @@ it("a chunk still full at six delta pages leaves the pass to the bootstrap, whos
   expect((await deltaPages(h)).map((page) => page.length)).toEqual([
     500, 500, 500, 500, 500, 500,
   ]);
+  // The delta's pages carried the edits and deletions they reached: the
+  // read of them the sample needs starts where the pages stopped.
+  expect(
+    h.reader.read.mock.calls.flatMap(([filters]) =>
+      filters.filter((filter) => filter.kinds?.join() === "40003,5,9005"),
+    ),
+  ).toEqual([
+    {
+      kinds: [40003, 5, 9005],
+      "#h": ["team"],
+      since: at - 1865,
+      limit: 500,
+      until: at - 1864,
+      before_id: store[1]?.id,
+    },
+  ]);
   await h.saved;
   expect((await storage.read())?.mark).toEqual({
     at: newest,
@@ -1815,26 +1832,34 @@ it("a held message deleted since the mark is read gone by a bootstrap before its
 const overlayRead = (filters: readonly ReadFilter[]) =>
   filters.some((filter) => filter.kinds?.join() === "40003,5,9005");
 
-it("more edits and deletions since a stale mark than the bootstrap reads forget what no read of the pass returned, and the roster sample moves the mark, so the next pass catches up", async () => {
+const byIdRead = (filters: readonly ReadFilter[]) =>
+  overlayRead(filters) && filters.some((filter) => !!filter["#e"]);
+
+it("more edits and deletions since a stale mark than the bootstrap reads have those of the held content no read returned read by ID: a deletion applies, an unread message past its window's cut stays, and the mark moves once that read lands", async () => {
   const at = T + 10_000;
   // Confirmed over a day ago: the launch reads the bootstrap.
   const storage = await marked({ at, checked: SECONDS - 86_401 });
-  // Held before the pass, read, and deleted by the oldest of more edits and
-  // deletions since the mark than the read of them reaches.
-  const old = hashed("team", at - 1000);
+  // Unread, held before the pass, and past the cut of the channel's window
+  // and the roster sample: one deleted by the oldest of more edits and
+  // deletions since the mark than the read of them reaches, and a mention.
+  const old = hashed("team", at + 1);
+  const mention = hashed("team", at + 2, 9, [["p", viewer]]);
   const removal = hashed("team", at - 1865, 5, [["e", old.id]]);
   const noise = Array.from({ length: 1000 }, (_, i) =>
     hashed("team", at - 1864 + i, 5, [["e", "f".repeat(64)]]),
   );
-  // Unread, in the channel's window.
-  const kept = hashed("team", at + 500);
+  // What the window returns.
+  const newer = Array.from({ length: 100 }, (_, i) =>
+    hashed("team", at + 500 + i),
+  );
+  let failing = true;
   const h = await launch({
-    store: [old, removal, ...noise, kept, ...busy],
+    store: [old, mention, removal, ...noise, ...newer, ...busy],
     storage,
     frontiers: { ...BUSY_READ, team: at },
+    fail: (filters) => failing && byIdRead(filters),
   });
-  h.owner.accept([old]);
-  expect(h.owner.event(old.id)).toBeDefined();
+  h.owner.accept([old, mention]);
   const save = vi.spyOn(storage, "save");
   const { release, waiting } = h.hold();
   const launched = h.owner.capability.ensure();
@@ -1845,13 +1870,44 @@ it("more edits and deletions since a stale mark than the bootstrap reads forget 
   release();
   await launched;
   await save.mock.results.at(-1)?.value;
-  expect(
-    h.reader.read.mock.calls.filter(([filters]) => overlayRead(filters)),
-  ).toHaveLength(2);
-  expect(h.owner.event(old.id)).toBeUndefined();
-  expect(h.owner.event(kept.id)).toBeDefined();
-  expect(h.owner.event(live.id)).toBeDefined();
-  expect(h.count("team")).toBe(2);
+  const mentioned = () =>
+    h.owner.capability
+      .inbox()
+      .items.some((item) => item.messageIds.includes(mention.id));
+  // That read dropped: nothing is forgotten, and the mark stays.
+  const sent = h.reader.read.mock.calls.map(([filters]) => filters);
+  expect(sent.filter(overlayRead)).toHaveLength(4);
+  expect(sent.filter(byIdRead)).toEqual([
+    [
+      {
+        kinds: [40003, 5, 9005],
+        "#e": [old.id, mention.id],
+        since: at - 1865,
+        limit: 500,
+      },
+    ],
+    [
+      {
+        kinds: [40003, 5, 9005],
+        "#e": [old.id, mention.id],
+        since: at - 1865,
+        limit: 500,
+      },
+    ],
+  ]);
+  expect(h.count("team")).toBe(103);
+  expect(mentioned()).toBe(true);
+  expect((await storage.read())?.mark).toEqual({
+    at,
+    checked: SECONDS - 86_401,
+  });
+  // Landed, it returns the deletion, which applies; the rest stays.
+  failing = false;
+  await h.owner.capability.refresh();
+  await save.mock.results.at(-1)?.value;
+  expect(h.owner.event(removal.id)).toBeDefined();
+  expect(h.count("team")).toBe(102);
+  expect(mentioned()).toBe(true);
   expect((await storage.read())?.mark).toEqual({
     at: T + 50_499,
     checked: SECONDS,
@@ -1863,10 +1919,107 @@ it("more edits and deletions since a stale mark than the bootstrap reads forget 
     expect.objectContaining({ since: T + 50_499 - 1865, until: T + 50_000 }),
   ]);
   expect(next.filter((filter) => overlayRead([filter]))).toEqual([]);
-  expect((await storage.read())?.mark).toEqual({
-    at: T + 50_499,
-    checked: SECONDS,
+  expect(h.count("team")).toBe(102);
+  expect(mentioned()).toBe(true);
+});
+
+it("of the reads by ID sharing a request, a full one pages on below the newest it matches, so another's older match does not skip a deletion it did not return", async () => {
+  const at = T + 10_000;
+  const since = at - 1865;
+  const storage = await marked({ at, checked: SECONDS - 86_401 });
+  // Unread past the window's cut and outside the roster sample: read by ID
+  // in two filters, the first of 100 and the second of one.
+  const held = Array.from({ length: 101 }, (_, i) =>
+    hashed("team", at + 1 + i),
+  );
+  const newer = Array.from({ length: 100 }, (_, i) =>
+    hashed("team", at + 500 + i),
+  );
+  // The first filter's 500 newest matches, then a deletion below them; the
+  // second's one match is older still and matches the first too.
+  const fill = Array.from({ length: 500 }, (_, i) =>
+    hashed("team", since + 2 + i, 5, [["e", held[0]?.id ?? ""]]),
+  );
+  const hidden = hashed("team", since + 1, 5, [["e", held[50]?.id ?? ""]]);
+  const cross = hashed("team", since, 5, [
+    ["e", held[1]?.id ?? ""],
+    ["e", held[100]?.id ?? ""],
+  ]);
+  // Newer than all of those, more than the read by channel reaches.
+  const noise = Array.from({ length: 1000 }, (_, i) =>
+    hashed("team", since + 502 + i, 5, [["e", "f".repeat(64)]]),
+  );
+  const h = await launch({
+    store: [...held, ...newer, ...fill, hidden, cross, ...noise, ...busy],
+    storage,
+    frontiers: { ...BUSY_READ, team: at },
   });
+  h.owner.accept(held);
+  await h.owner.capability.ensure();
+  const byId = h.reader.read.mock.calls
+    .map(([filters]) => filters)
+    .filter(byIdRead);
+  expect(byId[0]?.map((filter) => filter["#e"]?.length)).toEqual([100, 1]);
+  expect(h.owner.event(hidden.id)).toBeDefined();
+  expect(h.count("team")).toBe(197);
+});
+
+it("unread messages in a channel whose window dropped beside a busy one's edits and deletions stay until the window is read again", async () => {
+  const at = T + 10_000;
+  // Past the 127 windows riding with the viewer's authored page.
+  const extra = Array.from({ length: 126 }, (_, i) => `c${i}`);
+  const storage = await marked({ at, checked: SECONDS - 86_401 }, [
+    ...ROSTER,
+    ...extra,
+  ]);
+  // More than one request's reads by ID cover.
+  const unread = Array.from({ length: 1000 }, (_, i) =>
+    hashed("team", at + 1 + i),
+  );
+  const noise = Array.from({ length: 1001 }, (_, i) =>
+    hashed("team", at - 1864 + i, 5, [["e", "f".repeat(64)]]),
+  );
+  let failing = true;
+  const h = await launch({
+    store: [...unread, ...noise, ...busy],
+    storage,
+    roster: summaries([...ROSTER, ...extra]),
+    frontiers: {
+      ...BUSY_READ,
+      team: at,
+      ...Object.fromEntries(extra.map((id) => [id, T + 20_000])),
+    },
+    fail: (filters) => failing && filters.some(windowOf("team")),
+  });
+  h.owner.accept(unread);
+  await h.owner.capability.ensure();
+  const sent = h.reader.read.mock.calls.map(([filters]) => filters);
+  expect(
+    sent
+      .filter((filters) => filters.some(windowOf("team")))
+      .every((filters) => !filters.some((filter) => filter.authors)),
+  ).toBe(true);
+  // Each within the reader's 64 KiB of filters, together every one.
+  const byId = sent.filter(byIdRead);
+  expect(
+    byId.every(
+      (filters) =>
+        new TextEncoder().encode(JSON.stringify(filters)).byteLength <=
+        64 * 1024,
+    ),
+  ).toBe(true);
+  expect(
+    byId
+      .flat()
+      .flatMap((filter) => filter["#e"] ?? [])
+      .sort(),
+  ).toEqual(unread.map((item) => item.id).sort());
+  expect(h.owner.capability.inbox().partial).toBe(true);
+  expect(h.count("team")).toBe(1000);
+  failing = false;
+  await h.reconnected();
+  expect(h.owner.capability.inbox().partial).toBeUndefined();
+  expect(h.count("team")).toBe(1000);
 });
 
 // What the mark does not cover is read once beside the delta (design §3.6).
@@ -2159,6 +2312,82 @@ it("Refresh pressed while a pass catches up has the bootstrap read after it, and
     .flatMap(([filters]) => filters);
   expect(sent.filter(deltaFilter)).toHaveLength(1);
   expect(sent.filter(windowOf("team"))).toHaveLength(3);
+});
+
+it("Refresh pressed while a pass asked to catch up reads the bootstrap joins it, and one pressed before that pass routes has it read the bootstrap", async () => {
+  const store = [hashed("team", SECONDS - 300)];
+  // A mark confirmed over a day ago: the launch's pass reads the bootstrap.
+  const stale = await launch({
+    store,
+    storage: await marked({ at: SECONDS - 600, checked: SECONDS - 86_401 }),
+  });
+  const { release, waiting } = stale.hold();
+  let pressed: Promise<void> | undefined;
+  try {
+    const syncing = vi.spyOn(stale.reads, "refresh");
+    const launched = stale.owner.capability.ensure();
+    await waiting;
+    pressed = stale.owner.capability.refresh();
+    await Promise.all(syncing.mock.results.map(({ value }) => value));
+    release();
+    await launched;
+  } finally {
+    release();
+  }
+  await pressed;
+  const sent = stale.reader.read.mock.calls.flatMap(([filters]) => filters);
+  expect(sent.filter(deltaFilter)).toEqual([]);
+  expect(sent.filter(sampleFilter)).toHaveLength(1);
+  stale.owner.dispose();
+  // A mark confirmed a minute ago, read before the launch's pass routes.
+  const fresh = await marked({ at: SECONDS - 600, checked: SECONDS - 60 });
+  let open = () => {};
+  const opened = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  const h = await launch({
+    store,
+    storage: {
+      ...fresh,
+      read: () => opened.then(() => fresh.read()),
+    },
+  });
+  const syncing = vi.spyOn(h.reads, "refresh");
+  const launched = h.owner.capability.ensure();
+  pressed = h.owner.capability.refresh();
+  await Promise.all(syncing.mock.results.map(({ value }) => value));
+  open();
+  await Promise.all([launched, pressed]);
+  const routed = h.reader.read.mock.calls.flatMap(([filters]) => filters);
+  expect(routed.filter(deltaFilter)).toEqual([]);
+  expect(routed.filter(sampleFilter)).toHaveLength(1);
+});
+
+it("a pass an access change retires settles a launch's wait only once the pass after it has read", async () => {
+  const h = await launch({
+    store: [post(peerKey, "fresh", T + 10)],
+    storage: memoryUnreadStorage(),
+  });
+  const first = h.hold();
+  let launched: Promise<void> | undefined;
+  try {
+    launched = h.owner.capability.ensure();
+    await first.waiting;
+    h.roster(summaries([...ROSTER, "fresh"]));
+    // The pass after it holds at its first read, past the retired one's end.
+    const next = h.hold();
+    first.release();
+    try {
+      await next.waiting;
+    } finally {
+      next.release();
+    }
+  } finally {
+    first.release();
+  }
+  await launched;
+  expect(h.owner.capability.inbox().freshness).toBe("observed");
+  expect(h.count("fresh")).toBe(1);
 });
 
 it("a resume launch whose cached roster is confirmed unchanged catches up with the delta, reading no channel once", async () => {

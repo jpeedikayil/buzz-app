@@ -1552,10 +1552,12 @@ export const test = base.extend({
           )
           .filter(
             (event) =>
-              filter.until === undefined ||
-              event.created_at < filter.until ||
-              (event.created_at === filter.until &&
-                event.id > filter.before_id),
+              (filter.since === undefined ||
+                event.created_at >= filter.since) &&
+              (filter.until === undefined ||
+                event.created_at < filter.until ||
+                (event.created_at === filter.until &&
+                  event.id > filter.before_id)),
           )
           .toSorted(
             (a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id),

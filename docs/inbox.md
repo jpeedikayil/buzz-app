@@ -177,10 +177,12 @@ that fails verification, goes to it straight away. Either way the full repair
 moves the point then: once it has read the newest events across the roster and every thread
 and the viewer's own recent messages it asked for and, after an earlier
 point, the edits and deletions since it in every channel holding events, so a
-message deleted meanwhile is not kept past it. When those edits and deletions
-are more than it reads, the events held in those channels that none of its
-reads returned are dropped instead, as a device without them would not show
-them, and the point still moves. A catch-up whose read fails leaves the point
+message deleted meanwhile is not kept past it; after a catch-up that stopped
+short, only those it did not reach. When those edits and deletions are more
+than it reads, it reads instead those of each event held in those channels
+that none of its reads returned, and applies them, so nothing is dropped that
+was not deleted. The point moves once that read lands and stays where it was
+when it fails. A catch-up whose read fails leaves the point
 where it was and the Inbox saying some recent activity could not be checked;
 the next check reads it again. Live events never move the point. The record
 keeps which channels that point covers: those read up to it, and those whose
@@ -198,7 +200,8 @@ whose read failed—is read whole once, and one that leaves those 50, is
 unfollowed or loses its channel's coverage is read whole again when it
 returns. The full repair still runs beside these reads, so for now they
 repeat some of its own. Refresh always runs the full repair: pressed while a
-catch-up runs, it runs once that ends. The full repair also reads the
+catch-up runs, it runs once that ends, and pressed before a check has chosen
+to catch up, that check runs it instead. The full repair also reads the
 deletions made since that point in the channels holding restored events the
 repair's reads did not return. If those deletions are more than it reads, or
 the record never caught up, those restored events are dropped, as a device

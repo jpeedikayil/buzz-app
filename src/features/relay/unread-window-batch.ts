@@ -2,6 +2,8 @@ import type { ReadFilter } from "./events.ts";
 
 /** Content kinds the unread owner observes: messages, agent posts and files. */
 export const UNREAD_CONTENT_KINDS: readonly number[] = [9, 40002, 40008];
+/** Edit and deletion kinds the unread owner applies to that content. */
+export const UNREAD_OVERLAY_KINDS: readonly number[] = [40003, 5, 9005];
 /** Filters per unread repair request: every joined channel's window, the
  * viewer's authored page and the viewer's thread reads ride together, so the
  * repair costs one or two round trips instead of one per four channels. */
@@ -18,16 +20,21 @@ const keysAre = (filter: object, names: readonly string[]) => {
   const keys = Object.keys(filter);
   return keys.length === names.length && names.every((n) => keys.includes(n));
 };
+const kindsAre = (kinds: unknown, expected: readonly number[]) =>
+  Array.isArray(kinds) &&
+  kinds.length === expected.length &&
+  expected.every((kind) => kinds.includes(kind));
 
 /** An unread repair request, exempt from the four-filters-per-read rule the
- * reader and hosts otherwise enforce: up to UNREAD_WINDOW_BATCH content-kind
- * filters with `include_aux`, each one of the repair's shapes — a channel
- * window (`#h` of one channel, `since`), the viewer's authored page
+ * reader and hosts otherwise enforce: up to UNREAD_WINDOW_BATCH filters, each
+ * one of the repair's shapes. Content-kind filters with `include_aux`: a
+ * channel window (`#h` of one channel, `since`), the viewer's authored page
  * (`authors` of one key, at most once, `since` the last walk or none), a
  * thread read (`#h` of one channel and up to 100 `#e` roots read whole, or
  * one root `since` the thread's newest time) or a fetch of up to 100 `ids`
- * with the same `limit`. The relay honours each filter's own limit, which
- * keeps the events one request returns bounded. */
+ * with the same `limit`. Or the edits and deletions of up to 100 held events
+ * (`#e`) since a time. The relay honours each filter's own limit, which keeps
+ * the events one request returns bounded. */
 export function isUnreadWindowBatch(value: unknown): boolean {
   if (
     !Array.isArray(value) ||
@@ -41,13 +48,24 @@ export function isUnreadWindowBatch(value: unknown): boolean {
     if (
       !filter ||
       typeof filter !== "object" ||
-      !Array.isArray(filter.kinds) ||
-      filter.kinds.length !== UNREAD_CONTENT_KINDS.length ||
-      !UNREAD_CONTENT_KINDS.every((kind) => filter.kinds?.includes(kind)) ||
-      filter.include_aux !== true ||
       !Number.isInteger(filter.limit) ||
       (filter.limit as number) < 1 ||
       (filter.limit as number) > 500
+    )
+      return false;
+    const since =
+      filter.since === undefined ||
+      (Number.isInteger(filter.since) && filter.since >= 0);
+    if (keysAre(filter, ["kinds", "#e", "since", "limit"]))
+      return (
+        kindsAre(filter.kinds, UNREAD_OVERLAY_KINDS) &&
+        hexes(filter["#e"], 100) &&
+        filter.since !== undefined &&
+        since
+      );
+    if (
+      !kindsAre(filter.kinds, UNREAD_CONTENT_KINDS) ||
+      filter.include_aux !== true
     )
       return false;
     const channel = filter["#h"];
@@ -56,9 +74,6 @@ export function isUnreadWindowBatch(value: unknown): boolean {
       channel.length === 1 &&
       typeof channel[0] === "string" &&
       CHANNEL_ID.test(channel[0]);
-    const since =
-      filter.since === undefined ||
-      (Number.isInteger(filter.since) && filter.since >= 0);
     const shape = (names: readonly string[]) =>
       keysAre(filter, names) ||
       (filter.since !== undefined && keysAre(filter, [...names, "since"]));

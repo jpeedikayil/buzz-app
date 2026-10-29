@@ -393,6 +393,28 @@ export function policyRelay({
             filters.flatMap((filter) => answer(community, filter)),
           );
         }
+        // Unread repair: the edits and deletions of held events no read of the
+        // pass returned, by ID, up to 128 filters per request
+        // (`isUnreadWindowBatch`).
+        if (
+          filters.every(
+            (filter) =>
+              filter.kinds?.join() === "40003,5,9005" &&
+              filter["#e"] &&
+              !filter["#h"],
+          )
+        ) {
+          expect(filters.length).toBeLessThanOrEqual(128);
+          const community = communityOf(url);
+          for (const filter of filters) {
+            expect(filter["#e"].length).toBeLessThanOrEqual(100);
+            expect(filter.since).toEqual(expect.any(Number));
+            report.queries.push({ community, filter, at: performance.now() });
+          }
+          return Response.json(
+            filters.flatMap((filter) => answer(community, filter)),
+          );
+        }
         // Unread conversation lookup: missing parents by ID, and the viewer's
         // replies to undecided parents in one channel.
         if (
