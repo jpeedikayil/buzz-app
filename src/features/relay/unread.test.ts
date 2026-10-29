@@ -3058,6 +3058,58 @@ it("of a sender's edits of a message only the newest is held: an older one arriv
   expect(preview()).toBe("original");
 });
 
+it.each(["apart", "together"])(
+  "a deleted edit is not the held one: the edit before a sender's newest, read %s with it and its deletion, is held and shown, as the thread shows it",
+  (variant) => {
+    const h = setup();
+    h.grant("room");
+    const row = message(h.alice, "room", "original", 20, [
+      ["p", h.viewer.pubkey],
+    ]);
+    const edit = (content: string, created_at: number) =>
+      signed(h.alice, {
+        kind: 40003,
+        created_at,
+        content,
+        tags: [
+          ["h", "room"],
+          ["e", row.id],
+        ],
+      });
+    const preview = () => h.session.unread.inbox().items[0]?.preview;
+    const previous = edit("previous", 21);
+    const newest = edit("newest", 22);
+    const deletion = signed(h.alice, {
+      kind: 5,
+      created_at: 23,
+      content: "",
+      tags: [
+        ["h", "room"],
+        ["e", newest.id],
+      ],
+    });
+    if (variant === "apart") {
+      // The newest retires the one before it, is deleted, and the one
+      // before it is read again.
+      h.emit([row, previous]);
+      h.emit([newest]);
+      h.emit([deletion]);
+      expect(preview()).toBe("original");
+      h.emit([previous]);
+    } else {
+      // As a relaunch restores them, or a read returns them: the deleted
+      // edit retires nothing.
+      h.emit([row]);
+      h.emit([previous, newest, deletion]);
+    }
+    expect(preview()).toBe("previous");
+    // The deleted edit stays beside its deletion, so read again alone it
+    // does not show, and an older edit still does not displace the held one.
+    h.emit([newest, edit("older", 20)]);
+    expect(preview()).toBe("previous");
+  },
+);
+
 it("inbox keeps unresolved mentions exact, joins a verified root, and never clears unrelated roots", async () => {
   const h = setup();
   h.grant("room");

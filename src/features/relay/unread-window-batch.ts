@@ -33,7 +33,8 @@ const kindsAre = (kinds: unknown, expected: readonly number[]) =>
  * thread read (`#h` of one channel and up to 100 `#e` roots read whole, or
  * one root `since` the thread's newest time) or a fetch of up to 100 `ids`
  * with the same `limit`. Or the edits and deletions of up to 100 held events
- * (`#e`) since a time. The relay honours each filter's own limit, which keeps
+ * (`#e`) since a time, from where an earlier read of them stopped (`until`
+ * with `before_id`) or not. The relay honours each filter's own limit, which keeps
  * the events one request returns bounded. */
 export function isUnreadWindowBatch(value: unknown): boolean {
   if (
@@ -56,7 +57,18 @@ export function isUnreadWindowBatch(value: unknown): boolean {
     const since =
       filter.since === undefined ||
       (Number.isInteger(filter.since) && filter.since >= 0);
-    if (keysAre(filter, ["kinds", "#e", "since", "limit"]))
+    const resumed =
+      keysAre(filter, [
+        "kinds",
+        "#e",
+        "since",
+        "until",
+        "before_id",
+        "limit",
+      ]) &&
+      Number.isInteger(filter.until) &&
+      hexes([filter.before_id], 1);
+    if (resumed || keysAre(filter, ["kinds", "#e", "since", "limit"]))
       return (
         kindsAre(filter.kinds, UNREAD_OVERLAY_KINDS) &&
         hexes(filter["#e"], 100) &&

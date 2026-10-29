@@ -155,8 +155,9 @@ next one would read of what is held, every unread or undecided row, and what
 those rows depend on—roots, parents, the viewer's own messages in their
 threads, edits and deletions—up to 2,048 events and 4 MiB, beyond which it
 keeps none. Of each sender's edits of a message the device holds and keeps
-only the newest, so when that edit is deleted the message shows its original
-text or another sender's edit, not the edit before it. A root or parent
+only the newest that is not deleted, beside any newer one that is; when the
+newest is deleted, the message shows the edit before it once a read returns
+it, and its original text until then. A root or parent
 fetched only to group replies, by a lookup or a thread read, counts only once
 a channel's window or the newest events across the roster return it, and is
 restored as such. A launch verifies the events
@@ -189,7 +190,9 @@ than it reads too, it reads on in halves, down to single events, and for one
 event its newest edits, with any deletion made after them, are enough. The
 point moves once that read lands. When it fails, or would need too many
 halves, the point stays where it was and the Inbox says some recent activity
-could not be checked until the next check reads it again. A catch-up whose
+could not be checked until a later check finishes it: the next goes on from
+where that read stopped, and reads again of what it finished only what may
+have arrived since. A catch-up whose
 read fails leaves the point
 where it was and the Inbox saying some recent activity could not be checked;
 the next check reads it again. Live events never move the point. The record

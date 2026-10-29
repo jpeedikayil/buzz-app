@@ -1920,7 +1920,8 @@ export function createUnread({
   // at its last page reads on in halves (see `scanner`), HALVES at most a
   // read: enough to take one 100-ID filter down to single IDs (198), each
   // DELETION_PAGES pages, so the halves add at most 400 requests. A read
-  // needing more is dropped there, its queued requests unread.
+  // needing more is dropped there, its queued requests unread, and the next
+  // pass resumes it (see `byIdReads`).
   const DELTA_LOOKBACK = 900 + 960 + 5;
   const DELTA_PAGE = 500;
   const DELTA_PAGES = 6;
@@ -2306,6 +2307,61 @@ export function createUnread({
     if (owed?.since !== undefined && since <= owed.since)
       for (const id of ids) owed.covered.add(id);
   }
+  /** A read by ID that dropped (see `vouch`), for the next to resume: the
+   * mark it was read for, the newest time its pass read before it, the IDs
+   * it read, and each of its filters not read to its end, from where it
+   * stopped. Kept for the session only. */
+  let resumable:
+    | {
+        mark: UnreadMark;
+        top: number;
+        ids: Set<string>;
+        rest: readonly ReadFilter[];
+      }
+    | undefined;
+  /** The reads by ID of `ids`' edits and deletions since `since`. After one
+   * that dropped for the same mark (one that moved, or `clear()`, leaves
+   * none), they resume it, so a read capped at HALVES goes on from there
+   * and is not read again whole each pass: the filters it did not read to
+   * their end go on from where they stopped; its IDs are read again only
+   * since its pass's newest time less DELTA_LOOKBACK, which any edit or
+   * deletion committed after that read began is newer than (the relay's
+   * 900 s future tolerance and 960 s commit floor); IDs it did not read are
+   * read from `since`. An ID held since keeps the edits and deletions read
+   * with it, which go only with their target; one admitted again since
+   * (evicted, forgotten or its channel left in between) is read from
+   * `since` (see `accept`). Nothing is resumed when that newest time less
+   * the lookback is no later than `since`. */
+  function byIdReads(ids: readonly string[], since: number, prior: UnreadMark) {
+    const reads = (group: readonly string[], from: number) =>
+      chunk(group, 100).map(
+        (part): ReadFilter => ({
+          kinds: overlayKinds,
+          "#e": part,
+          since: from,
+          limit: DELTA_PAGE,
+        }),
+      );
+    const last = resumable?.mark === prior ? resumable : undefined;
+    const after = (last?.top ?? 0) - DELTA_LOOKBACK;
+    if (!last || after <= since) return reads(ids, since);
+    const held = new Set(ids);
+    return [
+      ...last.rest.flatMap((filter) => {
+        const part =
+          filter["#e"]?.filter((id) => held.has(id) && last.ids.has(id)) ?? [];
+        return part.length ? [{ ...filter, "#e": part }] : [];
+      }),
+      ...reads(
+        ids.filter((id) => last.ids.has(id)),
+        after,
+      ),
+      ...reads(
+        ids.filter((id) => !last.ids.has(id)),
+        since,
+      ),
+    ];
+  }
   /** Whether the edits and deletions since `prior` less the lookback were
    * read for every roster channel holding evidence, so the roster sample may
    * confirm the mark past `prior`: the bootstrap's reads carry none, and a
@@ -2318,12 +2374,15 @@ export function createUnread({
    * `current` (returned by a read of the pass, or received while it ran) in
    * the chunks not read to their end, which `accept` applies as it does any.
    * The outcome: `read`, or `dropped` when a read was dropped, which holds
-   * the mark back for the next pass to retry. Undefined when retired. */
+   * the mark back for the next pass to retry, and the next read by ID
+   * resumes the one dropped (see `byIdReads`). `newest` is the newest time
+   * the pass read before it. Undefined when retired. */
   async function vouch(
     ids: readonly string[],
     prior: UnreadMark,
     current: (id: string) => boolean,
     rest: readonly ReadFilter[] | undefined,
+    newest: number | undefined,
     generation: number,
     priority: Priority,
   ) {
@@ -2369,21 +2428,19 @@ export function createUnread({
           ? [event.id]
           : [],
       );
+      const top = Math.max(newest ?? 0, reading?.newest() ?? 0);
       const byId = await scan(
-        chunk(unreturned, 100).map(
-          (part): ReadFilter => ({
-            kinds: overlayKinds,
-            "#e": part,
-            since,
-            limit: DELTA_PAGE,
-          }),
-        ),
+        byIdReads(unreturned, since, prior),
         DELETION_PAGES,
         generation,
         priority,
         OVERLAY_BATCH,
       );
       outcome = byId?.outcome();
+      resumable =
+        byId && outcome === "dropped"
+          ? { mark: prior, top, ids: new Set(unreturned), rest: byId.rest() }
+          : undefined;
     }
     if (!outcome) return;
     if (outcome === "read") cover(held, since);
@@ -3709,6 +3766,7 @@ export function createUnread({
                 (id) =>
                   returned.has(id) || (!before.has(id) && !unconfirmed.has(id)),
                 catching?.rest(),
+                Math.max(sampledNewest ?? 0, catching?.newest() ?? 0),
                 generation,
                 priority,
               )
@@ -3966,11 +4024,12 @@ export function createUnread({
       }
     }
   }
-  /** The fold shows a target's newest edit by an editor it allows (see
-   * `foldMessages`), so of one editor's edits of a target only the newest
-   * is held, and saved: a target edited thousands of times costs one event.
-   * When that edit is deleted, the target shows its own body or another
-   * editor's edit, not the edit before it. */
+  /** The fold shows a target's newest edit by an editor it allows that is
+   * not deleted (see `foldMessages`), so of one editor's edits of a target
+   * only the newest not deleted is held, and saved: a target edited
+   * thousands of times costs one event. A deleted edit newer than it stays
+   * beside its deletion, so it does not show when read again alone, and the
+   * edit before it is held once a read returns it. */
   const editKeys = (edit: RelayEvent) => [
     ...new Set(
       edit.tags.flatMap(([name, id]) =>
@@ -3985,15 +4044,36 @@ export function createUnread({
     indexed = false;
     const incoming = new Map(batch.map((event) => [event.id, event]));
     const owners = channelOwnership((id) => incoming.get(id) ?? events.get(id));
-    // The held edit of each target and editor (see `editKeys`), built once a
-    // batch carries an edit. An edit of several targets may stay held for
-    // one while a newer edit holds another.
+    // The edits a deletion retained or in this batch removes, and the held
+    // edit of each target and editor (see `editKeys`), built once a batch
+    // carries an edit. An edit of several targets may stay held for one
+    // while a newer edit holds another.
+    let removed: Set<string> | undefined;
+    const deletedEdits = () => {
+      if (!removed) {
+        removed = new Set();
+        for (const event of [...events.values(), ...batch])
+          if (event.kind === 5 || event.kind === 9005)
+            for (const [name, id] of event.tags) {
+              const target =
+                name === "e" && id
+                  ? (events.get(id) ?? incoming.get(id))
+                  : undefined;
+              if (
+                target?.kind === 40003 &&
+                deletionApplies(event, target, signingAuthority)
+              )
+                removed.add(target.id);
+            }
+      }
+      return removed;
+    };
     let edits: Map<string, RelayEvent> | undefined;
     const heldEdits = () => {
       if (!edits) {
         edits = new Map();
         for (const event of events.values())
-          if (event.kind === 40003)
+          if (event.kind === 40003 && !deletedEdits().has(event.id))
             for (const key of editKeys(event)) {
               const other = edits.get(key);
               if (!other || byTime(event, other) < 0) edits.set(key, event);
@@ -4030,7 +4110,8 @@ export function createUnread({
       if (!channels || [...channels].some((channel) => !allowed(channel)))
         continue;
       // An edit older than the held one of its editor is not admitted; one
-      // newer retires it first, freeing the room it takes.
+      // newer retires it first, freeing the room it takes, unless it is
+      // deleted, when it is kept beside its deletion and retires nothing.
       if (event.kind === 40003) {
         const held = heldEdits();
         const newest = editKeys(event).filter((key) => {
@@ -4041,20 +4122,21 @@ export function createUnread({
           superseded = true;
           continue;
         }
-        for (const key of newest) {
-          const other = held.get(key);
-          held.set(key, event);
-          if (
-            other &&
-            events.has(other.id) &&
-            !editKeys(other).some((rest) => held.get(rest) === other)
-          ) {
-            for (const channel of owners(other) ?? []) changed.add(channel);
-            events.delete(other.id);
-            bytes -= sizeOf(other);
-            superseded = true;
+        if (!deletedEdits().has(event.id))
+          for (const key of newest) {
+            const other = held.get(key);
+            held.set(key, event);
+            if (
+              other &&
+              events.has(other.id) &&
+              !editKeys(other).some((rest) => held.get(rest) === other)
+            ) {
+              for (const channel of owners(other) ?? []) changed.add(channel);
+              events.delete(other.id);
+              bytes -= sizeOf(other);
+              superseded = true;
+            }
           }
-        }
       }
       const size = sizeOf(event);
       const subject = auxiliaryKind(event) ? overlaid(event) : event;
@@ -4098,6 +4180,7 @@ export function createUnread({
       }
       events.set(event.id, event);
       bytes += size;
+      resumable?.ids.delete(event.id);
       // Later events in this batch see this one as retained.
       const channel =
         retained && contentKind(event) ? channelOf(event) : undefined;
@@ -4871,6 +4954,7 @@ export function createUnread({
       waiting = [];
       owed = undefined;
       owedDeletions = undefined;
+      resumable = undefined;
       mark = undefined;
       complete = false;
       covered.clear();

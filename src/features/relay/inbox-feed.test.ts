@@ -1532,9 +1532,9 @@ it("retained dependency closure checks live same-channel edit candidates of the 
     content: "",
     tags: [["e", removedEdit.id]],
   });
-  // All are already retained; the relay omits them from this finite query.
-  // Of each sender's edits of the target only the newest is held, so with
-  // the author's deleted the target shows its own body.
+  // All are already retained, the deletion last. Of each sender's edits of
+  // the target only the newest is held, so with the author's deleted the
+  // target shows its own body until a read returns the edit before it.
   h.live.receive([
     target,
     unrelated,
@@ -1543,25 +1543,39 @@ it("retained dependency closure checks live same-channel edit candidates of the 
     removedEdit,
     wrongAuthor,
     unrelatedEdit,
-    deletion,
   ]);
+  h.live.receive([deletion]);
   expect(rows(h)[0]?.preview).toBe("original");
   const filters: ReadFilter[] = [];
+  // The relay omits the deleted edit, and returns the author's others.
   h.query.mockImplementation(async ([filter]) => {
     if (!filter) return [];
     filters.push(filter);
-    return filter["#p"] ? [target] : [];
+    if (filter["#p"]) return [target];
+    return filter.kinds?.includes(40003) && filter.until === undefined
+      ? [newestEdit, originalEdit]
+      : [];
   });
   await h.session.inboxFeed.ensure();
   expect(filters.filter((filter) => filter["#e"])).toEqual([
     { kinds: [40003, 5, 9005], "#e": [target.id], limit: 500 },
-    { kinds: [5, 9005], "#e": [wrongAuthor.id], limit: 500 },
+    expect.objectContaining({
+      kinds: [40003, 5, 9005],
+      "#e": [target.id],
+      until: originalEdit.created_at,
+    }),
+    {
+      kinds: [5, 9005],
+      "#e": [originalEdit.id, newestEdit.id, wrongAuthor.id].sort(),
+      limit: 500,
+    },
   ]);
   expect(h.session.inboxFeed.snapshot()).toMatchObject({
     status: "ready",
     incomplete: [],
   });
-  expect(rows(h)[0]?.preview).toBe("original");
+  // As the thread shows it: the author's newest edit not deleted.
+  expect(rows(h)[0]?.preview).toBe("newest edit");
 });
 
 it.each(["edit", "delete"] as const)(

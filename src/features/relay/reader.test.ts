@@ -356,7 +356,7 @@ it("admits an unread repair batch of up to 128 content filters, and nothing shap
   await rejected;
 });
 
-it("admits an unread repair batch of edits and deletions read by up to 100 event IDs each, within the request budget, and nothing shaped otherwise", async () => {
+it("admits an unread repair batch of edits and deletions read by up to 100 event IDs each, from the start or from where a read stopped, within the request budget, and nothing shaped otherwise", async () => {
   const { read, next, pending } = setup();
   const ids = (i: number, length = 100) =>
     Array.from({ length }, (_, j) =>
@@ -371,6 +371,13 @@ it("admits an unread repair batch of edits and deletions read by up to 100 event
   const batch = Array.from({ length: 9 }, (_, i) => filter(i));
   const result = read(batch);
   expect(next().filters).toHaveLength(9);
+  const stopped = batch.map((f, i) => ({
+    ...f,
+    until: 2000 + i,
+    before_id: "a".repeat(64),
+  }));
+  const resumed = read(stopped);
+  expect(next().filters).toEqual(stopped);
   for (const invalid of [
     Array.from({ length: 129 }, (_, i) => filter(i, 1)),
     batch.map((f) => ({ ...f, kinds: [5] })),
@@ -379,13 +386,20 @@ it("admits an unread repair batch of edits and deletions read by up to 100 event
     batch.map((f) => ({ ...f, include_aux: true })),
     batch.map((f) => ({ ...f, "#h": ["team"] })),
     batch.map((f) => ({ ...f, until: 2000 })),
+    batch.map((f) => ({ ...f, before_id: "a".repeat(64) })),
+    stopped.map((f) => ({ ...f, before_id: "A".repeat(64) })),
+    stopped.map((f) => ({ ...f, until: 2000.5 })),
   ] as ReadFilter[][])
     await expect(read(invalid)).rejects.toThrow("1–4 filters");
   await expect(read([...batch, filter(9)])).rejects.toThrow(
     "Relay filters exceed the request budget",
   );
   expect(pending).toHaveLength(0);
-  const rejected = expect(result).rejects.toMatchObject({ name: "AbortError" });
+  const rejected = Promise.all(
+    [result, resumed].map((read) =>
+      expect(read).rejects.toMatchObject({ name: "AbortError" }),
+    ),
+  );
   owners.at(-1)?.dispose();
   await rejected;
 });

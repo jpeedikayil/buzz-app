@@ -394,13 +394,15 @@ export function policyRelay({
           );
         }
         // Unread repair: the edits and deletions of held events no read of the
-        // pass returned, by ID, up to 128 filters per request
-        // (`isUnreadWindowBatch`).
+        // pass returned, by ID since the mark, up to 128 filters per request
+        // (`isUnreadWindowBatch`). The Inbox feed's overlay read has the same
+        // kinds and no `since`; it is answered below.
         if (
           filters.every(
             (filter) =>
               filter.kinds?.join() === "40003,5,9005" &&
               filter["#e"] &&
+              filter.since !== undefined &&
               !filter["#h"],
           )
         ) {
@@ -408,7 +410,6 @@ export function policyRelay({
           const community = communityOf(url);
           for (const filter of filters) {
             expect(filter["#e"].length).toBeLessThanOrEqual(100);
-            expect(filter.since).toEqual(expect.any(Number));
             report.queries.push({ community, filter, at: performance.now() });
           }
           return Response.json(

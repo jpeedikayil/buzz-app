@@ -2198,6 +2198,112 @@ it("a read by ID that would need more than 200 halves is dropped there, nothing 
   });
 });
 
+it("a read by ID dropped at 200 halves is resumed by the next pass from where it stopped, its IDs read again only since that pass's newest less the lookback, which a deletion made since is newer than: the next pass reads it to its end in far fewer requests, the deletion applies, the mark moves and the notice clears", async () => {
+  const at = T + 10_000;
+  const since = at - 1865;
+  const storage = await marked({ at, checked: SECONDS - 86_401 });
+  // Unread past the window's cut and outside the roster sample, read by ID
+  // in 15 filters of 100, beside more edits and deletions than the read by
+  // channel reaches.
+  const held = Array.from({ length: 1500 }, (_, i) =>
+    hashed("team", at - 2000 + i),
+  );
+  const noise = Array.from({ length: 1000 }, (_, i) =>
+    hashed("team", since + i, 5, [["e", "f".repeat(64)]]),
+  );
+  const newer = Array.from({ length: 100 }, (_, i) =>
+    hashed("team", at + 500 + i),
+  );
+  const store = [...held, ...noise, ...newer, ...busy];
+  const h = await launch({
+    store,
+    storage,
+    frontiers: { ...BUSY_READ, team: at - 3000 },
+  });
+  // Each filter's first message is edited every second of the 10,000 since
+  // the mark, its others in the newest 1,000 alone, all before the roster's
+  // newest: halving takes each filter down to its first, 7 halvings a
+  // filter, 105 in all, more than the 100 a read makes.
+  const deep = new Set(held.flatMap((event, i) => (i % 100 ? [] : [event.id])));
+  const newest = since + 10_000;
+  const relay = h.reader.read.getMockImplementation();
+  assert(relay);
+  let made = 0;
+  const edits = (filter: ReadFilter) => {
+    const ids = filter["#e"] ?? [];
+    const top = Math.min(filter.until ?? newest, newest);
+    const floor = Math.max(
+      filter.since ?? 0,
+      ids.some((id) => deep.has(id)) ? since : newest - 1000,
+    );
+    return Array.from(
+      { length: Math.max(0, Math.min(filter.limit, top - floor)) },
+      (_, i): RelayEvent => ({
+        kind: 40003,
+        pubkey: peerKey.pubkey,
+        created_at: top - 1 - i,
+        content: "",
+        tags: [
+          ["h", "team"],
+          ["e", ids[0] ?? ""],
+        ],
+        id: (made++).toString(16).padStart(64, "0"),
+        sig: "0".repeat(128),
+        [verifiedSymbol]: true,
+      }),
+    );
+  };
+  h.reader.read.mockImplementation(async (filters) =>
+    byIdRead(filters)
+      ? [...(await relay(filters)), ...filters.flatMap(edits)]
+      : relay(filters),
+  );
+  const requests = () =>
+    h.reader.read.mock.calls.map(([filters]) => filters).filter(byIdRead);
+  h.owner.accept(held);
+  await h.owner.capability.ensure();
+  const first = requests();
+  expect(h.owner.capability.inbox().partial).toBe(true);
+  expect((await storage.read())?.mark).toEqual({
+    at,
+    checked: SECONDS - 86_401,
+  });
+  // Meanwhile one the dropped read had read to its end is deleted, as the
+  // relay's clock goes, behind more deletions than the read by channel
+  // reaches.
+  const target = held[1];
+  assert(target);
+  const gone = hashed("team", SECONDS - 500, 5, [["e", target.id]]);
+  store.push(
+    gone,
+    ...Array.from({ length: 1000 }, (_, i) =>
+      hashed("team", SECONDS - 400 + (i % 400), 5, [["e", "f".repeat(64)]]),
+    ),
+  );
+  const save = vi.spyOn(storage, "save");
+  await h.reconnected();
+  await save.mock.results.at(-1)?.value;
+  const second = requests().slice(first.length);
+  expect(h.owner.event(gone.id)).toBeDefined();
+  expect(h.count("team")).toBe(1599);
+  expect(h.owner.capability.inbox().partial).toBeUndefined();
+  expect((await storage.read())?.mark).toEqual({
+    at: T + 50_499,
+    checked: SECONDS,
+  });
+  // On from where the dropped read stopped, and its IDs again since the
+  // roster's newest less the lookback: nothing is read again from the top
+  // since the mark.
+  expect(second.flat().filter((filter) => filter.until === undefined)).toEqual(
+    first[0]?.concat(first[1] ?? []).map((filter) => ({
+      ...filter,
+      since: T + 50_499 - 1865,
+    })),
+  );
+  expect(first.length).toBeGreaterThan(200);
+  expect(second.length).toBeLessThan(first.length / 4);
+});
+
 it("on a roster of more than 128 channels holding evidence, only the chunks whose edits and deletions were not read to their end have their held content read by ID", async () => {
   const at = T + 10_000;
   const since = at - 1865;
