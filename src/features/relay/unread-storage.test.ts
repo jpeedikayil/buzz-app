@@ -178,15 +178,19 @@ const meta = (participation: unknown) => ({
   structure: [],
 });
 
-it("a record round-trips with its threads, walk mark, events and structure", async () => {
+it("a record round-trips with its threads, walk mark, events, structure, mark and absent roots", async () => {
   memoryIndexedDB();
   const events = [event("first"), event("second")];
   const structure = new Set([(events[0] as RelayEvent).id]);
+  const mark = { at: 1700, checked: 1800 };
+  const absent = new Set(["c".repeat(64)]);
   await browserUnreadStorage(scope).save({
     participation: threads,
     events,
     structure,
     complete: true,
+    mark,
+    absent,
   });
   // The next launch reads it through its own connection.
   await expect(browserUnreadStorage(scope).read()).resolves.toEqual({
@@ -194,6 +198,8 @@ it("a record round-trips with its threads, walk mark, events and structure", asy
     events: events.map(wire),
     structure,
     complete: true,
+    mark,
+    absent,
   });
   await browserUnreadStorage(scope).save({
     participation: { roots: new Map() },
@@ -288,6 +294,28 @@ it("a field added after the participation reads as incomplete when missing or ma
     structure: new Set([held.id]),
     complete: true,
   });
+  // A mark or absent roots that cannot be read are none: the record stays,
+  // and the next repair reads it whole.
+  for (const [mark, absent] of [
+    [{ at: 1.5, checked: 1800 }, "c".repeat(64)],
+    [{ at: 1700 }, [7]],
+    ["1700", ["c".repeat(65)]],
+    [null, Array.from({ length: 1025 }, () => "c".repeat(64))],
+  ]) {
+    idb.seed("meta", scope, {
+      ...meta(participation),
+      structure: [],
+      complete: true,
+      mark,
+      absent,
+    });
+    await expect(storage.read()).resolves.toEqual({
+      participation: { roots: new Map([["c0:root", { at: 1000 }]]) },
+      events: [held],
+      structure: none,
+      complete: true,
+    });
+  }
 });
 
 it("an oversized record is refused when saved, keeping the saved one, and reads as no record when stored", async () => {

@@ -1201,8 +1201,9 @@ it("a reconnect repair in which nothing lands keeps the observation stale instea
   });
   const count = h.query.mock.calls.length;
   h.reconnect();
-  // The window request and the roster sample beside it are each read twice,
-  // then dropped; nothing was observed.
+  // The delta since the mark is read twice, then dropped; the relay has
+  // stalled twice, so the window request and the roster sample beside it are
+  // read once each. Nothing was observed.
   await vi.waitFor(() =>
     expect(
       h.query.mock.calls

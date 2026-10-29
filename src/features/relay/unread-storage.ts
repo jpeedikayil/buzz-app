@@ -13,13 +13,20 @@ import {
  * owner re-verifies them, and one that fails discards them. `structure`
  * names the events kept only to group replies (roots and parents a lookup
  * fetched), which never count. `complete` says the events hold everything
- * the next warm repair would read. */
+ * the next warm repair would read. `mark` is the newest relay time the last
+ * catch-up that read every chunk of the roster returned, with when this
+ * device confirmed it, in its own clock's seconds; `absent` names roots the
+ * relay returned nothing for when asked by ID, so a deleted root does not
+ * leave the record incomplete. */
 export type UnreadRecord<Event = RelayEvent> = Readonly<{
   participation: ThreadParticipation;
   events: readonly Event[];
   structure: ReadonlySet<string>;
   complete: boolean;
+  mark?: UnreadMark;
+  absent?: ReadonlySet<string>;
 }>;
+export type UnreadMark = Readonly<{ at: number; checked: number }>;
 /** A save refused because the partition was purged during this storage's
  * session: nothing the session holds may be saved back. */
 export class UnreadRecordPurged extends Error {
@@ -51,6 +58,8 @@ type StoredMeta = {
   };
   structure?: string[];
   complete?: boolean;
+  mark?: { at: number; checked: number };
+  absent?: string[];
   /** The partition's last purge, kept by every record written after it. */
   purged?: string;
 };
@@ -65,12 +74,21 @@ function parseRoot(entry: unknown): [string, ThreadMark] | undefined {
   if (typeof newestId === "string" && newestId.length <= 64)
     return [key, { at, newestId }];
 }
+function parseMark(raw: unknown): UnreadMark | undefined {
+  const { at, checked } = (raw ?? {}) as { at?: unknown; checked?: unknown };
+  return time(at) && time(checked) ? { at, checked } : undefined;
+}
+const ids = (raw: unknown, bound: number): raw is string[] =>
+  Array.isArray(raw) &&
+  raw.length <= bound &&
+  raw.every((id) => typeof id === "string" && id.length <= 64);
 /** Storage is untrusted: a meta of another version or any malformed part of
  * its participation, or events beyond the bounds, read as no record. Fields
  * added later under this version read leniently instead, a missing or
  * malformed one as incomplete, so a record from an older build keeps its
- * threads and only owes a full repair; without `structure` no event can be
- * told apart from structure, so none is restored. Event validity is left to
+ * threads and only owes a full repair (a missing or malformed `mark` or
+ * `absent` reads as none); without `structure` no event can be told apart
+ * from structure, so none is restored. Event validity is left to
  * the owner's re-verification. */
 function parse(
   raw: unknown,
@@ -100,21 +118,24 @@ function parse(
   } catch {
     return;
   }
-  const { structure, complete } = raw as {
+  const { structure, complete, absent } = raw as {
     structure?: unknown;
     complete?: unknown;
+    absent?: unknown;
   };
-  const known =
-    Array.isArray(structure) &&
-    structure.length <= UNREAD_RECORD_EVENTS &&
-    structure.every((id) => typeof id === "string" && id.length <= 64);
+  const known = ids(structure, UNREAD_RECORD_EVENTS);
+  const mark = parseMark((raw as { mark?: unknown }).mark);
   return {
     participation: time(since)
       ? { roots: marks, walk: { since } }
       : { roots: marks },
     events: known ? events : [],
-    structure: new Set(known ? (structure as string[]) : []),
+    structure: new Set(known ? structure : []),
     complete: known && complete === true,
+    ...(mark ? { mark } : {}),
+    ...(ids(absent, THREAD_PARTICIPATION_LIMIT) && absent.length
+      ? { absent: new Set(absent) }
+      : {}),
   };
 }
 const purgeOf = (raw: unknown) => {
@@ -129,6 +150,8 @@ function stored({
   events,
   structure,
   complete,
+  mark,
+  absent,
 }: UnreadRecord): StoredMeta {
   const meta: StoredMeta = {
     version: VERSION,
@@ -142,6 +165,8 @@ function stored({
     },
     structure: [...structure],
     complete,
+    ...(mark ? { mark: { at: mark.at, checked: mark.checked } } : {}),
+    ...(absent?.size ? { absent: [...absent] } : {}),
   };
   if (
     events.length > UNREAD_RECORD_EVENTS ||
@@ -164,6 +189,8 @@ export function memoryUnreadStorage(): UnreadStorage {
         events: [...record.events],
         structure: new Set(record.structure),
         complete: record.complete,
+        ...(record.mark ? { mark: { ...record.mark } } : {}),
+        ...(record.absent?.size ? { absent: new Set(record.absent) } : {}),
       };
     },
     close() {},

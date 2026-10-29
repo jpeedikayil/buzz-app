@@ -73,6 +73,7 @@ async function setup({
   authoredPage = true,
   sampled = true,
   localUnread = {},
+  now = NOW,
 }: {
   channels: readonly string[];
   frontiers: Readonly<Record<string, number>>;
@@ -85,6 +86,8 @@ async function setup({
   sampled?: boolean;
   // Messages marked unread on this device, which a relaunch keeps.
   localUnread?: Readonly<Record<string, number>>;
+  // The device clock, in seconds.
+  now?: number;
 }) {
   const store: RelayEvent[] = [];
   // Channels whose window requests fail: every time, or only the first.
@@ -215,7 +218,7 @@ async function setup({
     reader,
     viewer,
     storage,
-    now: () => NOW * 1000,
+    now: () => now * 1000,
   });
   owners.push(owner);
   const filters = () => reader.read.mock.calls.flatMap(([filters]) => filters);
@@ -1198,15 +1201,18 @@ it("remembered participation is saved and refetches the thread after the authore
     }),
   );
   first.owner.dispose();
-  // A later session: the viewer has since written a page of newer messages
-  // elsewhere, so their authored page no longer reaches the old reply, which
-  // the thread page ends before as well; the replies have been read since.
+  // A later session, days on, so it reads the bootstrap rather than a delta
+  // since the record's mark: the viewer has since written a page of newer
+  // messages elsewhere, so their authored page no longer reaches the old
+  // reply, which the thread page ends before as well; the replies have been
+  // read since.
   const second = await setup({
     channels: ["c0"],
     frontiers: { c0: 1300 },
     storage,
     authoredPage: false,
     sampled: false,
+    now: NOW + 2 * 24 * 60 * 60,
   });
   second.store.push(...first.store);
   await second.owner.capability.ensure();

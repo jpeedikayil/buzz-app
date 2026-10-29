@@ -163,10 +163,21 @@ verification discards them all, keeping the threads. The full repair still
 runs on every launch, and restored events only add to what it reads: one that
 a read should have returned and did not, deleted while the device was closed,
 is dropped, and one whose channel membership is not confirmed yet waits for
-it. The repair's reads return no deletions, so a restored event none of them
-reaches—an unread message older than its channel's window and outside the
-newest events across the roster—stays even if it was deleted while the device
-was closed, until its deletion arrives. Leaving a community clears its record,
+it. The record also keeps how far this device last read the whole roster.
+When it is complete and that read was confirmed within the last day, a
+launch, reconnect or periodic check first reads everything the joined channels
+gained since then—messages, edits, reactions and deletions, from far enough
+before that point that a send the relay committed late is still read—and
+moves that point only once every channel has read to its end; live events
+never move it. A channel with more new events than that read takes, or a
+record not caught up within the day, leaves the catch-up to the full repair,
+which then reads the deletions made since that point in the channels holding
+restored events the repair's reads did not return. If those deletions are
+more than it reads, or the record never caught up, those restored events are
+dropped, as a device without a record would never show them, rather than kept
+while they may have been deleted. A remembered thread whose root the relay
+returns nothing for, deleted, does not keep the record incomplete. Leaving a
+community clears its record,
 and a window still open on it cannot save it back; a session started after
 that, as when rejoining, saves as usual. Clearing the cache clears the record
 too, remembered threads included, so the next repair walks back through the
