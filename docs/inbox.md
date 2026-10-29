@@ -154,9 +154,12 @@ With those threads, each repair keeps on this device the signed events the
 next one would read of what is held, every unread or undecided row, and what
 those rows depend on—roots, parents, the viewer's own messages in their
 threads, edits and deletions—up to 2,048 events and 4 MiB, beyond which it
-keeps none. A root or parent fetched only to group replies, by a lookup or a
-thread read, counts only once a channel's window or the newest events across
-the roster return it, and is restored as such. A launch verifies the events
+keeps none. Of each sender's edits of a message the device holds and keeps
+only the newest, so when that edit is deleted the message shows its original
+text or another sender's edit, not the edit before it. A root or parent
+fetched only to group replies, by a lookup or a thread read, counts only once
+a channel's window or the newest events across the roster return it, and is
+restored as such. A launch verifies the events
 again beside the repair, not ahead of it, and shows them once all have
 passed, which may be before or after the relay's first answer; one that fails
 verification discards them all, keeping the threads. The full repair still

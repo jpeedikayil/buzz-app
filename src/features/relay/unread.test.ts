@@ -3019,6 +3019,45 @@ it("inbox folds edits and deletions and revokes all evidence before a reentrant 
   expect(h.session.unread.inbox().items).toHaveLength(0);
 });
 
+it("of a sender's edits of a message only the newest is held: an older one arriving later is not, another sender's edit does not displace it, and once it is deleted the message shows its own body", () => {
+  const h = setup();
+  h.grant("room");
+  const row = message(h.alice, "room", "original", 20, [
+    ["p", h.viewer.pubkey],
+  ]);
+  const edit = (author: typeof h.alice, content: string, created_at: number) =>
+    signed(author, {
+      kind: 40003,
+      created_at,
+      content,
+      tags: [
+        ["h", "room"],
+        ["e", row.id],
+      ],
+    });
+  const preview = () => h.session.unread.inbox().items[0]?.preview;
+  const newest = edit(h.alice, "newest", 23);
+  h.emit([row, edit(h.alice, "first", 21)]);
+  h.emit([newest]);
+  h.emit([edit(h.alice, "late", 22)]);
+  // The fold shows only the author's edits, but this sender's newer one is
+  // held beside them, not in place of theirs.
+  h.emit([edit(h.viewer, "forged", 24)]);
+  expect(preview()).toBe("newest");
+  h.emit([
+    signed(h.alice, {
+      kind: 5,
+      created_at: 25,
+      content: "",
+      tags: [
+        ["h", "room"],
+        ["e", newest.id],
+      ],
+    }),
+  ]);
+  expect(preview()).toBe("original");
+});
+
 it("inbox keeps unresolved mentions exact, joins a verified root, and never clears unrelated roots", async () => {
   const h = setup();
   h.grant("room");

@@ -1969,20 +1969,21 @@ it("of the reads by ID sharing a request, a full one pages on below the newest i
 });
 
 it.each(["edited", "deleted"])(
-  "a held message %s after more edits since the mark than a read by ID pages through has that read halved down to it alone, whose newest edits read it, so the mark moves",
+  "a held message %s after more edits since the mark than a read by ID pages through has that read halved down to it alone, whose newest edits read it, while the other half applies a deletion below where the read of both stopped, so the mark moves",
   async (variant) => {
     const at = T + 10_000;
     const since = at - 1865;
     const storage = await marked({ at, checked: SECONDS - 86_401 });
     // Unread past the window's cut and outside the roster sample, read by ID
     // together: one an agent edits more often than that read pages through,
-    // twice over, and one never edited.
+    // twice over, and one deleted below where its pages of both stop.
     const status = hashed("team", at - 2000);
     const other = hashed("team", at - 1999);
     const edits = Array.from({ length: 2001 }, (_, i) =>
       hashed("team", since + i, 40003, [["e", status.id]]),
     );
     const removal = hashed("team", since + 2001, 5, [["e", status.id]]);
+    const gone = hashed("team", since + 500, 5, [["e", other.id]]);
     // Newer than all of those, more than the read by channel reaches.
     const noise = Array.from({ length: 1000 }, (_, i) =>
       hashed("team", since + 2002 + i, 5, [["e", "f".repeat(64)]]),
@@ -1997,6 +1998,7 @@ it.each(["edited", "deleted"])(
         other,
         ...edits,
         ...(deleted ? [removal] : []),
+        gone,
         ...noise,
         ...newer,
         ...busy,
@@ -2008,14 +2010,16 @@ it.each(["edited", "deleted"])(
     const save = vi.spyOn(storage, "save");
     await h.owner.capability.ensure();
     await save.mock.results.at(-1)?.value;
-    expect(h.count("team")).toBe(deleted ? 101 : 102);
+    // The other's half applies its deletion.
+    expect(h.owner.event(gone.id)).toBeDefined();
+    expect(h.count("team")).toBe(deleted ? 100 : 101);
     expect(h.owner.capability.inbox().partial).toBeUndefined();
     expect((await storage.read())?.mark).toEqual({
       at: T + 50_499,
       checked: SECONDS,
     });
     // Two pages of both, then each half on from where they stopped: the
-    // unedited one is short, the edited one full at its last page.
+    // deleted one is short, the edited one full at its last page.
     const shift = deleted ? 1 : 0;
     expect(
       h.reader.read.mock.calls
@@ -2031,6 +2035,168 @@ it.each(["edited", "deleted"])(
     ]);
   },
 );
+
+it("a held unread mention edited 3,000 times since the mark is held and saved with its newest edit alone, so the pass moves the mark and saves the record complete, and the next launch restores it edited", async () => {
+  const at = T + 10_000;
+  const since = at - 1865;
+  const storage = await marked({ at, checked: SECONDS - 86_401 });
+  // Unread past the window's cut and outside the roster sample, read by ID
+  // together: a mention an agent edits more times than the record holds
+  // events, and one never edited. What the record keeps is signed, for the
+  // relaunch to verify.
+  const status = post(peerKey, "team", at - 2000, [["p", viewer]]);
+  const other = post(peerKey, "team", at - 1999);
+  const edits = Array.from({ length: 2999 }, (_, i) =>
+    hashed("team", since + i, 40003, [["e", status.id]]),
+  );
+  const newest = signed(peerKey, {
+    kind: 40003,
+    content: "status, edited",
+    created_at: since + 2999,
+    tags: [
+      ["h", "team"],
+      ["e", status.id],
+    ],
+  });
+  const newer = Array.from({ length: 100 }, (_, i) =>
+    post(peerKey, "team", at + 500 + i),
+  );
+  const store = [status, other, ...edits, newest, ...newer, ...busy];
+  const frontiers = { ...BUSY_READ, team: at - 3000 };
+  const h = await launch({ store, storage, frontiers });
+  h.owner.accept([status, other]);
+  const save = vi.spyOn(storage, "save");
+  await h.owner.capability.ensure();
+  await save.mock.results.at(-1)?.value;
+  const edited = expect.objectContaining({
+    messageIds: [status.id],
+    preview: "status, edited",
+  });
+  expect(h.rows()).toContainEqual(edited);
+  expect(h.count("team")).toBe(102);
+  expect(h.owner.capability.inbox().partial).toBeUndefined();
+  const record = await storage.read();
+  expect(record?.mark).toEqual({ at: T + 50_499, checked: SECONDS });
+  expect(record?.complete).toBe(true);
+  // The window, the roster sample, the two read by ID and one edit.
+  const kept = await saved(storage);
+  expect(kept).toHaveLength(100 + 500 + 2 + 1);
+  expect(kept).toContain(newest.id);
+  h.owner.dispose();
+  // The relay cannot be read: the edited mention comes from storage alone.
+  const offline = await launch({ store, storage, frontiers, down: true });
+  await offline.owner.capability.ensure();
+  await offline.restored(kept.length);
+  expect(offline.rows()).toContainEqual(edited);
+  expect(offline.count("team")).toBe(102);
+});
+
+it("a held message edited more times than the evidence holds events has one edit held, so its edits evict nothing: every held message stays counted, and the mark moves", async () => {
+  const at = T + 10_000;
+  const since = at - 1865;
+  const storage = await marked({ at, checked: SECONDS - 86_401 });
+  // Unread past the window's cut and outside the roster sample, read by ID
+  // together, the oldest of them edited by an agent 5,000 times.
+  const held = Array.from({ length: 22 }, (_, i) =>
+    hashed("team", at - 2000 + i),
+  );
+  const [status] = held;
+  assert(status);
+  const edits = Array.from({ length: 5000 }, (_, i) =>
+    hashed("team", since + i, 40003, [["e", status.id]]),
+  );
+  const newer = Array.from({ length: 100 }, (_, i) =>
+    hashed("team", at + 500 + i),
+  );
+  const h = await launch({
+    store: [...held, ...edits, ...newer, ...busy],
+    storage,
+    frontiers: { ...BUSY_READ, team: at - 3000 },
+  });
+  h.owner.accept(held);
+  const save = vi.spyOn(storage, "save");
+  await h.owner.capability.ensure();
+  await save.mock.results.at(-1)?.value;
+  expect(h.count("team")).toBe(122);
+  expect(h.owner.event(status.id)).toBeDefined();
+  expect(h.owner.event(edits.at(-1)?.id ?? "")).toBeDefined();
+  expect(h.owner.event(edits.at(-2)?.id ?? "")).toBeUndefined();
+  expect(h.owner.capability.inbox().partial).toBeUndefined();
+  expect((await storage.read())?.mark).toEqual({
+    at: T + 50_499,
+    checked: SECONDS,
+  });
+});
+
+it("a read by ID that would need more than 200 halves is dropped there, nothing queued behind it read: the mark stays and the Inbox says some activity could not be checked", async () => {
+  const at = T + 10_000;
+  const since = at - 1865;
+  const storage = await marked({ at, checked: SECONDS - 86_401 });
+  // Unread past the window's cut and outside the roster sample, read by ID
+  // in two filters of 100, beside more edits and deletions than the read by
+  // channel reaches.
+  const held = Array.from({ length: 200 }, (_, i) =>
+    hashed("team", at - 2000 + i),
+  );
+  const noise = Array.from({ length: 1000 }, (_, i) =>
+    hashed("team", since + i, 5, [["e", "f".repeat(64)]]),
+  );
+  const newer = Array.from({ length: 100 }, (_, i) =>
+    hashed("team", at + 500 + i),
+  );
+  const h = await launch({
+    store: [...held, ...noise, ...newer, ...busy],
+    storage,
+    frontiers: { ...BUSY_READ, team: at - 3000 },
+  });
+  // Each filter's first message has more edits than any page reaches, so
+  // every page by ID is full and each second page of more than one message
+  // is halved, until the 101st would make more than 200 halves. The edits
+  // are made as they are read, below where each page starts.
+  const relay = h.reader.read.getMockImplementation();
+  assert(relay);
+  const pages = new Map<string, number>();
+  let made = 0;
+  let splits = 0;
+  let after = 0;
+  h.reader.read.mockImplementation(async (filters) => {
+    if (!byIdRead(filters)) return relay(filters);
+    if (splits > 100) after++;
+    return filters.flatMap((filter) => {
+      const ids = filter["#e"] ?? [];
+      const page = (pages.get(ids.join()) ?? 0) + 1;
+      pages.set(ids.join(), page);
+      if (page === 2 && ids.length > 1) splits++;
+      const top = filter.until ?? since + 10_000;
+      return Array.from(
+        { length: 500 },
+        (_, i): RelayEvent => ({
+          kind: 40003,
+          pubkey: peerKey.pubkey,
+          created_at: top - 1 - i,
+          content: "",
+          tags: [
+            ["h", "team"],
+            ["e", ids[0] ?? ""],
+          ],
+          id: (made++).toString(16).padStart(64, "0"),
+          sig: "0".repeat(128),
+          [verifiedSymbol]: true,
+        }),
+      );
+    });
+  });
+  h.owner.accept(held);
+  await h.owner.capability.ensure();
+  expect(splits).toBe(101);
+  expect(after).toBe(0);
+  expect(h.count("team")).toBe(300);
+  expect(h.owner.capability.inbox().partial).toBe(true);
+  expect((await storage.read())?.mark).toEqual({
+    at,
+    checked: SECONDS - 86_401,
+  });
+});
 
 it("on a roster of more than 128 channels holding evidence, only the chunks whose edits and deletions were not read to their end have their held content read by ID", async () => {
   const at = T + 10_000;

@@ -1920,7 +1920,7 @@ export function createUnread({
   // at its last page reads on in halves (see `scanner`), HALVES at most a
   // read: enough to take one 100-ID filter down to single IDs (198), each
   // DELETION_PAGES pages, so the halves add at most 400 requests. A read
-  // needing more is dropped.
+  // needing more is dropped there, its queued requests unread.
   const DELTA_LOOKBACK = 900 + 960 + 5;
   const DELTA_PAGE = 500;
   const DELTA_PAGES = 6;
@@ -2163,8 +2163,9 @@ export function createUnread({
    * matches, as another's matches may reach below where its own stopped.
    * A filter of event IDs (`#e`) still full at its last page reads on from
    * there in two halves of its IDs, each with pages of its own, HALVES at
-   * most (more is `dropped`); one ID still full at its last page has read its
-   * newest edits and any deletion after the oldest of them, and is read.
+   * most (more is `dropped`, and nothing more of it is read); one ID still
+   * full at its last page has read its newest edits and any deletion after
+   * the oldest of them, and is read.
    * Once its requests are read, `outcome` is `read` when every filter read to
    * its end, `full` when one was still full at its last page (nothing more of
    * it is read) and `dropped` when one was dropped; `newest` is the newest
@@ -2179,6 +2180,8 @@ export function createUnread({
     let open = filters.length;
     let full = false;
     let dropped = false;
+    // Dropped for needing more than HALVES halves: nothing more is read.
+    let capped = false;
     let halves = 0;
     let newest: number | undefined;
     const owns = (request: readonly ReadFilter[]) =>
@@ -2227,7 +2230,7 @@ export function createUnread({
           const ids = filter["#e"];
           if (ids && !full && at >= pages) {
             if (ids.length > 1 && halves >= HALVES) {
-              dropped = true;
+              dropped = capped = true;
               continue;
             }
             open--;
@@ -2253,7 +2256,7 @@ export function createUnread({
           origin.set(next, from);
           queue.push([next]);
         }
-        if (full) {
+        if (full || capped) {
           const others = queue.filter((request) => !owns(request));
           queue.splice(0, queue.length, ...others);
         }
@@ -2628,13 +2631,14 @@ export function createUnread({
    * filter's limit (the cold read's boundary reply passed over, as the
    * repair passes it); every row the projection counts unread or cannot
    * decide yet; and what kept rows depend on: their roots and parents, the
-   * viewer's messages in their threads, and the edits and deletions of
-   * them. Beyond the record's bounds nothing is kept; that, a selected
-   * event retention dropped, a remembered thread's reply kept without its
-   * root (unless the relay returned nothing for it: `absent`, saved with the
-   * record), or a roster sample owed since a leave, leaves the record
-   * incomplete. Of the threads read whole, those still hot, followed and in
-   * a channel the mark covers stay so. */
+   * viewer's messages in their threads, and the edits (each editor's
+   * newest, the one held: see `editKeys`) and deletions of them. Beyond the
+   * record's bounds nothing is kept; that, a selected event retention
+   * dropped, a remembered thread's reply kept without its root (unless the
+   * relay returned nothing for it: `absent`, saved with the record), or a
+   * roster sample owed since a leave, leaves the record incomplete. Of the
+   * threads read whole, those still hot, followed and in a channel the mark
+   * covers stay so. */
   function retention(participation: ThreadParticipation) {
     indexEvidence();
     const ids = rosterIds();
@@ -3962,6 +3966,18 @@ export function createUnread({
       }
     }
   }
+  /** The fold shows a target's newest edit by an editor it allows (see
+   * `foldMessages`), so of one editor's edits of a target only the newest
+   * is held, and saved: a target edited thousands of times costs one event.
+   * When that edit is deleted, the target shows its own body or another
+   * editor's edit, not the edit before it. */
+  const editKeys = (edit: RelayEvent) => [
+    ...new Set(
+      edit.tags.flatMap(([name, id]) =>
+        name === "e" && id ? [`${id}:${edit.pubkey}`] : [],
+      ),
+    ),
+  ];
   function accept(batch: readonly RelayEvent[]) {
     if (closed) return false;
     retract(batch);
@@ -3969,6 +3985,23 @@ export function createUnread({
     indexed = false;
     const incoming = new Map(batch.map((event) => [event.id, event]));
     const owners = channelOwnership((id) => incoming.get(id) ?? events.get(id));
+    // The held edit of each target and editor (see `editKeys`), built once a
+    // batch carries an edit. An edit of several targets may stay held for
+    // one while a newer edit holds another.
+    let edits: Map<string, RelayEvent> | undefined;
+    const heldEdits = () => {
+      if (!edits) {
+        edits = new Map();
+        for (const event of events.values())
+          if (event.kind === 40003)
+            for (const key of editKeys(event)) {
+              const other = edits.get(key);
+              if (!other || byTime(event, other) < 0) edits.set(key, event);
+            }
+      }
+      return edits;
+    };
+    let superseded = false;
     // An edit or deletion is kept with its newest-ranked content target,
     // retained or in this batch, so an overlay on a pinned message is admitted
     // while the message is. Without one it ranks as itself.
@@ -3996,6 +4029,33 @@ export function createUnread({
       const channels = owners(event);
       if (!channels || [...channels].some((channel) => !allowed(channel)))
         continue;
+      // An edit older than the held one of its editor is not admitted; one
+      // newer retires it first, freeing the room it takes.
+      if (event.kind === 40003) {
+        const held = heldEdits();
+        const newest = editKeys(event).filter((key) => {
+          const other = held.get(key);
+          return !other || byTime(event, other) < 0;
+        });
+        if (!newest.length) {
+          superseded = true;
+          continue;
+        }
+        for (const key of newest) {
+          const other = held.get(key);
+          held.set(key, event);
+          if (
+            other &&
+            events.has(other.id) &&
+            !editKeys(other).some((rest) => held.get(rest) === other)
+          ) {
+            for (const channel of owners(other) ?? []) changed.add(channel);
+            events.delete(other.id);
+            bytes -= sizeOf(other);
+            superseded = true;
+          }
+        }
+      }
       const size = sizeOf(event);
       const subject = auxiliaryKind(event) ? overlaid(event) : event;
       // Full: make room by evicting what goes first, unless this event would
@@ -4065,7 +4125,7 @@ export function createUnread({
         known.delete(channel)
       )
         changed.add(channel);
-    if (evicted) dropOrphans();
+    if (evicted || superseded) dropOrphans();
     if (changed.size) {
       // The session admits profiles from this same batch after unread evidence.
       if (profiles)

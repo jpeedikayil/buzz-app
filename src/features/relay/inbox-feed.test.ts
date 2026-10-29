@@ -1533,6 +1533,8 @@ it("retained dependency closure checks live same-channel edit candidates of the 
     tags: [["e", removedEdit.id]],
   });
   // All are already retained; the relay omits them from this finite query.
+  // Of each sender's edits of the target only the newest is held, so with
+  // the author's deleted the target shows its own body.
   h.live.receive([
     target,
     unrelated,
@@ -1543,7 +1545,7 @@ it("retained dependency closure checks live same-channel edit candidates of the 
     unrelatedEdit,
     deletion,
   ]);
-  expect(rows(h)[0]?.preview).toBe("newest edit");
+  expect(rows(h)[0]?.preview).toBe("original");
   const filters: ReadFilter[] = [];
   h.query.mockImplementation(async ([filter]) => {
     if (!filter) return [];
@@ -1553,17 +1555,13 @@ it("retained dependency closure checks live same-channel edit candidates of the 
   await h.session.inboxFeed.ensure();
   expect(filters.filter((filter) => filter["#e"])).toEqual([
     { kinds: [40003, 5, 9005], "#e": [target.id], limit: 500 },
-    {
-      kinds: [5, 9005],
-      "#e": [originalEdit.id, newestEdit.id, wrongAuthor.id].sort(),
-      limit: 500,
-    },
+    { kinds: [5, 9005], "#e": [wrongAuthor.id], limit: 500 },
   ]);
   expect(h.session.inboxFeed.snapshot()).toMatchObject({
     status: "ready",
     incomplete: [],
   });
-  expect(rows(h)[0]?.preview).toBe("newest edit");
+  expect(rows(h)[0]?.preview).toBe("original");
 });
 
 it.each(["edit", "delete"] as const)(
