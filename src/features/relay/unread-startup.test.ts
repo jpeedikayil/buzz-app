@@ -1202,15 +1202,21 @@ it("a reconnect repair in which nothing lands keeps the observation stale instea
   });
   const count = h.query.mock.calls.length;
   h.reconnect();
-  // The window request and the roster sample beside it are read twice
-  // each, then dropped. Nothing was observed, so the delta since the mark,
-  // which waits behind the window request, is not asked.
+  // The first pass confirmed a mark, so the reconnect's reads only the
+  // delta since it: read twice, then dropped.
+  const delta = [
+    expect.objectContaining({
+      kinds: expect.arrayContaining([9, 40002, 40008, 40003, 5, 9005]),
+      "#h": ["other"],
+    }),
+  ];
   await vi.waitFor(() =>
     expect(
       h.query.mock.calls
         .slice(count)
-        .filter(([filters]) => filters[0]?.kinds?.includes(9)),
-    ).toHaveLength(4),
+        .filter(([filters]) => filters[0]?.kinds?.includes(9))
+        .map(([filters]) => filters),
+    ).toEqual([delta, delta]),
   );
   await vi.waitFor(() =>
     expect(h.session.unread.inbox()).toMatchObject({
@@ -1219,10 +1225,11 @@ it("a reconnect repair in which nothing lands keeps the observation stale instea
       error: "Relay read timed out",
     }),
   );
+  // Nothing was observed, so no read of edits and deletions follows.
   expect(
     h.query.mock.calls
       .slice(count)
-      .filter(([filters]) => filters[0]?.kinds?.includes(40003)),
+      .filter(([filters]) => filters[0]?.kinds?.join() === "40003,5,9005"),
   ).toEqual([]);
   expect(h.snapshot()).toMatchObject({ observedCount: 1, freshness: "stale" });
   expect(h.session.unread.inbox().partial).toBeUndefined();

@@ -211,7 +211,8 @@ Lists are bullets only, because browser helpers find the timeline through its
 single ordered list.
 
 The app verifies each relay event's signature once per connection and reuses that
-proof. Its startup unread read takes each joined channel's newest 100 events
+proof. Its startup unread read, a fresh device's full repair, takes each joined
+channel's newest 100 events
 since its read mark and the newest 500 across joined channels, so default
 history reaches the app before measurement, including the newest of the 620
 older paging rows. `firstSeenHistory` (`scroll-paging-fast-first-seen`) has

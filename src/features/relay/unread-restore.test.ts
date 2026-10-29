@@ -26,6 +26,30 @@ vi.mock("../developer/client-metrics", async (importOriginal) => {
     await importOriginal<typeof import("../developer/client-metrics")>();
   return { ...actual, clientMetrics: { ...actual.clientMetrics, cpu } };
 });
+// Restore yields between its batches; a test may hold it there.
+const restoreHold = vi.hoisted(() => ({
+  held: undefined as Promise<void> | undefined,
+}));
+vi.mock("./yield", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./yield")>();
+  return {
+    yieldToHost: async () => {
+      await restoreHold.held;
+      return actual.yieldToHost();
+    },
+  };
+});
+/** Holds restore at its next yield until `release`. */
+function holdRestore() {
+  let release = () => {};
+  restoreHold.held = new Promise((resolve) => {
+    release = () => {
+      restoreHold.held = undefined;
+      resolve();
+    };
+  });
+  return release;
+}
 
 // What a relaunch restores of the saved evidence, and what a save keeps
 // (design §3.2). Events are signed: restore verifies them again.
@@ -112,6 +136,7 @@ const summaries = (ids: readonly string[]) =>
 
 const owners: ReturnType<typeof createUnread>[] = [];
 afterEach(() => {
+  restoreHold.held = undefined;
   for (const owner of owners.splice(0)) owner.dispose();
   vi.restoreAllMocks();
 });
@@ -575,6 +600,67 @@ it("a tampered event discards the restored evidence, keeping the threads the rep
   );
 });
 
+it("restored evidence discarded after the pass routed to the delta has the bootstrap read in the same pass", async () => {
+  const saving = memoryUnreadStorage();
+  const root = post(peerKey, "team", T);
+  const mine = reply(viewerKey, "team", root, T + 1);
+  const answer = reply(peerKey, "team", root, T + 2);
+  const direct = Array.from({ length: 9 }, (_, i) =>
+    post(peerKey, "dm", T + 10 + i),
+  );
+  const store = [root, mine, answer, ...direct];
+  const first = await launch({ store, storage: saving });
+  await first.owner.capability.ensure();
+  await first.saved;
+  first.owner.dispose();
+  const record = await saving.read();
+  expect(record?.complete).toBe(true);
+  // Storage changed an event restore verifies after its first yield.
+  const tampered = (record?.events.at(-1) as RelayEvent | undefined)?.id;
+  expect(record?.events.length).toBeGreaterThan(8);
+  const storage: UnreadStorage = {
+    ...saving,
+    async read() {
+      const read = await saving.read();
+      return (
+        read && {
+          ...read,
+          events: read.events.map((event) =>
+            (event as RelayEvent).id === tampered
+              ? { ...(event as RelayEvent), content: "tampered" }
+              : event,
+          ),
+        }
+      );
+    },
+  };
+  const release = holdRestore();
+  const h = await launch({ store, storage });
+  let launched: Promise<void> | undefined;
+  try {
+    launched = h.owner.capability.ensure();
+    await vi.waitFor(() => expect(deltas(h)).not.toEqual([]));
+  } finally {
+    release();
+  }
+  await launched;
+  const sent = h.reader.read.mock.calls.map(([filters]) => filters);
+  expect(deltaRead(sent[0] ?? [])).toBe(true);
+  expect(sent.flat()).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ authors: [viewer] }),
+      expect.objectContaining({ "#h": ["dm"], since: expect.any(Number) }),
+      expect.objectContaining({ "#h": ROSTER, include_aux: true, limit: 500 }),
+    ]),
+  );
+  expect(h.owner.capability.inbox().items).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ rootId: root.id, unreadCount: 1 }),
+      expect.objectContaining({ channelId: "dm", unreadCount: 9 }),
+    ]),
+  );
+});
+
 it("a selection over the record's bounds, or one retention dropped, saves an incomplete record", async () => {
   // Unread messages larger together than the record's byte bound.
   const large = (key: Key, channelId: string, at: number) =>
@@ -799,6 +885,151 @@ it("a save that is refused is written again, and one carrying only threads keeps
   );
 });
 
+it("a warm launch reads only the delta, shows the restored rows before the relay answers, and loads once restore and the delta's first page are in", async () => {
+  const storage = memoryUnreadStorage();
+  // The lost thread: the viewer replied long ago, and only the thread reads
+  // reach it. Beside it, more unread DMs than restore verifies at once.
+  const lost = post(peerKey, "team", T);
+  const mine = reply(viewerKey, "team", lost, T + 1);
+  const answer = reply(peerKey, "team", lost, T + 2);
+  const direct = Array.from({ length: 9 }, (_, i) =>
+    post(peerKey, "dm", T + 10 + i),
+  );
+  const store = [lost, mine, answer, ...direct];
+  const first = await launch({ store, storage });
+  await first.owner.capability.ensure();
+  await first.saved;
+  first.owner.dispose();
+  const record = await storage.read();
+  assert(record?.mark);
+  expect(record.complete).toBe(true);
+  const count = record.events.length;
+  expect(count).toBeGreaterThan(8);
+  const delta = {
+    kinds: DELTA_KINDS,
+    "#h": ROSTER,
+    since: record.mark.at - 1865,
+    limit: 500,
+  };
+  const rows = [
+    expect.objectContaining({ rootId: lost.id, unreadCount: 1 }),
+    expect.objectContaining({ channelId: "dm", unreadCount: 9 }),
+  ];
+  // The relay holds its answer: restore alone shows the rows.
+  const held = await launch({ store, storage });
+  const network = held.hold();
+  try {
+    const launched = held.owner.capability.ensure();
+    expect(await network.waiting).toEqual([delta]);
+    await held.restored(count);
+    expect(held.owner.capability.inbox()).toMatchObject({
+      status: "loading",
+      items: expect.arrayContaining(rows),
+    });
+    network.release();
+    await launched;
+  } finally {
+    network.release();
+  }
+  held.owner.dispose();
+  // Restore is held instead: the delta's page lands, with a reply sent
+  // while this device was closed, and the Inbox still waits for restore.
+  const later = reply(peerKey, "team", lost, T + 30);
+  store.push(later);
+  const release = holdRestore();
+  const slow = await launch({ store, storage });
+  try {
+    const launched = slow.owner.capability.ensure();
+    await vi.waitFor(() => expect(slow.owner.event(later.id)).toBeDefined());
+    expect(slow.verified()).toBeLessThan(count);
+    expect(slow.owner.capability.inbox().status).toBe("loading");
+    release();
+    await slow.restored(count);
+    await launched;
+  } finally {
+    release();
+  }
+  expect(slow.owner.capability.inbox()).toMatchObject({
+    status: "ready",
+    freshness: "observed",
+    items: expect.arrayContaining([
+      expect.objectContaining({ rootId: lost.id, unreadCount: 2 }),
+      rows[1],
+    ]),
+  });
+  expect(slow.reader.read.mock.calls).toEqual([[[delta], expect.anything()]]);
+  await slow.saved;
+  expect(await storage.read()).toMatchObject({
+    complete: true,
+    mark: { at: later.created_at, checked: SECONDS },
+  });
+});
+
+it("a delta-only pass advances the walk mark and the thread marks to the viewer's newest reply it read, with no authored page or thread read", async () => {
+  const storage = memoryUnreadStorage();
+  // A thread the viewer replied in, with no unread reply holding its mark.
+  const root = post(peerKey, "team", T);
+  const mine = reply(viewerKey, "team", root, T + 1);
+  const store = [root, mine];
+  const first = await launch({ store, storage });
+  await first.owner.capability.ensure();
+  await first.saved;
+  first.owner.dispose();
+  const key = `team:${root.id}`;
+  expect(await storage.read()).toMatchObject({
+    complete: true,
+    whole: new Set([key]),
+    participation: { walk: { since: mine.created_at } },
+  });
+  // The viewer replied again on another device while this one was closed.
+  const again = reply(viewerKey, "team", root, T + 40);
+  store.push(again);
+  const warm = await launch({ store, storage });
+  await warm.owner.capability.ensure();
+  await warm.saved;
+  expect(warm.reader.read.mock.calls.map(([filters]) => filters)).toEqual([
+    [expect.objectContaining({ kinds: DELTA_KINDS })],
+  ]);
+  const record = await storage.read();
+  expect(record?.participation.walk).toEqual({ since: again.created_at });
+  expect(record?.participation.roots.get(key)?.at).toBe(again.created_at);
+  expect(record?.complete).toBe(true);
+});
+
+it("a delta-only pass fetches by ID the root of a remembered thread it brought a reply to, which stays structure and groups the reply", async () => {
+  // The viewer's reply is held without its root: it is read only by ID.
+  const root = post(peerKey, "quiet", T);
+  const mine = reply(viewerKey, "quiet", root, T + 1);
+  const key = `quiet:${root.id}`;
+  const storage = memoryUnreadStorage();
+  await storage.save({
+    participation: { roots: new Map([[key, { at: T + 1 }]]) },
+    events: [mine],
+    structure: new Set(),
+    complete: true,
+    mark: { at: SECONDS - 600, checked: SECONDS - 60 },
+    roster: new Set(ROSTER),
+    whole: new Set([key]),
+  });
+  const answer = reply(peerKey, "quiet", root, SECONDS - 300);
+  const h = await launch({ store: [root, mine, answer], storage });
+  const launched = await sentDuring(h, () => h.owner.capability.ensure());
+  expect(launched).toEqual([
+    expect.objectContaining({ kinds: DELTA_KINDS }),
+    expect.objectContaining({ ids: [root.id] }),
+  ]);
+  await h.saved;
+  expect(h.owner.capability.inbox().items).toContainEqual(
+    expect.objectContaining({ rootId: root.id, unreadCount: 1 }),
+  );
+  // Structure: the reply alone counts.
+  expect(h.count("quiet")).toBe(1);
+  expect(await storage.read()).toMatchObject({
+    complete: true,
+    structure: new Set([root.id]),
+  });
+});
+
 it("a full window's cut is its own limit-th match, and a deletion made while closed reaches the restored evidence below it", async () => {
   const storage = memoryUnreadStorage();
   // The viewer's newest message, at the channel's read mark: the authored
@@ -854,20 +1085,21 @@ it("a full window's cut is its own limit-th match, and a deletion made while clo
     await warm.saved;
     return { warm, memory, restoring, inbox };
   };
-  // A mark confirmed within the day: the delta since it returns the
-  // deletion, while restore is still verifying the evidence it deletes.
+  // A mark confirmed within the day: the delta since it, read first and
+  // with no bootstrap, returns the deletion while restore is still
+  // verifying the evidence it deletes, and the Inbox waits for both.
   const fresh = await relaunch(record.mark);
-  // It rides behind the bootstrap's first request: the Inbox has painted.
-  expect(fresh.warm.reader.read.mock.calls[0]?.[0]).toContainEqual(
-    expect.objectContaining({ authors: [viewer] }),
-  );
-  expect(fresh.inbox).toEqual(["ready", "ready"]);
-  expect(deltas(fresh.warm)[0]).toEqual({
-    kinds: DELTA_KINDS,
-    "#h": ["team", "quiet", "dm", "busy"],
-    since,
-    limit: 500,
-  });
+  const read = fresh.warm.reader.read.mock.calls.map(([filters]) => filters);
+  expect(read[0]).toEqual([
+    {
+      kinds: DELTA_KINDS,
+      "#h": ["team", "quiet", "dm", "busy"],
+      since,
+      limit: 500,
+    },
+  ]);
+  expect(read.filter((filters) => !deltaRead(filters))).toEqual([]);
+  expect(fresh.inbox).toEqual(["loading", "loading"]);
   expect(fresh.restoring).toEqual([true, true]);
   expect(fresh.warm.count("team")).toBe(129);
   expect(await saved(fresh.memory)).not.toContain(oldest.id);
@@ -1494,10 +1726,9 @@ it("a delta with a chunk that fails leaves the mark, so the next delta reads fro
     storage,
     roster: members(ids),
     fail: (filters) =>
-      sampleRead(filters) ||
-      (failing &&
-        deltaRead(filters) &&
-        filters.some((filter) => filter["#h"]?.includes("c129"))),
+      failing &&
+      deltaRead(filters) &&
+      filters.some((filter) => filter["#h"]?.includes("c129")),
   });
   const save = vi.spyOn(storage, "save");
   await h.owner.capability.ensure();
@@ -1508,13 +1739,16 @@ it("a delta with a chunk that fails leaves the mark, so the next delta reads fro
   failing = false;
   await h.reconnected();
   await save.mock.results.at(-1)?.value;
-  // The failing chunk was read once, the roster sample having stalled the
-  // pass already, then once more from the same mark.
+  // The failing chunk was read and retried, then read once more from the
+  // same mark, and nothing but the delta was read.
   expect(
     deltas(h)
       .filter((filter) => filter["#h"]?.includes("c129"))
       .map(({ since }) => since),
-  ).toEqual([at - 1865, at - 1865]);
+  ).toEqual([at - 1865, at - 1865, at - 1865]);
+  expect(
+    h.reader.read.mock.calls.every(([filters]) => deltaRead(filters)),
+  ).toBe(true);
   expect((await storage.read())?.mark).toEqual({
     at: at + 20,
     checked: SECONDS,
@@ -1790,6 +2024,33 @@ it("a pass that could not read the viewer's authored page leaves the mark unset,
   ).not.toEqual([]);
   expect(h.owner.capability.inbox().partial).toBe(true);
   expect((await storage.read())?.mark).toBeUndefined();
+});
+
+it("a walk cut short by a dropped page saves an incomplete record, so the next launch reads the bootstrap, not the delta, and its walk", async () => {
+  const storage = memoryUnreadStorage();
+  // More of the viewer's messages than the authored page holds.
+  const store = Array.from({ length: 101 }, (_, i) =>
+    post(viewerKey, "quiet", T + i),
+  );
+  const later = (filters: readonly ReadFilter[]) =>
+    filters.some((filter) => filter.authors && filter.until !== undefined);
+  const first = await launch({ store, storage, fail: later });
+  await first.owner.capability.ensure();
+  await first.saved;
+  first.owner.dispose();
+  const record = await storage.read();
+  expect(record?.mark).toEqual({ at: T + 100, checked: SECONDS });
+  expect(record?.complete).toBe(false);
+  // The walk's dropped page says nothing.
+  expect(first.owner.capability.inbox().partial).toBeUndefined();
+  const next = await launch({ store, storage });
+  await next.owner.capability.ensure();
+  await next.saved;
+  expect(deltas(next)).toEqual([]);
+  expect(next.reader.read.mock.calls.some(([filters]) => later(filters))).toBe(
+    true,
+  );
+  expect((await storage.read())?.complete).toBe(true);
 });
 
 it("a held message deleted since the mark is read gone by a bootstrap before its roster sample confirms the mark past the deletion", async () => {
@@ -2423,10 +2684,8 @@ it("unread messages in a channel whose window dropped beside a busy one's edits 
   expect(h.count("team")).toBe(1000);
 });
 
-// What the mark does not cover is read once beside the delta (design §3.6).
-// Until the cut-over the bootstrap still reads every window, the roster
-// sample and the hot threads whole each pass, so a read made once shows as
-// one more than the bootstrap's.
+// What the mark does not cover is read once beside the delta (design §3.6);
+// a pass that catches up reads nothing else of the bootstrap.
 /** The filters of the reads sent while `pass` ran. */
 async function sentDuring(h: Launch, pass: () => Promise<unknown>) {
   const from = h.reader.read.mock.calls.length;
@@ -2472,9 +2731,9 @@ it("joining a channel holding an old unread message, and a DM, reads each once b
   });
   expect(joining.filter(deltaFilter)).not.toEqual([]);
   for (const id of ["fresh", "dm2"])
-    expect(joining.filter(windowOf(id))).toHaveLength(2);
-  expect(joining.filter(windowOf("team"))).toHaveLength(1);
-  expect(joining.filter(sampleFilter)).toHaveLength(2);
+    expect(joining.filter(windowOf(id))).toHaveLength(1);
+  expect(joining.filter(windowOf("team"))).toEqual([]);
+  expect(joining.filter(sampleFilter)).toHaveLength(1);
   expect(h.count("fresh")).toBe(1);
   expect(h.count("dm2")).toBe(1);
   expect((await storage.read())?.roster).toEqual(
@@ -2482,8 +2741,8 @@ it("joining a channel holding an old unread message, and a DM, reads each once b
   );
   const ticking = await sentDuring(h, () => h.reconnected());
   for (const id of ["fresh", "dm2"])
-    expect(ticking.filter(windowOf(id))).toHaveLength(1);
-  expect(ticking.filter(sampleFilter)).toHaveLength(1);
+    expect(ticking.filter(windowOf(id))).toEqual([]);
+  expect(ticking.filter(sampleFilter)).toEqual([]);
 });
 
 it("a channel joined while this device was closed is read once on the next launch, not trusted to the mark", async () => {
@@ -2491,12 +2750,12 @@ it("a channel joined while this device was closed is read once on the next launc
   const { h, storage } = await caughtUp([old], summaries([...ROSTER, "fresh"]));
   const launched = h.reader.read.mock.calls.flatMap(([filters]) => filters);
   expect(launched.filter(deltaFilter)).not.toEqual([]);
-  expect(launched.filter(windowOf("fresh"))).toHaveLength(2);
-  expect(launched.filter(windowOf("team"))).toHaveLength(1);
+  expect(launched.filter(windowOf("fresh"))).toHaveLength(1);
+  expect(launched.filter(windowOf("team"))).toEqual([]);
   expect(h.count("fresh")).toBe(1);
   expect((await storage.read())?.roster).toEqual(new Set([...ROSTER, "fresh"]));
   const ticking = await sentDuring(h, () => h.reconnected());
-  expect(ticking.filter(windowOf("fresh"))).toHaveLength(1);
+  expect(ticking.filter(windowOf("fresh"))).toEqual([]);
 });
 
 it("leaving a busy channel reads the roster sample once more at once, saving the record complete, and rejoining it reads its window once", async () => {
@@ -2508,20 +2767,19 @@ it("leaving a busy channel reads the roster sample once more at once, saving the
   });
   expect(leaving.filter(sampleFilter)).toEqual([
     expect.objectContaining({ "#h": ["team", "quiet", "dm"] }),
-    expect.objectContaining({ "#h": ["team", "quiet", "dm"] }),
   ]);
   expect(await storage.read()).toMatchObject({
     complete: true,
     roster: new Set(["team", "quiet", "dm"]),
   });
   const ticking = await sentDuring(h, () => h.reconnected());
-  expect(ticking.filter(sampleFilter)).toHaveLength(1);
+  expect(ticking.filter(sampleFilter)).toEqual([]);
   // Its evidence was purged with it: a re-grant is a join.
   const rejoining = await sentDuring(h, () => {
     h.roster(summaries(ROSTER));
     return h.owner.capability.ensure();
   });
-  expect(rejoining.filter(windowOf("busy"))).toHaveLength(2);
+  expect(rejoining.filter(windowOf("busy"))).toHaveLength(1);
 });
 
 it("a channel the mark does not cover has its remembered threads past the 50 hot ones read since their marks once beside the delta, and not again", async () => {
@@ -2551,9 +2809,57 @@ it("a channel the mark does not cover has its remembered threads past the 50 hot
     !!filter["#e"]?.includes(cold.id) && filter.since === T;
   const launched = await sentDuring(h, () => h.owner.capability.ensure());
   expect(launched.filter(deltaFilter)).not.toEqual([]);
-  expect(launched.filter(coldOf)).toHaveLength(2);
+  expect(launched.filter(coldOf)).toHaveLength(1);
   const ticking = await sentDuring(h, () => h.reconnected());
+  expect(ticking.filter(coldOf)).toEqual([]);
+});
+
+it("a channel the mark does not cover whose cold thread read drops stays out of the roster set, and is read once again on the next pass", async () => {
+  const hot = Array.from({ length: 50 }, (_, i) =>
+    post(peerKey, "team", T + 100 + i),
+  );
+  const cold = post(peerKey, "quiet", T);
+  const storage = memoryUnreadStorage();
+  await storage.save({
+    participation: {
+      roots: new Map([
+        ...hot.map((root): [string, { at: number }] => [
+          `team:${root.id}`,
+          { at: root.created_at },
+        ]),
+        [`quiet:${cold.id}`, { at: T }],
+      ]),
+    },
+    events: [],
+    structure: new Set(),
+    complete: true,
+    mark: { at: SECONDS - 600, checked: SECONDS - 60 },
+    roster: new Set(ROSTER.filter((id) => id !== "quiet")),
+    whole: new Set(hot.map((root) => `team:${root.id}`)),
+  });
+  const coldOf = (filter: ReadFilter) =>
+    !!filter["#e"]?.includes(cold.id) && filter.since === T;
+  let failing = true;
+  const h = await launch({
+    store: [...hot, cold],
+    storage,
+    fail: (filters) => failing && filters.some(coldOf),
+  });
+  const launched = await sentDuring(h, () => h.owner.capability.ensure());
+  await h.saved;
+  // Its window and the sample landed; its cold read, retried, did not.
+  expect(launched.filter(windowOf("quiet"))).toHaveLength(1);
+  expect(launched.filter(coldOf)).toHaveLength(2);
+  expect(h.owner.capability.inbox().partial).toBe(true);
+  expect((await storage.read())?.roster).toEqual(
+    new Set(ROSTER.filter((id) => id !== "quiet")),
+  );
+  failing = false;
+  const ticking = await sentDuring(h, () => h.reconnected());
+  expect(ticking.filter(windowOf("quiet"))).toHaveLength(1);
   expect(ticking.filter(coldOf)).toHaveLength(1);
+  expect(h.owner.capability.inbox().partial).toBeUndefined();
+  expect((await storage.read())?.roster).toEqual(new Set(ROSTER));
 });
 
 it("a reply of the viewer's in an old thread has the thread read whole once beside the delta, and not again", async () => {
@@ -2564,10 +2870,10 @@ it("a reply of the viewer's in an old thread has the thread read whole once besi
   store.push(mine);
   h.owner.accept([mine]);
   const replied = await sentDuring(h, () => h.reconnected());
-  expect(replied.filter(wholeOf(root.id))).toHaveLength(2);
+  expect(replied.filter(wholeOf(root.id))).toHaveLength(1);
   expect((await storage.read())?.whole).toEqual(new Set([`team:${root.id}`]));
   const ticking = await sentDuring(h, () => h.reconnected());
-  expect(ticking.filter(wholeOf(root.id))).toHaveLength(1);
+  expect(ticking.filter(wholeOf(root.id))).toEqual([]);
 });
 
 /** A launch caught up on a thread the viewer has no part in, and a pass
@@ -2589,9 +2895,9 @@ async function following() {
 
 it("following a thread has it read whole once beside the delta", async () => {
   const { h, root, follow } = await following();
-  expect(await follow(true)).toHaveLength(2);
+  expect(await follow(true)).toHaveLength(1);
   const ticking = await sentDuring(h, () => h.reconnected());
-  expect(ticking.filter(wholeOf(root.id))).toHaveLength(1);
+  expect(ticking.filter(wholeOf(root.id))).toEqual([]);
 });
 
 it("unfollowing a thread drops it from the threads read whole, so following it again reads it whole again", async () => {
@@ -2600,7 +2906,7 @@ it("unfollowing a thread drops it from the threads read whole, so following it a
   expect((await storage.read())?.whole).toEqual(new Set([`team:${root.id}`]));
   expect(await follow(false)).toEqual([]);
   expect((await storage.read())?.whole).toBeUndefined();
-  expect(await follow(true)).toHaveLength(2);
+  expect(await follow(true)).toHaveLength(1);
 });
 
 it("a dropped whole read of a thread is read again on the next pass for that thread alone", async () => {
@@ -2635,14 +2941,14 @@ it("a dropped whole read of a thread is read again on the next pass for that thr
       failing && filters.some((filter) => filter["#e"]?.includes(lost.id)),
   });
   const launched = await sentDuring(h, () => h.owner.capability.ensure());
-  // The bootstrap's read of both, retried once, and the promotion of the
-  // one not read whole, all dropped.
-  expect(launched.filter(wholeOf(lost.id))).toHaveLength(3);
+  // The promotion of the one not read whole, retried once, dropped.
+  expect(launched.filter(wholeOf(lost.id))).toHaveLength(2);
+  expect(launched.filter(wholeOf(kept.id))).toEqual([]);
   expect((await storage.read())?.whole).toEqual(new Set([keys[0]]));
   failing = false;
   const ticking = await sentDuring(h, () => h.reconnected());
-  expect(ticking.filter(wholeOf(kept.id))).toHaveLength(1);
-  expect(ticking.filter(wholeOf(lost.id))).toHaveLength(2);
+  expect(ticking.filter(wholeOf(kept.id))).toEqual([]);
+  expect(ticking.filter(wholeOf(lost.id))).toHaveLength(1);
   expect((await storage.read())?.whole).toEqual(new Set(keys));
 });
 
@@ -2681,13 +2987,12 @@ it("a delta that drops keeps the mark though the roster sample lands, leaves the
 
 it("Refresh pressed while a pass catches up has the bootstrap read after it, and each press settles once that has", async () => {
   const storage = await marked({ at: SECONDS - 600, checked: SECONDS - 60 });
-  // The launch's pass and the reconnect's read the channel's window; the
-  // bootstrap after them cannot, so only its end leaves the Inbox partial.
-  let windows = 0;
+  // Only the bootstrap after the reconnect's pass reads the channel's
+  // window, which fails, so only its end leaves the Inbox partial.
   const h = await launch({
     store: [hashed("team", SECONDS - 300)],
     storage,
-    fail: (filters) => filters.some(windowOf("team")) && ++windows > 2,
+    fail: (filters) => filters.some(windowOf("team")),
   });
   await h.owner.capability.ensure();
   const from = h.reader.read.mock.calls.length;
@@ -2712,7 +3017,8 @@ it("Refresh pressed while a pass catches up has the bootstrap read after it, and
     .slice(from)
     .flatMap(([filters]) => filters);
   expect(sent.filter(deltaFilter)).toHaveLength(1);
-  expect(sent.filter(windowOf("team"))).toHaveLength(3);
+  // Read and retried once.
+  expect(sent.filter(windowOf("team"))).toHaveLength(2);
 });
 
 it("Refresh pressed while a pass asked to catch up reads the bootstrap joins it, and one pressed before that pass routes has it read the bootstrap", async () => {
@@ -2806,9 +3112,8 @@ it("a resume launch whose cached roster is confirmed unchanged catches up with t
   expect(confirming.filter(deltaFilter)).toEqual([
     expect.objectContaining({ since: SECONDS - 600 - 1865 }),
   ]);
-  for (const id of ROSTER)
-    expect(confirming.filter(windowOf(id))).toHaveLength(1);
-  expect(confirming.filter(sampleFilter)).toHaveLength(1);
+  for (const id of ROSTER) expect(confirming.filter(windowOf(id))).toEqual([]);
+  expect(confirming.filter(sampleFilter)).toEqual([]);
 });
 
 it("a channel whose window dropped stays out of the roster set the mark covers, and is read once on the next pass", async () => {
@@ -2833,8 +3138,8 @@ it("a channel whose window dropped stays out of the roster set the mark covers, 
   const next = await sentDuring(h, () => h.reconnected());
   expect(next.filter(deltaFilter)).not.toEqual([]);
   for (const id of ids.slice(127))
-    expect(next.filter(windowOf(id))).toHaveLength(2);
-  expect(next.filter(windowOf("c0"))).toHaveLength(1);
+    expect(next.filter(windowOf(id))).toHaveLength(1);
+  expect(next.filter(windowOf("c0"))).toEqual([]);
   expect((await storage.read())?.roster).toEqual(new Set(ids));
 });
 
@@ -2857,7 +3162,7 @@ it("a delta over a partly confirmed roster keeps covering only the channels it r
     return h.owner.capability.ensure();
   });
   for (const id of ["dm", "busy"])
-    expect(confirming.filter(windowOf(id))).toHaveLength(2);
-  expect(confirming.filter(windowOf("team"))).toHaveLength(1);
+    expect(confirming.filter(windowOf(id))).toHaveLength(1);
+  expect(confirming.filter(windowOf("team"))).toEqual([]);
   expect((await storage.read())?.roster).toEqual(new Set(ROSTER));
 });

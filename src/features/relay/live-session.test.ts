@@ -13,6 +13,7 @@ import {
   signReadState,
   // @ts-expect-error Node-only host module
 } from "../../../browser-host/read-state.mjs";
+import { matchesEvent } from "./projection";
 import {
   bounds,
   flush,
@@ -1680,5 +1681,149 @@ it("skips the reads a continuous global replay covers, and keeps them after a cu
     stop();
   } finally {
     owner.dispose();
+  }
+});
+
+/** A session whose unread owner has read the bootstrap of a `count`-channel
+ * roster, each channel holding one peer message, and so confirmed a mark at
+ * that message's time. `answer` serves every pending read from `store`, as
+ * the relay matches it, and `unread` lists the unread evidence reads. */
+async function caughtUp(count: number) {
+  const relay = keypair(),
+    viewer = keypair(),
+    peer = keypair();
+  const wire = scriptedTransport(viewer.pubkey, relay.pubkey);
+  let live!: LiveCallbacks;
+  const owner = createRelaySession({
+    ...wire.transport,
+    subscribe(callbacks) {
+      live = callbacks;
+      return { update() {}, retry() {}, dispose() {} };
+    },
+  });
+  const ids = Array.from(
+    { length: count },
+    (_, i) => `room-${i.toString().padStart(3, "0")}`,
+  );
+  const at = 1_700_000_900;
+  const rosters = ids.map((id) => roster(relay, id, [viewer.pubkey]));
+  const store: RelayEvent[] = [
+    ...rosters,
+    ...ids.map((id) => message(peer, id, "unread evidence", at)),
+  ];
+  const unread: (readonly ReadFilter[])[] = [];
+  const answer = async () => {
+    await flush();
+    while (wire.pending.length) {
+      const batch = wire.next();
+      if (batch.filters.some((filter) => filter.kinds?.includes(9)))
+        unread.push(batch.filters);
+      batch.respond(
+        batch.filters.flatMap((filter) =>
+          store
+            .filter((event) => matchesEvent(event, filter))
+            .sort(
+              (a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id),
+            )
+            .slice(0, filter.limit),
+        ),
+      );
+      await flush();
+    }
+  };
+  /** Answers reads until `pass` settles, then those it left pending. */
+  const settle = async (pass: Promise<unknown>) => {
+    let done = false;
+    void pass.finally(() => {
+      done = true;
+    });
+    while (!done) await answer();
+    await answer();
+  };
+  live.receive(rosters);
+  await settle(owner.session.unread.ensure());
+  return {
+    owner,
+    live: () => live,
+    ids,
+    at,
+    peer,
+    store,
+    unread,
+    answer,
+    settle,
+  };
+}
+const DELTA_KINDS = [9, 40002, 40008, 40003, 5, 9005];
+
+it.each([1, 128])(
+  "a tick on a %s-channel roster reads one unread filter: the delta since the mark",
+  async (count) => {
+    const h = await caughtUp(count);
+    try {
+      const from = h.unread.length;
+      h.live().recover?.();
+      // The tick's pass starts once the read state is refreshed.
+      await vi.waitFor(async () => {
+        await h.answer();
+        expect(h.unread.length).toBeGreaterThan(from);
+      });
+      await h.settle(h.owner.session.unread.ensure());
+      expect(h.unread.slice(from)).toEqual([
+        [
+          {
+            kinds: expect.arrayContaining(DELTA_KINDS),
+            "#h": h.ids,
+            since: h.at - 1865,
+            limit: 500,
+          },
+        ],
+      ]);
+    } finally {
+      h.owner.dispose();
+    }
+  },
+);
+
+it("a reconnect after a 10-minute outage reads one delta from the mark less 1,865 s and nothing else of unread", async () => {
+  const h = await caughtUp(2);
+  const clock = vi.spyOn(Date, "now");
+  try {
+    const [first = ""] = h.ids;
+    h.live().state({ status: "connected", routes: [] });
+    h.live().established();
+    await h.settle(h.owner.session.unread.ensure());
+    await vi.waitFor(async () => {
+      await h.answer();
+      expect(h.owner.session.unread.inbox().freshness).toBe("observed");
+    });
+    h.live().state({ status: "retrying", routes: [] });
+    // Ten minutes later, with a message sent meanwhile.
+    clock.mockReturnValue(Date.now() + 600_000);
+    h.store.push(message(h.peer, first, "sent while away", h.at + 300));
+    const from = h.unread.length;
+    h.live().state({ status: "connected", routes: [] });
+    h.live().established();
+    await vi.waitFor(async () => {
+      await h.answer();
+      expect(h.unread.length).toBeGreaterThan(from);
+    });
+    await h.settle(h.owner.session.unread.ensure());
+    expect(h.unread.slice(from)).toEqual([
+      [
+        {
+          kinds: expect.arrayContaining(DELTA_KINDS),
+          "#h": h.ids,
+          since: h.at - 1865,
+          limit: 500,
+        },
+      ],
+    ]);
+    expect(
+      h.owner.session.unread.snapshot({ kind: "channel", channelId: first }),
+    ).toMatchObject({ observedCount: 2, freshness: "observed" });
+  } finally {
+    clock.mockRestore();
+    h.owner.dispose();
   }
 });

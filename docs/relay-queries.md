@@ -976,25 +976,25 @@ or unsupported quota retries require manual Retry, not a reset each minute.
 Signed grant notices renew joined batches that contain the affected channel.
 One 60-second recovery timer checks for batches whose last REQ is at least
 15 minutes old. It also hints the roster and unread owners to repair finite
-evidence. The roster hint starts a full channel-list read only when the last
-one is still owed or failed, or when no full read has completed for 15 minutes
-(`ROSTER_BACKSTOP_INTERVAL`). Membership notices carry joins and removals live.
-The read also covers changes with no notice: a channel delete, a moderation
-kick or DM, and a dropped frame. The unread hint runs while a repair is owed,
-and otherwise at most every 15 minutes (`UNREAD_BACKSTOP_INTERVAL`), counted
-from that owner's last full
-repair, which each connection's first establishment also asks for. A covered
-resume (a continuous membership replay) reads no read-state snapshot, so it does
-not restart that interval. The live stream carries every unread change; this
+evidence; a caught-up unread owner reads only what its channels gained since
+its last read of them (see [Inbox](inbox.md)). The roster hint starts a full
+channel-list read only when the last one is still owed or failed, or when no
+full read has completed for 15 minutes (`ROSTER_BACKSTOP_INTERVAL`). Membership
+notices carry joins and removals live. The read also covers changes with no
+notice: a channel delete, a moderation kick or DM, and a dropped frame. The
+unread hint runs while a repair is owed, and otherwise at most every 15 minutes
+(`UNREAD_BACKSTOP_INTERVAL`), counted from that owner's last full repair, which
+each connection's first establishment also asks for. A covered resume (a
+continuous membership replay) reads no read-state snapshot, so it does not
+restart that interval. The live stream carries every unread change; this
 backstop only repairs what it lost with no signal (a channel the relay pruned
 from a batch, or a dropped frame). A repair is owed while either of two debts
 is open, and each clears only its own way. Evidence debt (a failed evidence
-repair, an evidence overflow, or a drop) clears only when an evidence repair
-completes; a live message that marks the evidence observed again does not clear
-it. Marker debt (a failed snapshot read, a live marker that failed to apply, or
-a drop) clears only on a successful snapshot read or a covered resume. A
-snapshot read cannot clear evidence debt, and an evidence repair cannot clear
-marker debt. It does not
+repair or a drop) clears only when an evidence repair completes; a live message
+that marks the evidence observed again does not clear it. Marker debt (a failed
+snapshot read, a live marker that failed to apply, or a drop) clears only on a
+successful snapshot read or a covered resume. A snapshot read cannot clear
+evidence debt, and an evidence repair cannot clear marker debt. It does not
 renew singleton previews or add per-channel background history reads. When the socket
 delivered no frame for a whole interval, the timer also sends one empty probe
 REQ; if no frame arrives within the setup timeout, the socket is replaced through
