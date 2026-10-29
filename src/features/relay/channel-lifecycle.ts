@@ -73,6 +73,10 @@ export function createChannelLifecycle({
   let closed = false;
   let busy = false;
   let epoch = 0;
+  // `created_at` has one-second resolution and lifecycle tags are fixed, so
+  // on -> off -> on within a second would re-sign the first event's id, which
+  // the relay deduplicates. Each channel's commands stay strictly increasing.
+  const issued = new Map<string, number>();
   // Each in-flight operation and the channel it concerns; visibility reads have none.
   const controllers = new Map<AbortController, string | undefined>();
   const listeners = new Set<() => void>();
@@ -440,7 +444,12 @@ export function createChannelLifecycle({
               );
           };
           if (await authorize()) return;
-          const template = lifecycleTemplate(action, id);
+          const fresh = lifecycleTemplate(action, id);
+          const template = {
+            ...fresh,
+            created_at: Math.max(fresh.created_at, (issued.get(id) ?? -1) + 1),
+          };
+          issued.set(id, template.created_at);
           const signed = await writer.sign(structuredClone(template), signal);
           signal.throwIfAborted();
           if (
