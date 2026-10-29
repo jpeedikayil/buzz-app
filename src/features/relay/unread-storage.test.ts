@@ -168,19 +168,26 @@ const meta = (participation: unknown) => ({ version: 1, participation });
 it("a record round-trips with its threads, walk mark and events", async () => {
   memoryIndexedDB();
   const events = [event("first"), event("second")];
-  await browserUnreadStorage(scope).save({ participation: threads, events });
+  await browserUnreadStorage(scope).save({
+    participation: threads,
+    events,
+    complete: true,
+  });
   // The next launch reads it through its own connection.
   await expect(browserUnreadStorage(scope).read()).resolves.toEqual({
     participation: threads,
     events: events.map(wire),
+    complete: true,
   });
   await browserUnreadStorage(scope).save({
     participation: { roots: new Map() },
     events: [],
+    complete: false,
   });
   await expect(browserUnreadStorage(scope).read()).resolves.toEqual({
     participation: { roots: new Map() },
     events: [],
+    complete: false,
   });
 });
 
@@ -214,28 +221,54 @@ it("malformed meta reads as no record", async () => {
   });
 });
 
+it("a field added after the participation reads as incomplete when missing or malformed, keeping the record", async () => {
+  const idb = memoryIndexedDB();
+  const storage = browserUnreadStorage(scope);
+  const participation = { roots: [["c0:root", 1000]] };
+  const held = wire(event());
+  idb.seed("events", [scope, held.id], { scope, id: held.id, event: held });
+  for (const complete of [undefined, "true", 1, null, { complete: true }]) {
+    idb.seed("meta", scope, { ...meta(participation), complete });
+    await expect(storage.read()).resolves.toEqual({
+      participation: { roots: new Map([["c0:root", { at: 1000 }]]) },
+      events: [held],
+      complete: false,
+    });
+  }
+  idb.seed("meta", scope, { ...meta(participation), complete: true });
+  await expect(storage.read()).resolves.toMatchObject({ complete: true });
+});
+
 it("an oversized record is refused when saved, keeping the saved one, and reads as no record when stored", async () => {
   const idb = memoryIndexedDB();
   const storage = browserUnreadStorage(scope);
-  const saved: UnreadRecord = { participation: threads, events: [event()] };
+  const saved: UnreadRecord = {
+    participation: threads,
+    events: [event()],
+    complete: true,
+  };
   await storage.save(saved);
   const many = Array.from({ length: UNREAD_RECORD_EVENTS + 1 }, () => event());
   const large = [event("x".repeat(UNREAD_RECORD_BYTES))];
   for (const events of [many, large]) {
     await expect(
-      storage.save({ participation: threads, events }),
+      storage.save({ participation: threads, events, complete: true }),
     ).rejects.toThrow(RangeError);
     await expect(
-      memoryUnreadStorage().save({ participation: threads, events }),
+      memoryUnreadStorage().save({
+        participation: threads,
+        events,
+        complete: true,
+      }),
     ).rejects.toThrow(RangeError);
     await expect(storage.read()).resolves.toEqual({
-      participation: threads,
+      ...saved,
       events: saved.events.map(wire),
     });
   }
   // At the bound it still saves and reads.
   const bound = many.slice(0, UNREAD_RECORD_EVENTS);
-  await storage.save({ participation: threads, events: bound });
+  await storage.save({ participation: threads, events: bound, complete: true });
   expect((await storage.read())?.events).toHaveLength(UNREAD_RECORD_EVENTS);
   // Beyond it on disk, by count or by bytes, nothing is restored.
   const extra = many.at(-1) as RelayEvent;
@@ -245,7 +278,7 @@ it("an oversized record is refused when saved, keeping the saved one, and reads 
     event: wire(extra),
   });
   await expect(storage.read()).resolves.toBeUndefined();
-  await storage.save({ participation: threads, events: [] });
+  await storage.save({ participation: threads, events: [], complete: true });
   const [big] = large as [RelayEvent];
   idb.seed("events", [scope, big.id], { scope, id: big.id, event: wire(big) });
   await expect(storage.read()).resolves.toBeUndefined();
@@ -255,7 +288,7 @@ it("a blocked open is not held against the next read", async () => {
   const idb = memoryIndexedDB(1);
   const storage = browserUnreadStorage(scope);
   await expect(storage.read()).rejects.toThrow("Close other Buzz windows");
-  await storage.save({ participation: threads, events: [] });
+  await storage.save({ participation: threads, events: [], complete: true });
   await expect(storage.read()).resolves.toMatchObject({
     participation: threads,
   });
@@ -270,9 +303,17 @@ it("a save puts only the events the partition lacks and deletes the rest", async
     RelayEvent,
     RelayEvent,
   ];
-  await storage.save({ participation: threads, events: [a, b] });
+  await storage.save({
+    participation: threads,
+    events: [a, b],
+    complete: true,
+  });
   idb.writes.splice(0);
-  await storage.save({ participation: threads, events: [b, c] });
+  await storage.save({
+    participation: threads,
+    events: [b, c],
+    complete: true,
+  });
   // In any order: a transaction commits its writes together.
   expect(idb.writes).toHaveLength(3);
   expect(idb.writes).toEqual(
@@ -298,19 +339,21 @@ it("two interleaved saves leave exactly the last writer's events and meta", asyn
     roots: new Map([["c0:later", { at: 2000 }]]),
   };
   await Promise.all([
-    first.save({ participation: threads, events: [a, b] }),
-    second.save({ participation: later, events: [b, c] }),
+    first.save({ participation: threads, events: [a, b], complete: true }),
+    second.save({ participation: later, events: [b, c], complete: true }),
   ]);
   await expect(first.read()).resolves.toEqual({
     participation: later,
     events: [b, c].map(wire),
+    complete: true,
   });
   // A window's earlier save is no guide to what the partition holds now.
-  await first.save({ participation: threads, events: [a] });
+  await first.save({ participation: threads, events: [a], complete: true });
   expect(idb.keys("events")).toEqual([[scope, a.id]]);
   await expect(second.read()).resolves.toEqual({
     participation: threads,
     events: [wire(a)],
+    complete: true,
   });
 });
 
@@ -323,10 +366,12 @@ it("a purge clears only that partition", async () => {
     await browserUnreadStorage(other).save({
       participation: threads,
       events: [item],
+      complete: true,
     });
   await browserUnreadStorage(scope).save({
     participation: threads,
     events: [event(), event()],
+    complete: true,
   });
   await purgeUnreadStorage(scope);
   await expect(browserUnreadStorage(scope).read()).resolves.toBeUndefined();
@@ -335,5 +380,38 @@ it("a purge clears only that partition", async () => {
     await expect(browserUnreadStorage(other).read()).resolves.toEqual({
       participation: threads,
       events: [wire(item)],
+      complete: true,
     });
+});
+
+it("a window that read before a purge cannot save the record back; a session started after it can", async () => {
+  const idb = memoryIndexedDB();
+  const record = (events: RelayEvent[]): UnreadRecord => ({
+    participation: threads,
+    events,
+    complete: true,
+  });
+  // Another window's session for the community, live since before the leave.
+  const stale = browserUnreadStorage(scope);
+  await stale.save(record([event()]));
+  await stale.read();
+  await purgeUnreadStorage(scope);
+  await expect(stale.save(record([event()]))).rejects.toThrow("purged");
+  expect(idb.keys("events")).toEqual([]);
+  await expect(browserUnreadStorage(scope).read()).resolves.toBeUndefined();
+  // Rejoining starts a session that reads the purge and saves over it.
+  const rejoined = browserUnreadStorage(scope);
+  await expect(rejoined.read()).resolves.toBeUndefined();
+  const kept = event();
+  await rejoined.save(record([kept]));
+  // The stale window stays refused, and the rejoined record stands.
+  await expect(stale.save(record([event()]))).rejects.toThrow("purged");
+  await expect(stale.read()).resolves.toEqual({
+    ...record([kept]),
+    events: [wire(kept)],
+  });
+  await expect(stale.save(record([event()]))).rejects.toThrow("purged");
+  // A later purge fences the rejoined session as well.
+  await purgeUnreadStorage(scope);
+  await expect(rejoined.save(record([kept]))).rejects.toThrow("purged");
 });

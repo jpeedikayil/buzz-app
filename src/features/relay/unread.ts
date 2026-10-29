@@ -3,7 +3,7 @@ import { workflowOwner } from "./workflow-attribution";
 import { agentAudience } from "./audience";
 import type { InboxItem, InboxSnapshot } from "./inbox";
 import type { ChannelQueries } from "./contracts";
-import type { ReadFilter, RelayEvent } from "./events";
+import { eventDto, type ReadFilter, type RelayEvent } from "./events";
 import {
   effectiveFrontier,
   overrideActive,
@@ -20,6 +20,9 @@ import type { ReadJournal } from "./read-state-storage";
 import { markMessage } from "./read-state-retention";
 import type { Priority, RelayReader } from "./reader";
 import { isOversizedResponse } from "./errors";
+import { listByteSize } from "./budget";
+import { matchesEvent } from "./projection";
+import { yieldToHost } from "./yield";
 import { foldMessages, deletionApplies, messageAuthor } from "./fold";
 import { eventMs } from "./message-order";
 import { threadReference } from "./thread-reference";
@@ -39,7 +42,13 @@ import {
   type ThreadMark,
   type ThreadParticipation,
 } from "./thread-participation";
-import { memoryUnreadStorage, type UnreadStorage } from "./unread-storage";
+import {
+  memoryUnreadStorage,
+  UNREAD_RECORD_BYTES,
+  UNREAD_RECORD_EVENTS,
+  type UnreadRecord,
+  type UnreadStorage,
+} from "./unread-storage";
 
 export type UnreadSnapshot = Readonly<{
   target: ReadTarget;
@@ -369,7 +378,8 @@ export function createUnread({
   // what the walk, the evidence and follows can teach; the 1,000 limit is
   // applied where it is read (`newest()`) and in the saved record.
   let remembered: Map<string, ThreadMark> | undefined;
-  // What storage holds, with the walk mark, so a repair writes only a change.
+  // The threads the next repair starts from, with the walk mark: read from
+  // storage once, then what the last repair saved.
   let persisted: ThreadParticipation | undefined;
   const pinned = (event: RelayEvent) => {
     const channel = channelOf(event);
@@ -1387,6 +1397,7 @@ export function createUnread({
     } else {
       accessKey = next;
       purge();
+      if (waiting.length) admitRestored(waiting);
       // An initial observation made against a display-only roster still owes
       // evidence when membership becomes fresh, including during an active repair.
       // A newly accessible channel has no evidence yet, and the epoch bump
@@ -1786,6 +1797,81 @@ export function createUnread({
     Array.from({ length: Math.ceil(items.length / size) }, (_, i) =>
       items.slice(i * size, (i + 1) * size),
     );
+  /** The relay's order: newest first, then by ID. */
+  const byTime = (a: RelayEvent, b: RelayEvent) =>
+    b.created_at - a.created_at || a.id.localeCompare(b.id);
+  /** Channels the repair reads: joined, with membership confirmed. */
+  const rosterIds = () =>
+    channels
+      .list()
+      .channels.filter(
+        (channel) => !channel.cached && channel.members?.includes(viewer),
+      )
+      .map((channel) => channel.id);
+  /** The roster's windows, most recently read channels first (the viewer is
+   * active there, and their windows are the smallest; never-read channels go
+   * last), the channels with a read mark, and the roster sample. What a
+   * repair reads of the roster, and what a save keeps for the next one. */
+  function rosterReads(ids: readonly string[]) {
+    const { frontiers } = reads.state();
+    const floor = Math.floor(now() / 1000) - WINDOW_FLOOR_SECONDS;
+    const limit = Math.max(
+      WINDOW_LEAST,
+      Math.min(WINDOW_LIMIT, Math.floor(WINDOW_BUDGET / ids.length)),
+    );
+    const windows = ids
+      .map((id) => {
+        const marks = [frontiers[id], frontiers[`activity:${id}`]].filter(
+          (mark): mark is number => mark !== undefined,
+        );
+        return { id, since: marks.length ? Math.min(...marks) : undefined };
+      })
+      .sort((a, b) => (b.since ?? -1) - (a.since ?? -1));
+    return {
+      marked: new Set(
+        windows.flatMap(({ id, since }) => (since === undefined ? [] : [id])),
+      ),
+      windows: windows.map(
+        ({ id, since }): ReadFilter => ({
+          kinds: contentKinds,
+          "#h": [id],
+          since: since ?? floor,
+          include_aux: true,
+          limit,
+        }),
+      ),
+      sample: chunk(ids, SAMPLE_CHANNELS).map(
+        (part): ReadFilter => ({
+          kinds: contentKinds,
+          "#h": part,
+          include_aux: true,
+          limit: SAMPLE_LIMIT,
+        }),
+      ),
+    };
+  }
+  /** A thread read: whole, or replies since a time. */
+  const threadRead = (
+    channelId: string,
+    rootIds: readonly string[],
+    since?: number,
+  ): ReadFilter => ({
+    kinds: contentKinds,
+    "#h": [channelId],
+    "#e": [...rootIds],
+    ...(since === undefined ? {} : { since }),
+    include_aux: true,
+    limit: since === undefined ? THREAD_LIMIT : COLD_LIMIT,
+  });
+  /** The viewer's newest authored page, since the last walk when there was
+   * one. */
+  const authoredRead = (walk: ThreadParticipation["walk"]): ReadFilter => ({
+    kinds: contentKinds,
+    authors: [viewer],
+    ...(walk ? { since: walk.since } : {}),
+    include_aux: true,
+    limit: WINDOW_LIMIT,
+  });
   /** One repair's reads: whether any landed, whether one was dropped, and
    * the last failure, which is the repair's error when nothing landed. */
   type Pass = { landed: boolean; dropped: boolean; failure: unknown };
@@ -1872,8 +1958,10 @@ export function createUnread({
           divided(request, parts);
           continue;
         }
-        if (result) pass.landed = true;
-        else pass.dropped = true;
+        if (result) {
+          pass.landed = true;
+          reconcile(request, result);
+        } else pass.dropped = true;
         if (
           closed ||
           generation !== epoch ||
@@ -1887,17 +1975,305 @@ export function createUnread({
     );
     return !closed && generation === epoch && !retired;
   }
+  // Saved evidence is restored once a session, verified off the repair's
+  // path; `restoring` is that verification, and the reads that land during
+  // it wait in `early` to be reconciled once it is in.
+  let restored = false;
+  let restoring: { done: Promise<void> } | undefined;
+  let early: [readonly ReadFilter[], readonly RelayEvent[]][] = [];
+  // Restored content no read has returned yet (see `reconcile`).
+  const unconfirmed = new Set<string>();
+  // Restored evidence of channels listed but not yet confirmed, which
+  // `accept` refuses: offered again as access changes, and saved meanwhile.
+  let waiting: RelayEvent[] = [];
+  const awaitingAccess = (event: RelayEvent) => {
+    const channelId = channelOf(event);
+    return (
+      channelId !== undefined &&
+      !allowed(channelId) &&
+      channels
+        .list()
+        .channels.some(
+          (channel) =>
+            channel.id === channelId && channel.members?.includes(viewer),
+        )
+    );
+  };
+  function admitRestored(batch: readonly RelayEvent[]) {
+    accept(batch);
+    for (const event of batch)
+      if (contentKind(event) && events.has(event.id)) unconfirmed.add(event.id);
+    waiting = batch.filter(
+      (event) => !events.has(event.id) && awaitingAccess(event),
+    );
+  }
+  /** Re-verifies the saved evidence in yielding batches, as the channel
+   * heads restore does, and admits it whole or not at all: storage is
+   * untrusted, and one event failing verification discards the evidence,
+   * which the repair reads again. Reads that landed meanwhile are then
+   * reconciled against it. */
+  function restore(saved: readonly unknown[]) {
+    const run = { done: Promise.resolve() };
+    restoring = run;
+    run.done = (async () => {
+      const verified: RelayEvent[] = [];
+      for (let index = 0; index < saved.length; index += 8) {
+        if (index) await yieldToHost();
+        if (closed || restoring !== run) return;
+        for (const value of saved.slice(index, index + 8))
+          verified.push(eventDto(JSON.parse(JSON.stringify(value))));
+      }
+      admitRestored(verified);
+    })()
+      .catch(() => {})
+      .finally(() => {
+        if (restoring !== run) return;
+        restoring = undefined;
+        const landed = early;
+        early = [];
+        for (const [request, result] of landed) reconcile(request, result);
+      });
+  }
+  /** Restored evidence a read should have returned and did not is gone from
+   * the relay: deleted, or no longer readable, while this device was closed,
+   * which no read tells. A read returns each filter's newest matches, so a
+   * short page covers every match and a full one those newer than its last;
+   * a keyset page starts below the newest and is not judged. Plain channel
+   * reads leave deletions out, so without this a deleted message would be
+   * restored, and saved again, for good. */
+  function reconcile(
+    request: readonly ReadFilter[],
+    result: readonly RelayEvent[],
+  ) {
+    if (restoring) early.push([request, result]);
+    if (!unconfirmed.size) return;
+    const returned = new Set(result.map((event) => event.id));
+    const gone = new Set<string>();
+    for (const filter of request) {
+      if (filter.until !== undefined) continue;
+      const page = result
+        .filter((event) => matchesEvent(event, filter))
+        .sort(byTime);
+      const last = page.length < filter.limit ? undefined : page.at(-1);
+      for (const id of unconfirmed) {
+        const event = events.get(id);
+        if (!event) unconfirmed.delete(id);
+        else if (!matchesEvent(event, filter)) continue;
+        else if (returned.has(id)) unconfirmed.delete(id);
+        else if (!last || event.created_at > last.created_at) gone.add(id);
+      }
+    }
+    if (!gone.size) return;
+    const changed = new Set<string>();
+    for (const id of gone) {
+      const event = events.get(id) as RelayEvent;
+      unconfirmed.delete(id);
+      events.delete(id);
+      bytes -= sizeOf(event);
+      const channel = channelOf(event);
+      if (channel) changed.add(channel);
+    }
+    dropOrphans();
+    indexed = false;
+    publish(changed);
+  }
+  // Content that retention evicted or refused since the repair began, or
+  // undefined once that outgrew the evidence budget: a save whose reads
+  // would select one of them is not complete.
+  let dropped: RelayEvent[] | undefined = [];
+  const drop = (event: RelayEvent) => {
+    if (contentKind(event) && dropped && dropped.push(event) > EVENT_BUDGET)
+      dropped = undefined;
+  };
+  /** What a save keeps of the evidence held (design §3.2), so a relaunch
+   * shows what the next warm repair would: what that repair's own reads
+   * would return, judged against held evidence newest first with each
+   * filter's limit (the cold read's boundary reply passed over, as the
+   * repair passes it); every row the projection counts unread or cannot
+   * decide yet; and what kept rows depend on: their roots and parents, the
+   * viewer's messages in their threads, and the edits and deletions of
+   * them. Beyond the record's bounds nothing is kept; that, or a selected
+   * event retention dropped, leaves the record incomplete. */
+  function retention(participation: ThreadParticipation) {
+    indexEvidence();
+    const ids = rosterIds();
+    const members = new Set(ids);
+    // One copy of an event dropped and read again: the one held.
+    const held = [
+      ...new Map(
+        [...(dropped ?? []), ...events.values()].map((event) => [
+          event.id,
+          event,
+        ]),
+      ).values(),
+    ].filter((event) => contentKind(event) && !tombstones.has(event.id));
+    const heldIds = new Map(held.map((event) => [event.id, event]));
+    const inChannel = new Map<string, RelayEvent[]>();
+    const tagged = new Map<string, RelayEvent[]>();
+    for (const event of held) {
+      const channelId = channelOf(event);
+      if (!channelId) continue;
+      inChannel.set(channelId, [...(inChannel.get(channelId) ?? []), event]);
+      for (const [name, id] of event.tags)
+        if (name === "e" && id)
+          tagged.set(id, [...(tagged.get(id) ?? []), event]);
+    }
+    const kept = new Set<RelayEvent>();
+    const read = (
+      candidates: readonly RelayEvent[],
+      filter: ReadFilter,
+      passed?: string,
+    ) =>
+      candidates
+        .filter((event) => matchesEvent(event, filter))
+        .sort(byTime)
+        .slice(0, filter.limit)
+        .filter((event) => event.id !== passed);
+    const keep = (page: readonly RelayEvent[]) => {
+      for (const event of page) kept.add(event);
+    };
+    const { windows, sample } = rosterReads(ids);
+    for (const filter of [...windows, ...sample])
+      keep(
+        read(
+          (filter["#h"] ?? []).flatMap((id) => inChannel.get(id) ?? []),
+          filter,
+        ),
+      );
+    keep(read(held, authoredRead(participation.walk)));
+    const newest = [...participation.roots]
+      .filter(([key]) => {
+        const channelId = key.slice(0, key.indexOf(":"));
+        return members.has(channelId) && choices().get(key) !== false;
+      })
+      .sort(([, a], [, b]) => b.at - a.at)
+      .slice(0, THREAD_PARTICIPATION_LIMIT);
+    newest.forEach(([key, mark], rank) => {
+      const separator = key.indexOf(":");
+      const channelId = key.slice(0, separator);
+      const rootId = key.slice(separator + 1);
+      const replies = tagged.get(rootId) ?? [];
+      const whole = read(replies, threadRead(channelId, [rootId]));
+      if (rank < HOT_THREADS) {
+        keep(whole);
+        // Read by ID when not held.
+        const root = heldIds.get(rootId) ?? lookupEvents.get(rootId);
+        if (root) kept.add(root);
+        return;
+      }
+      // A full page is read again whole, as `landed` does.
+      const recent = read(replies, threadRead(channelId, [rootId], mark.at));
+      keep(
+        recent.length < COLD_LIMIT
+          ? recent.filter((event) => event.id !== mark.newestId)
+          : whole,
+      );
+    });
+    const state = reads.state();
+    for (const [channelId, entries] of byChannel) {
+      const dm = isDm(channelId);
+      for (const entry of entries)
+        if (isUnread(entry, state, dm) || undecided(entry, dm))
+          kept.add(entry.event);
+    }
+    const threadOf = (event: RelayEvent) =>
+      `${channelOf(event)}:${threadReference(event)?.rootId ?? event.id}`;
+    for (const event of [...kept]) {
+      const reference = threadReference(event);
+      for (const id of reference
+        ? [reference.rootId, reference.parentId]
+        : []) {
+        const dependency = structural(id);
+        if (dependency) kept.add(dependency);
+      }
+    }
+    const threads = new Set([...kept].map(threadOf));
+    for (const event of [...events.values(), ...witnesses.values()])
+      if (
+        event.pubkey === viewer &&
+        contentKind(event) &&
+        !tombstones.has(event.id) &&
+        threads.has(threadOf(event))
+      )
+        kept.add(event);
+    const keptIds = new Set([...kept].map((event) => event.id));
+    for (let grew = true; grew; ) {
+      grew = false;
+      for (const event of events.values())
+        if (
+          auxiliaryKind(event) &&
+          !keptIds.has(event.id) &&
+          event.tags.some(([name, id]) => name === "e" && keptIds.has(id ?? ""))
+        ) {
+          keptIds.add(event.id);
+          kept.add(event);
+          grew = true;
+        }
+    }
+    const retained = [...kept].filter(
+      (event) =>
+        events.has(event.id) ||
+        lookupEvents.has(event.id) ||
+        witnesses.has(event.id),
+    );
+    const lost = !dropped || retained.length < kept.size;
+    retained.push(...waiting.filter(awaitingAccess));
+    const fits =
+      retained.length <= UNREAD_RECORD_EVENTS &&
+      listByteSize(retained) <= UNREAD_RECORD_BYTES;
+    return { events: fits ? retained : [], complete: fits && !lost };
+  }
+  // The last record a save landed, so a save writes only a change: a save
+  // that is refused or aborted leaves it, and the next save writes again.
+  let savedKey: string | undefined;
+  let owed: ThreadParticipation | undefined;
+  /** The one way the record is saved: the threads with the evidence kept
+   * for them (see `retention`), so a save carrying new threads never drops
+   * saved evidence. While restored evidence is still being verified the
+   * save waits for it, rather than replace it with what is held so far. */
+  function persist(participation: ThreadParticipation) {
+    if (restoring) {
+      if (!owed) {
+        const generation = epoch;
+        void restoring.done.then(() => {
+          const next = owed;
+          owed = undefined;
+          if (next && !closed && generation === epoch) persist(next);
+        });
+      }
+      owed = participation;
+      return;
+    }
+    const record = { participation, ...retention(participation) };
+    const key = JSON.stringify([
+      [...participation.roots],
+      participation.walk?.since,
+      record.events.map((event) => event.id).sort(),
+      record.complete,
+    ]);
+    if (key === savedKey) return;
+    void storage.save(record).then(
+      () => {
+        savedKey = key;
+      },
+      () => {},
+    );
+  }
   async function rememberedRoots(): Promise<ThreadParticipation> {
     if (!persisted) {
+      let record: UnreadRecord<unknown> | undefined;
       try {
-        persisted =
-          (await storage.read())?.participation ?? NO_THREAD_PARTICIPATION;
+        record = await storage.read();
       } catch {
         // Unreadable storage forgets nothing durable: this repair relearns
         // what the relay still shows and saves that.
-        persisted = NO_THREAD_PARTICIPATION;
       }
+      persisted = record?.participation ?? NO_THREAD_PARTICIPATION;
       remembered = new Map(persisted.roots);
+      // Once a session: a cache reset reads the threads again, not the
+      // evidence it cleared.
+      if (!restored && record?.events.length) restore(record.events);
+      restored = true;
     }
     return {
       roots: remembered ?? persisted.roots,
@@ -2014,18 +2390,7 @@ export function createUnread({
     // The reply each cold read begins at, by root: already seen, so its
     // return is neither evidence nor a reason to fetch its root.
     const boundary = new Map<string, string>();
-    const threads = (
-      channelId: string,
-      rootIds: readonly string[],
-      since?: number,
-    ): ReadFilter => ({
-      kinds: contentKinds,
-      "#h": [channelId],
-      "#e": [...rootIds],
-      ...(since === undefined ? {} : { since }),
-      include_aux: true,
-      limit: since === undefined ? THREAD_LIMIT : COLD_LIMIT,
-    });
+    const threads = threadRead;
     /** The roots of `keys` not yet asked for, by channel, now asked for. */
     const group = (keys: readonly string[]) => {
       const groups = new Map<string, string[]>();
@@ -2053,8 +2418,6 @@ export function createUnread({
         }),
       );
     };
-    const byTime = (a: RelayEvent, b: RelayEvent) =>
-      b.created_at - a.created_at || a.id.localeCompare(b.id);
     // The walk: pages asked for beyond the first, the newest authored time
     // seen, and whether the walk reached its end this repair.
     let pages = 0;
@@ -2065,15 +2428,7 @@ export function createUnread({
       walk: {
         /** The authored read riding the first request: the viewer's newest
          * page, since the last walk when there was one. */
-        first(): ReadFilter {
-          return {
-            kinds: contentKinds,
-            authors: [viewer],
-            ...(stored.walk ? { since: stored.walk.since } : {}),
-            include_aux: true,
-            limit: WINDOW_LIMIT,
-          };
-        },
+        first: () => authoredRead(stored.walk),
         /** Learns the threads the viewer replied in from a walk page and
          * returns the next page when this one was full: the viewer's older
          * messages, keyset from the page's oldest. */
@@ -2347,24 +2702,8 @@ export function createUnread({
           walked && newestWalked !== undefined
             ? { since: newestWalked }
             : stored.walk;
-        const next: ThreadParticipation = {
-          roots: nextRoots,
-          ...(walk ? { walk } : {}),
-        };
-        if (
-          persisted?.roots.size !== nextRoots.size ||
-          [...nextRoots].some(([key, mark]) => {
-            const was = persisted?.roots.get(key);
-            return was?.at !== mark.at || was?.newestId !== mark.newestId;
-          }) ||
-          persisted?.walk?.since !== walk?.since
-        ) {
-          persisted = next;
-          // The record holds no evidence yet, only the threads.
-          void storage
-            .save({ participation: next, events: [] })
-            .catch(() => {});
-        }
+        persisted = { roots: nextRoots, ...(walk ? { walk } : {}) };
+        persist(persisted);
       },
     };
   }
@@ -2419,12 +2758,7 @@ export function createUnread({
     refresh = (async () => {
       const [, stored] = await Promise.all([reads.ensure(), rememberedRoots()]);
       if (closed || generation !== epoch) return;
-      const ids = channels
-        .list()
-        .channels.filter(
-          (channel) => !channel.cached && channel.members?.includes(viewer),
-        )
-        .map((channel) => channel.id);
+      const ids = rosterIds();
       if (!ids.length) {
         freshness = "observed";
         owing = false;
@@ -2436,28 +2770,9 @@ export function createUnread({
         // channels. Each bounded request owns its queue-inclusive deadline
         // after marker sync; optional profiles must not block the initial
         // user-visible observation.
-        const { frontiers } = reads.state();
-        const floor = Math.floor(now() / 1000) - WINDOW_FLOOR_SECONDS;
-        const limit = Math.max(
-          WINDOW_LEAST,
-          Math.min(WINDOW_LIMIT, Math.floor(WINDOW_BUDGET / ids.length)),
-        );
-        // Most recently read channels first: the viewer is active there, and
-        // their windows are the smallest; never-read channels go last.
-        const windows = ids
-          .map((id) => {
-            const marks = [frontiers[id], frontiers[`activity:${id}`]].filter(
-              (mark): mark is number => mark !== undefined,
-            );
-            return {
-              id,
-              since: marks.length ? Math.min(...marks) : undefined,
-            };
-          })
-          .sort((a, b) => (b.since ?? -1) - (a.since ?? -1));
-        const marked = new Set(
-          windows.flatMap(({ id, since }) => (since === undefined ? [] : [id])),
-        );
+        const { marked, windows, sample } = rosterReads(ids);
+        // This repair reads again what retention dropped before it.
+        dropped = [];
         // The viewer's newest messages ride the first request, and the
         // remembered threads most recently read or written in are read right
         // behind it, before the windows: the pinned rows are the ones the
@@ -2467,31 +2782,12 @@ export function createUnread({
         // the viewer's history, behind them.
         const pass = participating(new Set(ids), stored);
         const requests = chunk<ReadFilter>(
-          [
-            pass.walk.first(),
-            ...windows.map(({ id, since }) => ({
-              kinds: contentKinds,
-              "#h": [id],
-              since: since ?? floor,
-              include_aux: true,
-              limit,
-            })),
-          ],
+          [pass.walk.first(), ...windows],
           UNREAD_WINDOW_BATCH,
         );
         const hot = pass.hot();
         requests.splice(1, 0, ...hot);
-        requests.push(
-          ...chunk(ids, SAMPLE_CHANNELS).map((part) => [
-            {
-              kinds: contentKinds,
-              "#h": part,
-              include_aux: true,
-              limit: SAMPLE_LIMIT,
-            },
-          ]),
-          ...pass.cold(),
-        );
+        requests.push(...sample.map((filter) => [filter]), ...pass.cold());
         remembered = pass.roots;
         const run: Run = { pass, generation, queue: requests, pooling: true };
         activePass = run;
@@ -2815,6 +3111,19 @@ export function createUnread({
       ? !pinned(event)
       : (pinned(event) || channelOf(event) === channelOf(oldest)) &&
         older(event, oldest) < 0;
+  /** Edits and deletions stay only while one of their targets does. */
+  function dropOrphans() {
+    for (const [id, event] of events) {
+      if (!auxiliaryKind(event)) continue;
+      const targets = event.tags.flatMap(([name, target]) =>
+        name === "e" && target ? [target] : [],
+      );
+      if (targets.length && targets.every((target) => !events.has(target))) {
+        events.delete(id);
+        bytes -= sizeOf(event);
+      }
+    }
+  }
   function accept(batch: readonly RelayEvent[]) {
     if (closed) return false;
     retract(batch);
@@ -2873,6 +3182,7 @@ export function createUnread({
         pool.bytes -= sizeOf(oldest);
         events.delete(oldest.id);
         bytes -= sizeOf(oldest);
+        drop(oldest);
         evicted = true;
         const channel = channelOf(oldest);
         if (channel) {
@@ -2884,7 +3194,10 @@ export function createUnread({
           break;
         }
       }
-      if (!admitted) continue;
+      if (!admitted) {
+        drop(event);
+        continue;
+      }
       events.set(event.id, event);
       bytes += size;
       // Later events in this batch see this one as retained.
@@ -2914,18 +3227,7 @@ export function createUnread({
         known.delete(channel)
       )
         changed.add(channel);
-    // Edits and deletions stay only while one of their targets does.
-    if (evicted)
-      for (const [id, event] of events) {
-        if (!auxiliaryKind(event)) continue;
-        const targets = event.tags.flatMap(([name, target]) =>
-          name === "e" && target ? [target] : [],
-        );
-        if (targets.length && targets.every((target) => !events.has(target))) {
-          events.delete(id);
-          bytes -= sizeOf(event);
-        }
-      }
+    if (evicted) dropOrphans();
     if (changed.size) {
       // The session admits profiles from this same batch after unread evidence.
       if (profiles)
@@ -3662,6 +3964,12 @@ export function createUnread({
       activePass = undefined;
       remembered = undefined;
       persisted = undefined;
+      restoring = undefined;
+      early = [];
+      unconfirmed.clear();
+      waiting = [];
+      owed = undefined;
+      dropped = [];
       partial = false;
       events.clear();
       known.clear();

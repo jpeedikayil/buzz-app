@@ -149,6 +149,18 @@ that mark back to itself (a thread or root marked unread, back to the root).
 A device's first repair also walks back through the viewer's own messages,
 behind the windows, to learn the threads they replied in before their most
 recent messages; later repairs read only what they wrote since.
+With those threads, each repair keeps on this device the signed events the
+next one would read of what is held, every unread or undecided row, and what
+those rows depend on—roots, parents, the viewer's own messages in their
+threads, edits and deletions—up to 2,048 events and 4 MiB, beyond which it
+keeps none. A launch verifies them again and shows them before the relay
+answers; one that fails verification discards them all, keeping the threads.
+The full repair still runs on every launch, and restored events only add to
+what it reads: one that a read should have returned and did not, deleted
+while the device was closed, is dropped, and one whose channel membership is
+not confirmed yet waits for it. Leaving a community clears its record, and a
+window still open on it cannot save it back; a session that first reads the
+record after that, as when rejoining, saves as usual.
 The windows, the viewer's own recent messages and the thread reads ride
 together, up to 128 filters per request with two requests in flight, so a
 roster costs one or two round trips; the newest events across the roster are

@@ -442,7 +442,9 @@ it("a lookup that lands after the repair reads the thread it found in the backgr
   const inbox = () => owner.capability.inbox();
   expect(inbox()).toMatchObject({ status: "ready", freshness: "observed" });
   expect(inbox().partial).toBeUndefined();
-  expect(save).not.toHaveBeenCalled();
+  // The repair saved its evidence, and no thread yet.
+  expect(save).toHaveBeenCalledTimes(1);
+  expect((await remembered(storage)).roots.size).toBe(0);
   expect(threadReads()).toBe(0);
   // The membership lookup finds the viewer's reply: one background read of
   // the thread, then the record written with its key and the viewer's reply,
@@ -454,7 +456,7 @@ it("a lookup that lands after the repair reads the thread it found in the backgr
     }),
   );
   expect(threadReads()).toBe(1);
-  expect(save).toHaveBeenCalledTimes(1);
+  expect(save).toHaveBeenCalledTimes(2);
   expect(inbox()).toMatchObject({ status: "ready", freshness: "observed" });
   expect(inbox().partial).toBeUndefined();
   expect(inbox().error).toBeUndefined();
@@ -568,7 +570,8 @@ it("a follow-up pre-empted by a new repair leaves the thread it fed to that repa
   // The lookup finds the viewer's reply after the repair saved; its
   // follow-up read is in flight when a new repair starts.
   await vi.waitFor(() => expect(threadReads()).toBe(1));
-  expect(save).not.toHaveBeenCalled();
+  // Only the repair has saved.
+  expect(save).toHaveBeenCalledTimes(1);
   const refresh = owner.capability.refresh();
   try {
     // That repair remembers the fed thread and reads it itself.
@@ -578,7 +581,7 @@ it("a follow-up pre-empted by a new repair leaves the thread it fed to that repa
   }
   await refresh;
   expect(threadReads()).toBe(2);
-  expect(save).toHaveBeenCalledTimes(1);
+  expect(save).toHaveBeenCalledTimes(2);
   expect((await remembered(storage)).roots.get(`c0:${root.id}`)).toEqual({
     at: 11,
     newestId: mine.id,

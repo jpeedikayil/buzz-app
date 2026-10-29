@@ -54,7 +54,7 @@ const NOW = 10_000_000;
 const remembered = async (storage: UnreadStorage) =>
   (await storage.read())?.participation ?? NO_THREAD_PARTICIPATION;
 const remember = (storage: UnreadStorage, participation: ThreadParticipation) =>
-  storage.save({ participation, events: [] });
+  storage.save({ participation, events: [], complete: false });
 
 const owners: ReturnType<typeof createUnread>[] = [];
 afterEach(() => {
@@ -1168,13 +1168,14 @@ it("remembered participation is saved and refetches the thread after the authore
     expect.objectContaining({ rootId: root.id, unreadCount: 200 }),
   );
   // Remembered as of the viewer's reply: the unread answers advance nothing.
-  expect(save).toHaveBeenCalledWith({
-    participation: {
-      roots: new Map([[`c0:${root.id}`, { at: 1010, newestId: mine.id }]]),
-      walk: { since: 1010 },
-    },
-    events: [],
-  });
+  expect(save).toHaveBeenCalledWith(
+    expect.objectContaining({
+      participation: {
+        roots: new Map([[`c0:${root.id}`, { at: 1010, newestId: mine.id }]]),
+        walk: { since: 1010 },
+      },
+    }),
+  );
   first.owner.dispose();
   // A later session: the viewer has since written a page of newer messages
   // elsewhere, so their authored page no longer reaches the old reply, which

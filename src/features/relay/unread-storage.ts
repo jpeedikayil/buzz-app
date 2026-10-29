@@ -10,16 +10,19 @@ import {
  * viewer: the threads the viewer is part of and signed evidence. A record is
  * read whole or not at all, so nothing starts from part of one. Events are
  * signed wire records; read back from storage they are untrusted until the
- * owner re-verifies them, and one that fails discards the record. */
+ * owner re-verifies them, and one that fails discards them. `complete` says
+ * the events hold everything the next warm repair would read. */
 export type UnreadRecord<Event = RelayEvent> = Readonly<{
   participation: ThreadParticipation;
   events: readonly Event[];
+  complete: boolean;
 }>;
 export type UnreadStorage = Readonly<{
   /** The saved record, or undefined when none is saved or it is unusable. */
   read(): Promise<UnreadRecord<unknown> | undefined>;
   /** Replaces the record: its events become exactly those given. A record
-   * beyond the bounds is refused and the saved one kept. */
+   * beyond the bounds is refused and the saved one kept, as is any record
+   * once the partition was purged after this storage first read it. */
   save(record: UnreadRecord): Promise<void>;
   close(): void;
 }>;
@@ -35,6 +38,9 @@ type StoredMeta = {
     roots: ([string, number] | [string, number, string])[];
     walk?: { since: number };
   };
+  complete?: boolean;
+  /** The partition's last purge, kept by every record written after it. */
+  purged?: string;
 };
 
 const time = (value: unknown): value is number =>
@@ -47,9 +53,12 @@ function parseRoot(entry: unknown): [string, ThreadMark] | undefined {
   if (typeof newestId === "string" && newestId.length <= 64)
     return [key, { at, newestId }];
 }
-/** Storage is untrusted: a meta of another version or any malformed part, or
- * events beyond the bounds, read as no record. Event validity is left to the
- * owner's re-verification. */
+/** Storage is untrusted: a meta of another version or any malformed part of
+ * its participation, or events beyond the bounds, read as no record. Fields
+ * added later under this version read leniently instead, a missing or
+ * malformed one as incomplete, so a record from an older build keeps its
+ * threads and only owes a full repair. Event validity is left to the owner's
+ * re-verification. */
 function parse(
   raw: unknown,
   events: readonly unknown[],
@@ -83,10 +92,18 @@ function parse(
       ? { roots: marks, walk: { since } }
       : { roots: marks },
     events,
+    complete: (raw as { complete?: unknown }).complete === true,
   };
 }
+const purgeOf = (raw: unknown) => {
+  const purged = (raw as { purged?: unknown } | null | undefined)?.purged;
+  return typeof purged === "string" ? purged : undefined;
+};
 /** The stored meta, refusing a record that would not read back. */
-function stored({ participation, events }: UnreadRecord): StoredMeta {
+function stored(
+  { participation, events, complete }: UnreadRecord,
+  purged?: string,
+): StoredMeta {
   const meta: StoredMeta = {
     version: VERSION,
     participation: {
@@ -97,6 +114,8 @@ function stored({ participation, events }: UnreadRecord): StoredMeta {
         ? { walk: { since: participation.walk.since } }
         : {}),
     },
+    complete,
+    ...(purged === undefined ? {} : { purged }),
   };
   if (
     events.length > UNREAD_RECORD_EVENTS ||
@@ -117,6 +136,7 @@ export function memoryUnreadStorage(): UnreadStorage {
       saved = {
         participation: { roots: new Map(roots), ...(walk ? { walk } : {}) },
         events: [...record.events],
+        complete: record.complete,
       };
     },
     close() {},
@@ -154,10 +174,19 @@ function settle(
 /** Device-local and partitioned by relay and viewer, like read state: one
  * meta entry per partition, and its events keyed by partition and ID so a
  * save writes only what changed. A sibling database rather than more stores
- * in `buzz-read-state-v1`, so neither owner's schema version gates the other. */
+ * in `buzz-read-state-v1`, so neither owner's schema version gates the other.
+ *
+ * Leaving a community purges its partition while another window may still
+ * hold a session for it, until that window reloads. Its saves would bring
+ * the left community's evidence back, so each storage keeps the purge its
+ * first read saw and refuses to save over a later one; a session started
+ * after the purge, such as one for rejoining, saves as usual. A window whose
+ * session first reads after the purge is not told apart from such a one. */
 export function browserUnreadStorage(scope: string): UnreadStorage {
   let database: Promise<IDBDatabase> | undefined;
   let closed = false;
+  let read = false;
+  let purged: string | undefined;
   function open() {
     if (closed) return Promise.reject(new Error("Unread storage closed"));
     // A failed open is not held against the next read or save.
@@ -180,13 +209,16 @@ export function browserUnreadStorage(scope: string): UnreadStorage {
           .getAll(IDBKeyRange.only(scope), UNREAD_RECORD_EVENTS + 1);
         settle(
           tx,
-          () =>
+          () => {
+            if (!read) purged = purgeOf(meta.result);
+            read = true;
             resolve(
               parse(
                 meta.result,
                 rows.result.map((row: { event?: unknown }) => row?.event),
               ),
-            ),
+            );
+          },
           reject,
         );
       });
@@ -195,7 +227,7 @@ export function browserUnreadStorage(scope: string): UnreadStorage {
      * holds, puts the missing ones, deletes the rest and writes the meta, so
      * saves from two windows leave exactly the last writer's record. */
     async save(record) {
-      const meta = stored(record);
+      const meta = stored(record, purged);
       const db = await open();
       return new Promise((resolve, reject) => {
         const tx = db.transaction(["meta", "events"], "readwrite");
@@ -203,8 +235,14 @@ export function browserUnreadStorage(scope: string): UnreadStorage {
         const selected = new Map(
           record.events.map((event) => [event.id, event]),
         );
+        const current = tx.objectStore("meta").get(scope);
         const keys = events.index("scope").getAllKeys(IDBKeyRange.only(scope));
+        // Requests succeed in order, so the meta has been read by now.
         keys.onsuccess = () => {
+          if (purgeOf(current.result) !== purged)
+            return reject(
+              new Error("Unread record was purged by another window"),
+            );
           const held = new Set<string>();
           for (const key of keys.result) {
             const id = (key as [string, string])[1];
@@ -213,8 +251,8 @@ export function browserUnreadStorage(scope: string): UnreadStorage {
           }
           for (const [id, event] of selected)
             if (!held.has(id)) events.put({ scope, id, event });
+          tx.objectStore("meta").put(meta, scope);
         };
-        tx.objectStore("meta").put(meta, scope);
         settle(tx, resolve, reject);
       });
     },
@@ -227,7 +265,8 @@ export function browserUnreadStorage(scope: string): UnreadStorage {
     },
   };
 }
-/** Forgets one partition's record once the viewer has left that community. */
+/** Forgets one partition's record once the viewer has left that community,
+ * leaving only a mark of the purge that reads as no record. */
 export async function purgeUnreadStorage(scope: string) {
   if (typeof indexedDB === "undefined") return;
   const db = await openDatabase();
@@ -239,7 +278,10 @@ export async function purgeUnreadStorage(scope: string) {
       keys.onsuccess = () => {
         for (const key of keys.result) events.delete(key);
       };
-      tx.objectStore("meta").delete(scope);
+      tx.objectStore("meta").put(
+        { version: VERSION, purged: crypto.randomUUID() },
+        scope,
+      );
       settle(tx, resolve, reject);
     });
   } finally {
