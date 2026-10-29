@@ -418,6 +418,11 @@ export function createUnread({
   // walk (see `walk.caught`), so until a walk reaches its end a save is not
   // complete and the next pass reads the bootstrap (see `route`).
   let unwalked = false;
+  // Restored evidence was forgotten because no read vouched for it (see
+  // `settleDeletions`): its thread left `through`, but a catch-up reads no
+  // cold thread, so until a pass that reads the bootstrap reads it on its
+  // own a save is not complete (see `route`).
+  let forgotten = false;
   // Roots the relay returned nothing for when asked by ID, read with the
   // record too, so a remembered thread whose root was deleted does not leave
   // every save incomplete (see `retention`); the newest 1,024.
@@ -2509,6 +2514,7 @@ export function createUnread({
     if (outcome === "dropped") return true;
     if (outcome !== "read") {
       const channels = new Set(owing);
+      forgotten = true;
       forget(
         [...unconfirmed].filter((id) => {
           const event = events.get(id);
@@ -2686,8 +2692,8 @@ export function createUnread({
   /** Drops restored evidence found gone, or that no read vouches for. Its
    * thread is no longer read whole or through: a full repair from the mark
    * would read it only since the mark (see `past`), and a catch-up not at
-   * all (see `promote`), so a reply forgotten while undeleted would not be
-   * read again. */
+   * all (see `promote`; hence `forgotten`), so a reply forgotten while
+   * undeleted would not be read again. */
   function forget(gone: Iterable<string>) {
     const changed = new Set<string>();
     let removed = false;
@@ -2728,11 +2734,12 @@ export function createUnread({
    * record's bounds nothing is kept; that, a selected event retention
    * dropped, a remembered thread's reply kept without its root (unless the
    * relay returned nothing for it: `absent`, saved with the record), a
-   * roster sample owed since a leave, or a walk owed (see `unwalked`),
-   * leaves the record incomplete. Of the
-   * threads read whole, those still hot, followed and in a channel the mark
-   * covers stay so; of those read through, those still remembered and in a
-   * channel the mark covers, none of whose selected content was dropped. */
+   * roster sample owed since a leave, a walk owed (see `unwalked`), or a
+   * thread owed since its evidence was forgotten (see `forgotten`), leaves
+   * the record incomplete. Of the threads read whole, those still hot,
+   * followed and in a channel the mark covers stay so; of those read
+   * through, those still remembered and in a channel the mark covers, none
+   * of whose selected content was dropped. */
   function retention(participation: ThreadParticipation) {
     indexEvidence();
     const ids = rosterIds();
@@ -2892,6 +2899,7 @@ export function createUnread({
       ungrouped ||
       resample ||
       unwalked ||
+      forgotten ||
       retained.length < kept.size;
     retained.push(...waiting.filter(awaitingAccess));
     const fits =
@@ -4194,6 +4202,9 @@ export function createUnread({
           if (windowed.has(id) && sampled.has(id) && !short.has(id))
             covered.add(id);
         if (resampled) resample = false;
+        // A pass that read the bootstrap has read on its own each thread
+        // forgotten before it; one it forgets now owes the next.
+        if (bootstrapped) forgotten = false;
         if (!(await settleDeletions(ids, generation, priority))) return;
         unwalked = (bootstrapped || walking) && !pass.walk.ended();
         pass.learn();
@@ -5366,6 +5377,7 @@ export function createUnread({
       through.clear();
       resample = false;
       unwalked = false;
+      forgotten = false;
       absent.clear();
       dropped = [];
       // Wiped as the channel heads are, remembered threads and walk mark
