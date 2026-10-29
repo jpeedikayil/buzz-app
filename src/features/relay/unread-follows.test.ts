@@ -361,13 +361,16 @@ it("drains the lookups of many distinct revived threads once and stays idle", as
   });
   const { owner, unread, reader, settled } = await setup();
   const asked = new Map<string, number>();
+  const sizes: number[] = [];
   const relay = relayOf(...history);
   reader.read.mockImplementation(async (filters) => {
-    const filter = filters[0] as { ids?: string[]; "#e"?: string[] };
-    for (const id of filter.ids ?? [])
-      asked.set(`ids:${id}`, (asked.get(`ids:${id}`) ?? 0) + 1);
-    for (const id of filter["#e"] ?? [])
-      asked.set(`#e:${id}`, (asked.get(`#e:${id}`) ?? 0) + 1);
+    for (const filter of filters as { ids?: string[]; "#e"?: string[] }[]) {
+      if (filter.ids) sizes.push(filter.ids.length);
+      for (const id of filter.ids ?? [])
+        asked.set(`ids:${id}`, (asked.get(`ids:${id}`) ?? 0) + 1);
+      for (const id of filter["#e"] ?? [])
+        asked.set(`#e:${id}`, (asked.get(`#e:${id}`) ?? 0) + 1);
+    }
     return relay(filters);
   });
   owner.accept(nested);
@@ -382,8 +385,10 @@ it("drains the lookups of many distinct revived threads once and stays idle", as
   stop();
   expect(reader.read.mock.calls.length).toBe(reads);
   expect([...asked.values()].filter((count) => count > 1)).toEqual([]);
-  // Each parent and root fetched once, and asked about once.
+  // Each parent and root fetched once, and asked about once, 50 IDs a
+  // filter at most: the relay plans 100 as a scan.
   expect(asked.size).toBe(2 * history.length);
+  expect(Math.max(...sizes)).toBe(50);
 }, 30000);
 
 it("keys choices by channel and canonical root and keeps them across reload", async () => {

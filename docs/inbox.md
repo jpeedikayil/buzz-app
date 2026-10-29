@@ -230,7 +230,23 @@ whole: beside the catch-up, any of the 50 most recently read or written in
 that was not—one the viewer just replied in, was mentioned in or followed, or
 whose read failed—is read whole once, and one that leaves those 50, is
 unfollowed or loses its channel's coverage is read whole again when it
-returns. Refresh always runs the full repair: pressed while a
+returns. It keeps too which remembered threads this device read through to the
+point, which a full repair from the record does not read again: it asks them
+only for replies since the point, from as far before it as a catch-up reads,
+in one read of up to 200 of them at a time. A read that comes back full is read
+again in halves of its threads rather than paged. Of the 50 most recently read
+or written in, only those read whole ride that read; the others, such as one
+newly among them, are read whole. A thread not read through since the point
+is still asked on its own for replies since the newest one the viewer wrote
+or read, as is every thread on a device's first launch, after its storage was
+lost, from a record over its bounds or one that never caught up. Such a thread
+was learned beside a catch-up, which read none of its replies from before the
+point, or had replies that were not kept, or is in a channel the point no
+longer covers. When restored events fail verification after that read, the
+threads it covered are read again on their own in the same pass. A dropped
+read leaves the point where it was and the Inbox saying some recent activity
+could not be checked, and the next check reads those threads again. Refresh
+always runs the full repair: pressed while a
 catch-up runs, it runs once that ends, and pressed before a check has chosen
 to catch up, that check runs it instead. The full repair also reads the
 deletions made since that point in the channels holding restored events the
@@ -273,7 +289,8 @@ For a roster of up to 128 channels with nothing new, unread reads:
 |---|---|
 | Warm tick: a periodic check or reconnect, caught up | One, with one filter: what the roster gained since the point. |
 | Warm launch: caught up | The same one request. A remembered thread's root is fetched only when the catch-up brought the thread a reply and nothing holds the root, and a thread newly among the 50 is read whole once. |
-| Fresh launch, or any full repair | Two (three at 128 channels, whose windows with the viewer's recent messages take two): the viewer's recent messages with every channel's window, then the newest events across the roster. Then any further pages of the walk and, with a record, its remembered threads and the edits and deletions since an earlier point. |
+| Full repair from a record caught up before: Refresh, or a record caught up more than a day ago, incomplete, or whose catch-up found more than it takes | Three (four at 128 channels): the viewer's recent messages with every channel's window, one read of the remembered threads read through to the point (one more per further 200 of them), then the newest events across the roster. Any of the 50 most recently read or written in that was not read whole is read whole beside them. Then the edits and deletions since the point, and each thread not read through, on its own. |
+| Full repair without one: a first launch, lost storage, or a record over its bounds or never caught up | Two (three at 128 channels, whose windows with the viewer's recent messages take two): the viewer's recent messages with every channel's window, then the newest events across the roster. Then any further pages of the walk and, with a record, each remembered thread: the 50 most recently read or written in whole, the rest each on its own. |
 
 Read state and the addressed history Inbox reads for mentions are separate
 owners and not counted here.

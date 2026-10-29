@@ -19,6 +19,8 @@ import {
  * channels that mark covers, each read since this device saw it joined, so
  * one outside it is read once before the mark vouches for it; `whole` names
  * remembered threads read whole, whose later replies the mark's reads bring;
+ * `through` names remembered threads whose replies up to the mark this device
+ * read, so a full repair from the mark reads only their replies since it;
  * `absent` names roots the relay returned nothing for when asked by ID, so a
  * deleted root does not leave the record incomplete. */
 export type UnreadRecord<Event = RelayEvent> = Readonly<{
@@ -29,6 +31,7 @@ export type UnreadRecord<Event = RelayEvent> = Readonly<{
   mark?: UnreadMark;
   roster?: ReadonlySet<string>;
   whole?: ReadonlySet<string>;
+  through?: ReadonlySet<string>;
   absent?: ReadonlySet<string>;
 }>;
 export type UnreadMark = Readonly<{ at: number; checked: number }>;
@@ -68,6 +71,7 @@ type StoredMeta = {
   mark?: { at: number; checked: number };
   roster?: string[];
   whole?: string[];
+  through?: string[];
   absent?: string[];
   /** The partition's last purge, kept by every record written after it. */
   purged?: string;
@@ -96,7 +100,7 @@ const ids = (raw: unknown, bound: number, length = 64): raw is string[] =>
  * added later under this version read leniently instead, a missing or
  * malformed one as incomplete, so a record from an older build keeps its
  * threads and only owes a full repair (a missing or malformed `mark`,
- * `whole` or `absent` reads as none); without `structure` no event can be
+ * `whole`, `through` or `absent` reads as none); without `structure` no event can be
  * told apart from structure, so none is restored. Event validity is left to
  * the owner's re-verification. */
 function parse(
@@ -127,11 +131,12 @@ function parse(
   } catch {
     return;
   }
-  const { structure, complete, roster, whole, absent } = raw as {
+  const { structure, complete, roster, whole, through, absent } = raw as {
     structure?: unknown;
     complete?: unknown;
     roster?: unknown;
     whole?: unknown;
+    through?: unknown;
     absent?: unknown;
   };
   const known = ids(structure, UNREAD_RECORD_EVENTS);
@@ -148,6 +153,9 @@ function parse(
     ...(covered && roster.length ? { roster: new Set(roster) } : {}),
     ...(ids(whole, THREAD_PARTICIPATION_LIMIT, 256) && whole.length
       ? { whole: new Set(whole) }
+      : {}),
+    ...(ids(through, THREAD_PARTICIPATION_LIMIT, 256) && through.length
+      ? { through: new Set(through) }
       : {}),
     ...(ids(absent, THREAD_PARTICIPATION_LIMIT) && absent.length
       ? { absent: new Set(absent) }
@@ -169,6 +177,7 @@ function stored({
   mark,
   roster,
   whole,
+  through,
   absent,
 }: UnreadRecord): StoredMeta {
   const meta: StoredMeta = {
@@ -186,6 +195,7 @@ function stored({
     ...(mark ? { mark: { at: mark.at, checked: mark.checked } } : {}),
     roster: [...(roster ?? [])],
     ...(whole?.size ? { whole: [...whole] } : {}),
+    ...(through?.size ? { through: [...through] } : {}),
     ...(absent?.size ? { absent: [...absent] } : {}),
   };
   if (
@@ -212,6 +222,7 @@ export function memoryUnreadStorage(): UnreadStorage {
         ...(record.mark ? { mark: { ...record.mark } } : {}),
         ...(record.roster?.size ? { roster: new Set(record.roster) } : {}),
         ...(record.whole?.size ? { whole: new Set(record.whole) } : {}),
+        ...(record.through?.size ? { through: new Set(record.through) } : {}),
         ...(record.absent?.size ? { absent: new Set(record.absent) } : {}),
       };
     },

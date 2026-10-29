@@ -179,13 +179,14 @@ const meta = (participation: unknown) => ({
   roster: [],
 });
 
-it("a record round-trips with its threads, walk mark, events, structure, mark, roster, whole threads and absent roots", async () => {
+it("a record round-trips with its threads, walk mark, events, structure, mark, roster, threads read whole and through, and absent roots", async () => {
   memoryIndexedDB();
   const events = [event("first"), event("second")];
   const structure = new Set([(events[0] as RelayEvent).id]);
   const mark = { at: 1700, checked: 1800 };
   const roster = new Set(["c0", "c".repeat(128)]);
   const whole = new Set(["c0:other"]);
+  const through = new Set(["c0:other", "c0:root"]);
   const absent = new Set(["c".repeat(64)]);
   await browserUnreadStorage(scope).save({
     participation: threads,
@@ -195,6 +196,7 @@ it("a record round-trips with its threads, walk mark, events, structure, mark, r
     mark,
     roster,
     whole,
+    through,
     absent,
   });
   // The next launch reads it through its own connection.
@@ -206,6 +208,7 @@ it("a record round-trips with its threads, walk mark, events, structure, mark, r
     mark,
     roster,
     whole,
+    through,
     absent,
   });
   await browserUnreadStorage(scope).save({
@@ -323,8 +326,8 @@ it("a field added after the participation reads as incomplete when missing or ma
       complete: false,
     });
   }
-  // A mark, threads read whole or absent roots that cannot be read are
-  // none: the record stays, and the next repair reads them whole.
+  // A mark, threads read whole or through or absent roots that cannot be
+  // read are none: the record stays, and the next repair reads them whole.
   for (const [mark, whole, absent] of [
     [{ at: 1.5, checked: 1800 }, "c0:root", "c".repeat(64)],
     [{ at: 1700 }, [7], [7]],
@@ -341,6 +344,7 @@ it("a field added after the participation reads as incomplete when missing or ma
       complete: true,
       mark,
       whole,
+      through: whole,
       absent,
     });
     await expect(storage.read()).resolves.toEqual({

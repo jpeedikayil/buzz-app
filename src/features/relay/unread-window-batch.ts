@@ -31,11 +31,12 @@ const kindsAre = (kinds: unknown, expected: readonly number[]) =>
  * channel window (`#h` of one channel, `since`), the viewer's authored page
  * (`authors` of one key, at most once, `since` the last walk or none), a
  * thread read (`#h` of one channel and up to 100 `#e` roots read whole, or
- * one root `since` the thread's newest time) or a fetch of up to 100 `ids`
- * with the same `limit`. Or the edits and deletions of up to 100 held events
- * (`#e`) since a time, from where an earlier read of them stopped (`until`
- * with `before_id`) or not. The relay honours each filter's own limit, which keeps
- * the events one request returns bounded. */
+ * up to 200 roots in up to 128 channels `since` a time: one thread's newest,
+ * or a mark's) or a fetch of up to 50 `ids` with the same `limit`. Or the
+ * edits and deletions of up to 100 held events (`#e`) since a time, from where
+ * an earlier read of them stopped (`until` with `before_id`) or not. The relay
+ * honours each filter's own limit, which keeps the events one request returns
+ * bounded. */
 export function isUnreadWindowBatch(value: unknown): boolean {
   if (
     !Array.isArray(value) ||
@@ -82,23 +83,25 @@ export function isUnreadWindowBatch(value: unknown): boolean {
     )
       return false;
     const channel = filter["#h"];
-    const channelled =
+    const channelled = (most: number) =>
       Array.isArray(channel) &&
-      channel.length === 1 &&
-      typeof channel[0] === "string" &&
-      CHANNEL_ID.test(channel[0]);
+      channel.length >= 1 &&
+      channel.length <= most &&
+      channel.every((id) => typeof id === "string" && CHANNEL_ID.test(id));
     const shape = (names: readonly string[]) =>
       keysAre(filter, names) ||
       (filter.since !== undefined && keysAre(filter, [...names, "since"]));
     if (keysAre(filter, ["kinds", "#h", "since", "include_aux", "limit"])) {
+      const id = channel?.[0];
       if (
-        !channelled ||
+        !channelled(1) ||
+        id === undefined ||
         filter.since === undefined ||
         !since ||
-        windows.has(channel[0])
+        windows.has(id)
       )
         return false;
-      windows.add(channel[0]);
+      windows.add(id);
       return true;
     }
     if (shape(["kinds", "authors", "include_aux", "limit"])) {
@@ -107,13 +110,11 @@ export function isUnreadWindowBatch(value: unknown): boolean {
       return true;
     }
     if (shape(["kinds", "#h", "#e", "include_aux", "limit"]))
-      return (
-        channelled &&
-        hexes(filter["#e"], filter.since === undefined ? 100 : 1) &&
-        since
-      );
+      return filter.since === undefined
+        ? channelled(1) && hexes(filter["#e"], 100)
+        : channelled(128) && hexes(filter["#e"], 200) && since;
     if (keysAre(filter, ["kinds", "ids", "include_aux", "limit"]))
-      return hexes(filter.ids, 100) && filter.limit === filter.ids?.length;
+      return hexes(filter.ids, 50) && filter.limit === filter.ids?.length;
     return false;
   });
 }
