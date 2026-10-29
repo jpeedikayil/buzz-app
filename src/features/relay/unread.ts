@@ -1732,12 +1732,12 @@ export function createUnread({
   // nothing new. Each channel gets one page of at most WINDOW_LIMIT events,
   // sized so the roster's windows together stay within WINDOW_BUDGET, three
   // quarters of the retained budget: counts and rows beyond a channel's page
-  // are bounded, as under the former global sample, but a busy channel can no
-  // longer push a quiet channel's thread out of the sample, not even on a
+  // are bounded, as under the roster sample alone, but a busy channel can no
+  // longer push a quiet channel's thread out of the evidence, not even on a
   // first run with a large roster. Single-channel filters ride
   // UNREAD_WINDOW_BATCH per request (the relay honours per-filter limits; the
   // reader and hosts admit this batch shape beyond their four-filter rule),
-  // so a roster costs one or two requests, with WINDOW_CONCURRENCY in flight:
+  // so the windows cost one or two requests, with WINDOW_CONCURRENCY in flight:
   // the reader runs three reads at once, and the third slot stays free for
   // the channel the viewer opens meanwhile. Each landed request publishes.
   const WINDOW_LIMIT = 100;
@@ -1745,6 +1745,16 @@ export function createUnread({
   const WINDOW_BUDGET = 3072;
   const WINDOW_CONCURRENCY = 2;
   const WINDOW_FLOOR_SECONDS = 7 * 24 * 60 * 60;
+  // Behind the windows, the roster sample is read too: the newest
+  // SAMPLE_LIMIT events of each SAMPLE_CHANNELS of the roster, whatever their
+  // marks, one single-filter request each (the relay once capped a request's
+  // `#h` values at 128). A window starts at its channel's older mark, and in
+  // a channel only scrolled to its end that is the catch-up mark, which reads
+  // no replies, so an unread reply older than it is in no window; the sample
+  // still holds it while it is that recent, as it holds read history before
+  // a mark or a never-read channel's week.
+  const SAMPLE_LIMIT = 500;
+  const SAMPLE_CHANNELS = 128;
   // The viewer's threads ride the same requests as the windows do. The
   // HOT_THREADS most recently read or written in are refetched whole, one
   // filter per channel naming its roots (a full page splits a filter's roots,
@@ -2449,8 +2459,9 @@ export function createUnread({
         // remembered threads most recently read or written in are read right
         // behind it, before the windows: the pinned rows are the ones the
         // windows cannot show.
-        // The other remembered threads are asked for new replies, and the
-        // walk pages back through the viewer's history, behind the windows.
+        // The roster sample follows the windows. The other remembered
+        // threads are asked for new replies, and the walk pages back through
+        // the viewer's history, behind them.
         const pass = participating(new Set(ids), stored);
         const requests = chunk<ReadFilter>(
           [
@@ -2467,7 +2478,17 @@ export function createUnread({
         );
         const hot = pass.hot();
         requests.splice(1, 0, ...hot);
-        requests.push(...pass.cold());
+        requests.push(
+          ...chunk(ids, SAMPLE_CHANNELS).map((part) => [
+            {
+              kinds: contentKinds,
+              "#h": part,
+              include_aux: true,
+              limit: SAMPLE_LIMIT,
+            },
+          ]),
+          ...pass.cold(),
+        );
         remembered = pass.roots;
         const run: Run = { pass, generation, queue: requests, pooling: true };
         activePass = run;
@@ -2507,9 +2528,11 @@ export function createUnread({
           else {
             // A read channel with nothing since its mark is observed with
             // nothing unread; a never-read channel with no recent history
-            // stays unknown rather than claiming zero.
+            // stays unknown rather than claiming zero. The roster sample has
+            // no start, so it returning nothing of a channel claims nothing.
             for (const filter of request) {
-              const id = filter["#h"]?.[0];
+              const id =
+                filter.since === undefined ? undefined : filter["#h"]?.[0];
               if (id && marked.has(id)) known.add(id);
             }
             // Walk pages beyond the first are not evidence.

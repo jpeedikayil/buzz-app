@@ -127,10 +127,15 @@ retains at most 4,096 events / 8 MiB. Each joined channel is observed on its
 own since its read mark (or since the last week, when never read anywhere), up
 to 100 recent events per channel—fewer on a large roster, so a first run's
 windows together fit the budget—so one busy channel cannot push another
-channel's thread out of the Inbox. Threads the viewer took part in—replied in,
-was mentioned or answered in, or follows—are remembered per relay and viewer
-on this device, at most 1,000 threads, so their new replies reach the Inbox
-after their channel's window has moved on. The 50 most recently read or
+channel's thread out of the Inbox. The newest 500 events of up to 128 joined
+channels at a time are read as well, whatever their marks, so what a window
+starts after is still seen while it is that recent: in a channel only scrolled
+to its end, whose catch-up mark reads no replies, an unread reply older than
+the mark, and read history older than a channel's mark or a never-read
+channel's week. Threads the viewer took part in—replied in, was mentioned or
+answered in, or follows—are remembered per relay and viewer on this device, at
+most 1,000 threads, so their new replies reach the Inbox after their channel's
+window has moved on. The 50 most recently read or
 written in are refetched whole on every repair, before the channel windows,
 and show as rows read or unread. The rest are asked only for replies since the
 newest one the viewer wrote or read, behind the windows, and are rows only
@@ -146,18 +151,19 @@ behind the windows, to learn the threads they replied in before their most
 recent messages; later repairs read only what they wrote since.
 The windows, the viewer's own recent messages and the thread reads ride
 together, up to 128 filters per request with two requests in flight, so a
-roster costs one or two round trips. The Inbox is ready once the viewer's own
-recent messages and the remembered threads most recently read or written in
-have landed, or were dropped, and reports `observing` while further windows
-still read. A read that fails is tried once more; dropped after that, its
-channels or threads stay as they were—a dropped thread read leaves its
-channels' counts observed—and the Inbox notes that some recent activity could
-not be checked until the next refresh, with no automatic retry; later reads
-that fail in the same pass are dropped at once, and a dropped walk page leaves
-the walk to the next repair without a notice. A response too large for the
-reader or the native host is split and read in parts rather than retried. A
-repair in which no read lands fails instead, keeping the previous evidence and
-its stale freshness. While a
+roster costs one or two round trips; the newest events across the roster are
+one more request per 128 channels, behind the windows. The Inbox is ready once
+the viewer's own recent messages and the remembered threads most recently read
+or written in have landed, or were dropped, and reports `observing` while
+further windows still read. A read that fails is tried once more; dropped
+after that, its channels or threads stay as they were—a dropped thread read
+leaves its channels' counts observed—and the Inbox notes that some recent
+activity could not be checked until the next refresh, with no automatic retry;
+later reads that fail in the same pass are dropped at once, and a dropped walk
+page leaves the walk to the next repair without a notice. A response too large
+for the reader or the native host is split and read in parts rather than
+retried. A repair in which no read lands fails instead, keeping the previous
+evidence and its stale freshness. While a
 repair runs, a reply whose root is not yet retained is not shown as a row
 of its own; it appears under its root once the thread read or lookup brings
 it. A lookup that finds the viewer's reply in a thread, or fetches the root

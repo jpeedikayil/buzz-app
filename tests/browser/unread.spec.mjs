@@ -136,11 +136,10 @@ test("built sidebar → visible dwell → durable journal → encrypted broker p
       app.report.queries.some(({ filter }) => filter.read_state_snapshot === 1),
     )
     .toBe(true);
-  // Wait for the channel's bounded unread window, not merely the first
-  // 20-row head.
+  // Wait for the bounded roster-wide repair, not merely the first 20-row head.
   await expect(alpha(page).getByRole("img")).toHaveAttribute(
     "aria-label",
-    /^100 observed unread messages/,
+    /^500 observed unread messages/,
   );
   await park(page);
   await releaseReadingFocus(page);

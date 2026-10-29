@@ -142,7 +142,7 @@ it("initial unread markers and evidence bypass held optional profiles without ca
     });
   try {
     await h.session.unread.ensure();
-    expect(h.trace.map(({ kind }) => kind)).toEqual([0, 30078, 9]);
+    expect(h.trace.map(({ kind }) => kind)).toEqual([0, 30078, 9, 9]);
     expect(profileFinished).toBe(false);
     expect(h.profileSignals).toHaveLength(1);
     expect(h.profileSignals[0]?.aborted).toBe(false);
@@ -174,9 +174,11 @@ it("evidence gets its own deadline after a failed marker read; marker errors sta
     assert(marker);
     marker.abort(new DOMException("Marker deadline expired", "TimeoutError"));
     await done;
-    expect(deadlines).toHaveLength(2);
+    // The window request and the roster sample each own a deadline.
+    expect(deadlines).toHaveLength(3);
     expect(deadlines[1]?.signal.aborted).toBe(false);
-    expect(h.trace.map(({ kind }) => kind)).toEqual([30078, 9]);
+    expect(deadlines[2]?.signal.aborted).toBe(false);
+    expect(h.trace.map(({ kind }) => kind)).toEqual([30078, 9, 9]);
     expect(h.snapshot()).toMatchObject({
       observedCount: 1,
       freshness: "observed",
@@ -248,6 +250,9 @@ it("a full channel window does not starve later channels, and a dropped request 
     if (!filters[0]?.kinds?.includes(9) || !filters.some((f) => f["#h"]))
       return [];
     const ids = filters.flatMap((filter) => filter["#h"] ?? []);
+    // The roster sample, with no start, holds the busy rows and never fails.
+    if (filters.every((filter) => filter.since === undefined))
+      return ids.includes("other") ? rows : [];
     batches.push(ids);
     if (ids.includes("other")) return rows;
     if (fail) throw new Error("Later chunk unavailable");
@@ -288,9 +293,10 @@ it("a full channel window does not starve later channels, and a dropped request 
 });
 
 function conversationRelay(h: ReturnType<typeof setup>) {
-  // A relay whose channel window holds only the 100 newest rows and whose
-  // page of the viewer's own messages holds none of these older replies, so
-  // older conversation membership is reachable only by parent lookup.
+  // A relay whose channel window and roster sample hold only the 100 and 500
+  // newest rows and whose page of the viewer's own messages holds none of
+  // these older replies, so older conversation membership is reachable only
+  // by parent lookup.
   const store: RelayEvent[] = [];
   const lookups: ReadFilter[][] = [];
   let fail = false;
@@ -374,7 +380,8 @@ it("looks up conversation membership that falls outside the sampled window", asy
     mine,
     answer,
   );
-  // 100 newer rows fill the channel window and push out every older message.
+  // 500 newer rows fill the channel window and the roster sample and push
+  // out every older message.
   relay.store.push(
     mine,
     agentRoot,
@@ -383,7 +390,7 @@ it("looks up conversation membership that falls outside the sampled window", asy
     sibling,
     nested,
     underAnswer,
-    ...busy(h, 96),
+    ...busy(h, 496),
   );
   await h.session.unread.ensure();
   const attention = (id: string) => h.session.unread.attention("other", id);
@@ -393,7 +400,7 @@ it("looks up conversation membership that falls outside the sampled window", asy
     pending: true,
     unread: false,
   });
-  expect(h.snapshot().observedCount).toBe(96);
+  expect(h.snapshot().observedCount).toBe(496);
   await vi.waitFor(() =>
     expect(attention(answer.id)).toMatchObject({
       status: "eligible",
@@ -418,7 +425,7 @@ it("looks up conversation membership that falls outside the sampled window", asy
     );
   // Fetched parents are structure only: the badge gains the four replies in
   // the viewer's threads, not the fetched old posts.
-  expect(h.snapshot()).toMatchObject({ observedCount: 100, attentionCount: 4 });
+  expect(h.snapshot()).toMatchObject({ observedCount: 500, attentionCount: 4 });
   // Each undecided parent is asked once, scoped to its channel: by ID when
   // missing, and for the viewer's replies to it.
   expect(relay.asked().sort()).toEqual(
@@ -451,7 +458,7 @@ it("a reply whose parent and root are both outside the window still groups as th
   const root = message(h.peer, "other", "old root", 10);
   const mine = reply(h.viewer, "my old nested reply", 11, root, root);
   const answer = reply(h.peer, "agent answers me", 700, root, mine);
-  relay.store.push(root, mine, answer, ...busy(h, 99));
+  relay.store.push(root, mine, answer, ...busy(h, 499));
   await h.session.unread.ensure();
   h.snapshot();
   const attention = () => h.session.unread.attention("other", answer.id);
@@ -465,7 +472,7 @@ it("a reply whose parent and root are both outside the window still groups as th
   );
   // The parent and the root are fetched together; neither recurses.
   expect(relay.fetched().sort()).toEqual([mine.id, root.id].sort());
-  expect(h.snapshot()).toMatchObject({ observedCount: 100, attentionCount: 1 });
+  expect(h.snapshot()).toMatchObject({ observedCount: 500, attentionCount: 1 });
   expect(
     h.session.unread.snapshot({
       kind: "thread",
@@ -498,7 +505,7 @@ it("a full page of replies under one parent cannot hide the viewer's reply to an
     busyRoot,
   );
   relay.store.push(busyRoot, quietRoot, mineQuiet, busyParent, ...deep);
-  relay.store.push(answer, peerUnderBusy, ...busy(h, 98));
+  relay.store.push(answer, peerUnderBusy, ...busy(h, 498));
   await h.session.unread.ensure();
   h.snapshot();
   await vi.waitFor(() =>
@@ -530,7 +537,7 @@ it("a busy root's deep replies of the viewer decide its thread in one page", asy
   const answer = reply(h.peer, "same level as me", 2000, root, root);
   relay.store.push(root, mine, nestedParent, ...deep, answer);
   relay.store.push(
-    ...Array.from({ length: 99 }, (_, i) =>
+    ...Array.from({ length: 499 }, (_, i) =>
       message(h.peer, "other", `busy ${i}`, 1000 + i),
     ),
   );
@@ -555,7 +562,7 @@ it("a reply to the viewer's message in another channel is not the viewer's conve
   const relay = conversationRelay(h);
   const mine = message(h.viewer, "room-1", "my post elsewhere", 10);
   const forged = reply(h.peer, "claims my parent", 700, mine, mine);
-  relay.store.push(mine, forged, ...busy(h, 99));
+  relay.store.push(mine, forged, ...busy(h, 499));
   await h.session.unread.ensure();
   h.snapshot();
   await vi.waitFor(() =>
@@ -583,7 +590,7 @@ it("a deleted reply of the viewer does not join its parent", async () => {
     ],
   });
   const sibling = reply(h.peer, "same level", 700, agentRoot, agentRoot);
-  relay.store.push(agentRoot, mine, removal, sibling, ...busy(h, 99));
+  relay.store.push(agentRoot, mine, removal, sibling, ...busy(h, 499));
   // The fixture relay returns the deletion with include_aux lookups.
   const base = h.query.getMockImplementation();
   h.query.mockImplementation(async (filters, signal) => {
@@ -608,7 +615,7 @@ it("deleting the viewer's reply after a completed lookup ends the membership", a
   const agentRoot = message(h.peer, "other", "agent post", 10);
   const mine = reply(h.viewer, "my old reply", 11, agentRoot, agentRoot);
   const sibling = reply(h.peer, "same level", 700, agentRoot, agentRoot);
-  relay.store.push(agentRoot, mine, sibling, ...busy(h, 99));
+  relay.store.push(agentRoot, mine, sibling, ...busy(h, 499));
   await h.session.unread.ensure();
   h.snapshot();
   const attention = () => h.session.unread.attention("other", sibling.id);
@@ -645,7 +652,7 @@ it("deleting one of the viewer's replies keeps the membership its other replies 
   const older = reply(h.viewer, "my older reply", 11, agentRoot, agentRoot);
   const newer = reply(h.viewer, "my newer reply", 12, agentRoot, agentRoot);
   const sibling = reply(h.peer, "same level", 700, agentRoot, agentRoot);
-  relay.store.push(agentRoot, older, newer, sibling, ...busy(h, 99));
+  relay.store.push(agentRoot, older, newer, sibling, ...busy(h, 499));
   // The thread's page, read once the lookup finds the viewer in it, reaches
   // neither of their replies: membership rests on the lookup alone.
   const answer = h.query.getMockImplementation();
@@ -687,7 +694,7 @@ it("deleting the viewer's parent and then their reply ends the membership", asyn
   const mine = message(h.viewer, "other", "my old post", 10);
   const myReply = reply(h.viewer, "my reply to it", 11, mine, mine);
   const answer = reply(h.peer, "answer", 700, mine, mine);
-  relay.store.push(mine, myReply, answer, ...busy(h, 99));
+  relay.store.push(mine, myReply, answer, ...busy(h, 499));
   await h.session.unread.ensure();
   h.snapshot();
   const attention = () => h.session.unread.attention("other", answer.id);
@@ -732,7 +739,7 @@ it("lookups for the same parent ID in two channels do not share a result", async
   // A reply in another channel that deliberately tags the same parent.
   const elsewhere = reply(h.peer, "cross-channel", 700, root, root, "room-1");
   const sibling = reply(h.peer, "same level as me", 701, root, root);
-  relay.store.push(root, mine, elsewhere, sibling, ...busy(h, 98));
+  relay.store.push(root, mine, elsewhere, sibling, ...busy(h, 498));
   await h.session.unread.ensure();
   // The other channel asks first, in the same turn.
   h.session.unread.attention("room-1", elsewhere.id);
@@ -758,7 +765,7 @@ it("a lookup in flight during a cache clear cannot restore its result", async ()
   const relay = conversationRelay(h);
   const mine = message(h.viewer, "other", "my old post", 10);
   const answer = reply(h.peer, "answer to me", 700, mine, mine);
-  relay.store.push(mine, answer, ...busy(h, 99));
+  relay.store.push(mine, answer, ...busy(h, 499));
   const base = h.query.getMockImplementation();
   const held = deferred();
   let hold = true;
@@ -800,7 +807,7 @@ it("a failed membership lookup stays pending and retries with backoff", async ()
   const relay = conversationRelay(h);
   const mine = message(h.viewer, "other", "my old post", 10);
   const answer = reply(h.peer, "answer to me", 700, mine, mine);
-  relay.store.push(mine, answer, ...busy(h, 99));
+  relay.store.push(mine, answer, ...busy(h, 499));
   relay.fail(true);
   await h.session.unread.ensure();
   const attention = () => h.session.unread.attention("other", answer.id);
@@ -831,7 +838,10 @@ it.each(["clear", "dispose", "revoke", "join"])(
     const windows = () => batches.filter((ids) => ids.length);
     h.query.mockImplementation(async (filters) => {
       if (!filters[0]?.kinds?.includes(9)) return [];
-      const ids = filters.flatMap((filter) => filter["#h"] ?? []);
+      // Windows, not the roster sample behind them, which has no start.
+      const ids = filters.flatMap((filter) =>
+        filter.since === undefined ? [] : (filter["#h"] ?? []),
+      );
       batches.push(ids);
       // The two window requests in flight are held across the boundary.
       await (ids.length && windows().length <= 2
@@ -885,7 +895,7 @@ it("concurrent ensure callers share the active marker/evidence work", async () =
   expect(finished).toBe(false);
   release();
   await Promise.all([first, second]);
-  expect(h.trace.map(({ kind }) => kind)).toEqual([30078, 9]);
+  expect(h.trace.map(({ kind }) => kind)).toEqual([30078, 9, 9]);
   expect(h.snapshot().observedCount).toBe(1);
 });
 
@@ -1191,13 +1201,14 @@ it("a reconnect repair in which nothing lands keeps the observation stale instea
   });
   const count = h.query.mock.calls.length;
   h.reconnect();
-  // The one request is read twice, then dropped; nothing was observed.
+  // The window request and the roster sample beside it are each read twice,
+  // then dropped; nothing was observed.
   await vi.waitFor(() =>
     expect(
       h.query.mock.calls
         .slice(count)
         .filter(([filters]) => filters[0]?.kinds?.includes(9)),
-    ).toHaveLength(2),
+    ).toHaveLength(4),
   );
   await vi.waitFor(() =>
     expect(h.session.unread.inbox()).toMatchObject({
@@ -1220,13 +1231,15 @@ it("a relay that accepts reads but answers none costs one read per request after
     throw new Error("Relay read timed out");
   });
   await h.session.unread.ensure();
-  // Three requests (the authored page and 299 windows, then 128, then 45):
-  // the first is read twice, the last once; the second, in flight beside
-  // the first, at most twice. Six reads would mean a retry per request.
+  // Six requests (the authored page and 299 windows, then 128, then 45,
+  // then the roster sample's 128, 128 and 44): the first is read twice, the
+  // last four once; the second, in flight beside the first, at most twice.
+  // Twelve reads would mean a retry per request.
   const sizes = batches.map((batch) => batch.length);
   expect(sizes.filter((size) => size === 127)).toHaveLength(2);
   expect(sizes.filter((size) => size === 45)).toHaveLength(1);
-  expect(batches.length).toBeLessThanOrEqual(5);
+  expect(sizes.filter((size) => size === 44)).toHaveLength(1);
+  expect(batches.length).toBeLessThanOrEqual(8);
   expect(h.session.unread.inbox()).toMatchObject({
     status: "error",
     freshness: "stale",
@@ -1253,8 +1266,8 @@ it("a full budget evicts the oldest evidence and the observation still completes
     return [overflow];
   });
   await h.session.unread.ensure();
-  // Every window request still runs.
-  expect(batches).toBe(2);
+  // Every window request and the roster sample's two still run.
+  expect(batches).toBe(4);
   expect(h.snapshot()).toMatchObject({
     observedCount: 18,
     freshness: "observed",
@@ -1305,7 +1318,7 @@ it("a response over the reader's byte budget splits the request and the repair c
   // The 41-filter request is split in two, each within the budget.
   const windowed = h.query.mock.calls
     .map(([filters]) => filters)
-    .filter((filters) => filters.some((filter) => filter.kinds?.includes(9)));
+    .filter((filters) => filters.some((filter) => filter.since !== undefined));
   expect(windowed.map((filters) => filters.length)).toEqual([41, 21, 20]);
   // The evidence lands, trimmed to the 8 MiB retained budget channel by
   // channel, rather than failing the repair with nothing observed.
@@ -1352,7 +1365,7 @@ it("a response the native host rejects as too large splits the request the same 
   await h.session.unread.ensure();
   const windowed = h.query.mock.calls
     .map(([filters]) => filters)
-    .filter((filters) => filters.some((filter) => filter.kinds?.includes(9)));
+    .filter((filters) => filters.some((filter) => filter.since !== undefined));
   expect(windowed.map((filters) => filters.length)).toEqual([41, 21, 20]);
   for (const id of h.ids)
     expect(
@@ -1392,7 +1405,13 @@ it.each(["clear", "dispose", "revoke"])(
     const evidence = h.query.mock.calls
       .flatMap(([filters]) => filters)
       .filter((filter) => filter.kinds?.includes(9) && filter["#h"]);
-    expect(evidence).toHaveLength(128);
+    // 128 windows and the roster sample of the same 128 channels.
+    expect(
+      evidence.filter((filter) => filter.since !== undefined),
+    ).toHaveLength(128);
+    expect(evidence.filter((filter) => filter.since === undefined)).toEqual([
+      expect.objectContaining({ "#h": expect.any(Array), limit: 500 }),
+    ]);
     expect(evidence.flatMap((filter) => filter["#h"] ?? [])).not.toContain(
       "other",
     );
@@ -1420,7 +1439,9 @@ it("explicit refresh bypasses optional profiles for both markers and evidence", 
   try {
     await h.session.unread.refresh();
     expect(h.profileSignals[0]?.aborted).toBe(false);
-    expect(h.trace.map(({ kind }) => kind)).toEqual([30078, 9, 0, 30078, 9]);
+    expect(h.trace.map(({ kind }) => kind)).toEqual([
+      30078, 9, 9, 0, 30078, 9, 9,
+    ]);
   } finally {
     release();
     await profiles;

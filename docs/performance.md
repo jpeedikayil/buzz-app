@@ -212,21 +212,23 @@ single ordered list.
 
 The app verifies each relay event's signature once per connection and reuses that
 proof. Its startup unread read takes each joined channel's newest 100 events
-since its read mark, so default history reaches the app before measurement,
-including the newest of the 620 older paging rows. `firstSeenHistory`
-(`scroll-paging-fast-first-seen`) has the fixture honour the never-read window
-start, which the 2023-dated history predates, so none of that history reaches
-the unread read. Older pages then first reach the app, and are verified, during the measured
-traversal. The fixture records the event IDs of each modeled HTTP query response
-when it computes the response, which for a held older page is before release.
+since its read mark and the newest 500 across joined channels, so default
+history reaches the app before measurement, including the newest of the 620
+older paging rows. `firstSeenHistory` (`scroll-paging-fast-first-seen`) has
+the fixture honour the never-read window start, which the 2023-dated history
+predates, and its second channel's newer messages fill the newest 500, so none
+of that history reaches the unread read. Older pages then first reach the app,
+and are verified, during the measured traversal. The fixture records the event
+IDs of each modeled HTTP query response when it computes the response, which
+for a held older page is before release.
 Paging samples record `work.olderRowsServedBefore`, and the first-seen case
 requires zero. This proves which events arrive first-seen, not when background
 verification of the startup read finishes; setup does not wait for it. The option
 adds 500 newer messages by the viewer in a second channel, which fill the
-viewer's own recent-messages read, plus their signatures at setup and one
-sidebar row. There is no first-seen channel-open case: verifying its one
-20-event head page is within that case's sample-to-sample variation, and the
-second channel also changes unread state before the click.
+viewer's own recent-messages read and the newest 500, plus their signatures at
+setup and one sidebar row. There is no first-seen channel-open case: verifying
+its one 20-event head page is within that case's sample-to-sample variation,
+and the second channel also changes unread state before the click.
 
 ## Rich thread lifecycle
 

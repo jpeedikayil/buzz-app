@@ -499,11 +499,12 @@ export const test = base.extend({
           }),
         );
     // A joined channel the viewer has written far more in: its newer messages
-    // fill the viewer's authored page, which has no window start, and the
-    // walk through the rest of them pages back behind the windows, while the
-    // fixture honours the never-read window start for the channel windows
-    // (see the unread evidence read below). The measured history is by a
-    // peer, so the walk does not serve it before the measurement.
+    // fill the viewer's authored page and the roster sample, which have no
+    // window start, and the walk through the rest of them pages back behind
+    // the windows, while the fixture honours the never-read window start for
+    // the channel windows (see the unread evidence read below). The measured
+    // history is by a peer, so the walk does not serve it before the
+    // measurement.
     if (firstSeenHistory)
       histories.set(
         "primary/busy",

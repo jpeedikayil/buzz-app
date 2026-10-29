@@ -775,14 +775,18 @@ it("notification startup waits for the roster without consuming the shared evide
   expect(h.markerQuery).toHaveBeenCalledOnce();
   const evidence = () =>
     h.query.mock.calls.filter(([filters]) => filters[0]?.kinds?.includes(9));
-  expect(evidence()).toHaveLength(1);
+  // One repair: the windows' request and the roster sample behind it.
+  expect(evidence()).toHaveLength(2);
   expect(evidence()[0]?.[0]).toContainEqual(
-    expect.objectContaining({ "#h": ["room"] }),
+    expect.objectContaining({ "#h": ["room"], since: expect.any(Number) }),
   );
+  expect(evidence()[1]?.[0]).toEqual([
+    expect.objectContaining({ "#h": ["room"], limit: 500 }),
+  ]);
   h.discover();
   await h.owner.session.unread.ensure();
   expect(h.markerQuery).toHaveBeenCalledOnce();
-  expect(evidence()).toHaveLength(1);
+  expect(evidence()).toHaveLength(2);
 });
 
 it("scopes notification author collisions to the message channel", async () => {

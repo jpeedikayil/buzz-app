@@ -59,6 +59,7 @@ async function setup({
   frontiers,
   participation = memoryThreadParticipation(),
   authoredPage = true,
+  sampled = true,
   localUnread = {},
 }: {
   channels: readonly string[];
@@ -66,6 +67,10 @@ async function setup({
   participation?: ReturnType<typeof memoryThreadParticipation>;
   // Whether the viewer's newest authored page still reaches their old replies.
   authoredPage?: boolean;
+  // Whether the roster sample still reaches this history; busier channels
+  // move it past a quiet channel within hours, which windows and thread reads
+  // do not depend on.
+  sampled?: boolean;
   // Messages marked unread on this device, which a relaunch keeps.
   localUnread?: Readonly<Record<string, number>>;
 }) {
@@ -79,9 +84,15 @@ async function setup({
     item.tags.some(
       ([tag, value]) => tag === name && values.includes(value ?? ""),
     );
+  // The roster sample: the newest across channels, with no start.
+  const sample = (filter: ReadFilter) =>
+    !!filter["#h"] && !filter["#e"] && filter.since === undefined;
   const reader = {
     read: vi.fn(async (filters: readonly ReadFilter[]) => {
-      const windows = filters.flatMap((filter) => filter["#h"] ?? []);
+      // The roster sample fails or waits as the "sample" channel would.
+      const windows = filters.flatMap((filter) =>
+        sample(filter) ? ["sample"] : (filter["#h"] ?? []),
+      );
       // The walk's pages beyond the first fail as the "walk" channel would,
       // and single-root `since` thread reads as "cold".
       if (filters.some((filter) => filter.until !== undefined))
@@ -99,6 +110,7 @@ async function setup({
         throw new DOMException("Relay read timed out", "TimeoutError");
       return filters.flatMap((filter) => {
         if (filter.authors && !filter["#e"] && !authoredPage) return [];
+        if (sample(filter) && !sampled) return [];
         // `until` is exclusive at the keyset cursor, as the relay's is.
         const before = (item: RelayEvent) =>
           filter.until === undefined ||
@@ -214,7 +226,7 @@ it("a thread the viewer replied in outlives its channel's later traffic and a bu
     reply("quiet", peer, time, root),
   );
   // Later top-level traffic fills the quiet channel's one-page window, and
-  // the busy channel holds far more than the former global sample.
+  // the busy channel holds far more than the roster sample.
   h.store.push(root, mine, ...answers, ...flood("quiet", 120, 1100));
   h.store.push(...flood("busy", 600, 2000));
   await h.owner.capability.ensure();
@@ -235,6 +247,75 @@ it("a thread the viewer replied in outlives its channel's later traffic and a bu
   ]);
   expect(h.filters()).toContainEqual(
     expect.objectContaining({ "#h": ["quiet"], "#e": [root.id] }),
+  );
+});
+
+it("an unread reply below a channel's catch-up mark, in a thread the viewer started, is in the Inbox and stays after the sample moves on", async () => {
+  const participation = memoryThreadParticipation();
+  // The channel was only scrolled to its end, so its one mark is the
+  // catch-up mark, which reads no replies; the viewer has written much
+  // since, so their authored page no longer reaches the root.
+  const launch = (sampled: boolean) =>
+    setup({
+      channels: ["c0"],
+      frontiers: { "activity:c0": 3000 },
+      participation,
+      authoredPage: false,
+      sampled,
+    });
+  const root = event("c0", viewer, 1000);
+  const answer = reply("c0", peer, 2000, root);
+  const history = [root, answer, event("c0", peer, 3000)];
+  const row = (h: Awaited<ReturnType<typeof launch>>) =>
+    h.owner.capability.inbox().items.find((item) => item.rootId === root.id);
+  const first = await launch(true);
+  first.store.push(...history);
+  await first.owner.capability.ensure();
+  // The window starts at the mark, after the reply; the roster sample,
+  // with no start, holds it.
+  expect(first.filters()).toContainEqual(
+    expect.objectContaining({ "#h": ["c0"], since: 3000 }),
+  );
+  expect(row(first)).toMatchObject({ unreadCount: 1, messageIds: [answer.id] });
+  expect(first.owner.capability.attention("c0", answer.id)).toMatchObject({
+    status: "eligible",
+    category: "thread",
+    unread: true,
+  });
+  // The thread is remembered as of its root, so a launch after busier
+  // channels have moved the sample on still reads the reply.
+  expect((await participation.read()).roots.get(`c0:${root.id}`)).toEqual({
+    at: 1000,
+    newestId: root.id,
+  });
+  first.owner.dispose();
+  const second = await launch(false);
+  second.store.push(...history);
+  await second.owner.capability.ensure();
+  await vi.waitFor(() =>
+    expect(row(second)).toMatchObject({
+      unreadCount: 1,
+      messageIds: [answer.id],
+    }),
+  );
+});
+
+it("the roster sample keeps a read mention older than its channel's mark and a mention older than a never-read channel's week", async () => {
+  const h = await setup({
+    channels: ["read", "never"],
+    frontiers: { read: 5000 },
+  });
+  const floor = NOW - 7 * 24 * 60 * 60;
+  const read = event("read", peer, 4000, [["p", viewer]]);
+  const old = event("never", peer, floor - 86400, [["p", viewer]]);
+  h.store.push(read, old);
+  await h.owner.capability.ensure();
+  const items = h.owner.capability.inbox().items;
+  expect(items).toContainEqual(
+    expect.objectContaining({ messageId: read.id, unreadCount: 0 }),
+  );
+  expect(items).toContainEqual(
+    expect.objectContaining({ messageId: old.id, unreadCount: 1 }),
   );
 });
 
@@ -313,11 +394,13 @@ it("a full budget evicts the busiest channel's oldest ordinary evidence, never a
     expect.objectContaining({ rootId: root.id }),
   );
   expect(snapshot("lone").observedCount).toBe(1);
-  expect(snapshot("quiet").observedCount).toBe(101);
+  // Its window holds the quiet channel's newest 100; the roster sample, all
+  // 120 of its messages and the thread.
+  expect(snapshot("quiet").observedCount).toBe(121);
   // Live traffic fills the event budget. Only what goes first is evicted: the
   // busy channel's own older traffic, since it holds the most — never the
   // lone channel's one unread message, whose count would otherwise become a
-  // confident zero, nor the quiet channel's window or the viewer's thread.
+  // confident zero, nor the quiet channel's evidence or the viewer's thread.
   const live = flood("busy", 4096, 3000);
   h.owner.accept(live);
   expect(inbox().freshness).toBe("observed");
@@ -329,8 +412,8 @@ it("a full budget evicts the busiest channel's oldest ordinary evidence, never a
     observedCount: 1,
     coverage: "observed",
   });
-  expect(snapshot("quiet").observedCount).toBe(101);
-  expect(snapshot("busy").observedCount).toBe(4096 - 103 - 1);
+  expect(snapshot("quiet").observedCount).toBe(121);
+  expect(snapshot("busy").observedCount).toBe(4096 - 123 - 1);
   expect(unread("busy", live.at(-1)?.id)).toBe(true);
   expect(unread("busy", windowed[0]?.id)).toBe(false);
   expect(unread("lone", only.id)).toBe(true);
@@ -341,7 +424,7 @@ it("a full budget evicts the busiest channel's oldest ordinary evidence, never a
   );
   h.owner.accept(large);
   expect(snapshot("lone").observedCount).toBe(1);
-  expect(snapshot("quiet").observedCount).toBe(101);
+  expect(snapshot("quiet").observedCount).toBe(121);
   expect(snapshot("busy").observedCount).toBeLessThan(30);
   expect(unread("busy", large.at(-1)?.id)).toBe(true);
   expect(unread("busy", live.at(-1)?.id)).toBe(false);
@@ -485,14 +568,15 @@ it("a window dropped after its retry leaves its channel unknown and the Inbox pa
   expect(snapshot("busy").coverage).toBe("observed");
 });
 
-it("reads the viewer's page with 127 windows first, remembered and newly taught threads next, then the remaining windows", async () => {
+it("reads the viewer's page with 127 windows first, remembered and newly taught threads next, then the remaining windows and the roster sample", async () => {
   const participation = memoryThreadParticipation();
   const remembered = "f".repeat(64);
   await participation.write({
     roots: new Map([[`c1:${remembered}`, { at: 1000 }]]),
   });
+  const channels = ["never1", "c1", "c2", "c3", "never2", ...filler];
   const h = await setup({
-    channels: ["never1", "c1", "c2", "c3", "never2", ...filler],
+    channels,
     frontiers: { c1: 1100, c2: 1300, c3: 1200, ...fillerFrontiers },
     participation,
   });
@@ -527,7 +611,12 @@ it("reads the viewer's page with 127 windows first, remembered and newly taught 
     expect.objectContaining({ "#h": ["never1"], since: floor }),
     expect.objectContaining({ "#h": ["never2"], since: floor }),
   ]);
-  expect(requests).toHaveLength(4);
+  // The roster sample, one request per 128 channels, with no start.
+  expect(requests.slice(never + 1)).toEqual(
+    [channels.slice(0, 128), channels.slice(128)].map((ids) => [
+      { kinds: [9, 40002, 40008], "#h": ids, include_aux: true, limit: 500 },
+    ]),
+  );
 });
 
 it("a thread read's full-page split goes ahead of the remaining windows", async () => {
@@ -621,7 +710,7 @@ it("a full page's split rereads count each reply once against the participation 
 });
 
 // Six remembered threads the viewer replied in, of 300 unread replies each
-// outside the channel's full window, and 44 remembered threads with nothing:
+// outside the channel's full window and the roster sample, and 44 remembered threads with nothing:
 // the hot tier, whose whole reads offer 1,194 replies to the 1,024-reply
 // budget. `cold` roots are remembered behind them with the time given, so
 // their reads are the last request, held until the six whole reads have
@@ -636,6 +725,7 @@ async function spentBudget(
     channels: ["c0"],
     frontiers: { c0: 5000 },
     participation,
+    sampled: false,
   });
   const busy = Array.from({ length: 6 }, (_, i) => event("c0", peer, 1000 + i));
   const peerReplies = new Set<string>();
@@ -772,6 +862,7 @@ it("a dropped read releases its thread's reserved slot to the reads still to lan
     channels: ["c0", "busy"],
     frontiers: { c0: 5000, busy: 5000 },
     participation,
+    sampled: false,
   });
   h.store.push(cold, reply("c0", viewer, 1010, cold));
   // Six threads the viewer replied in after the channel's mark: the window
@@ -849,7 +940,8 @@ it("a dropped first request still lets the Inbox leave loading", async () => {
   });
   h.store.push(event("quiet", peer, 1100, [["p", viewer]]));
   // The request carrying the authored page and c1 fails both reads; the
-  // second request, quiet's window, lands.
+  // second request, quiet's window, lands, and so does the roster sample,
+  // which names c1 first but, having no start, claims nothing of it.
   h.failing.add("c1");
   await h.owner.capability.ensure();
   expect(h.owner.capability.inbox()).toMatchObject({
@@ -859,8 +951,15 @@ it("a dropped first request still lets the Inbox leave loading", async () => {
     items: [expect.objectContaining({ channelId: "quiet", unreadCount: 1 })],
   });
   expect(
-    h.filters().filter((filter) => filter["#h"]?.[0] === "c1"),
+    h
+      .filters()
+      .filter(
+        (filter) => filter["#h"]?.[0] === "c1" && filter.since !== undefined,
+      ),
   ).toHaveLength(2);
+  expect(
+    h.owner.capability.snapshot({ kind: "channel", channelId: "c1" }),
+  ).toMatchObject({ coverage: "unknown", observedCount: null });
 });
 
 it("replies of a thread never show as rows of their own while the repair fetches its root", async () => {
@@ -923,10 +1022,13 @@ it("a first run with a large roster sizes each window so the pass fits the budge
       unreadCount: 1,
     }),
   );
-  expect(
-    h.owner.capability.snapshot({ kind: "channel", channelId: "c40" })
-      .observedCount,
-  ).toBe(74);
+  // A window holds its page; the roster sample adds the newest 500, the
+  // five newest channels' 100 each.
+  const observed = (channelId: string) =>
+    h.owner.capability.snapshot({ kind: "channel", channelId }).observedCount;
+  expect(observed("c35")).toBe(74);
+  expect(observed("c36")).toBe(100);
+  expect(observed("c40")).toBe(100);
 });
 
 it("remembers threads the viewer took part in, not every message they wrote", async () => {
@@ -1018,7 +1120,11 @@ it("the Inbox leaves loading once the viewer's page and remembered threads land,
 });
 
 it("a read reply outside the viewer's conversations fetches only its root, never a membership lookup", async () => {
-  const h = await setup({ channels: ["c0"], frontiers: { c0: 1100 } });
+  const h = await setup({
+    channels: ["c0"],
+    frontiers: { c0: 1100 },
+    sampled: false,
+  });
   const root = event("c0", peer, 1000);
   const answer = reply("c0", peer, 1020, root);
   h.store.push(root, answer, ...flood("c0", 120, 1100));
@@ -1068,6 +1174,7 @@ it("remembered participation is saved and refetches the thread after the authore
     frontiers: { c0: 1300 },
     participation,
     authoredPage: false,
+    sampled: false,
   });
   second.store.push(...first.store);
   await second.owner.capability.ensure();
@@ -1147,6 +1254,7 @@ it("a device's first repair walks the viewer's history behind the windows, remem
     channels: ["a", "b"],
     frontiers: { a: 9600, b: 9600 },
     participation,
+    sampled: false,
   });
   const { roots, notes } = history(h);
   // A peer answered the oldest thread since; the others are quiet.
@@ -1299,6 +1407,7 @@ it("a dropped walk page leaves the walk to the next repair without marking chann
     channels: ["a", "b"],
     frontiers: { a: 9600, b: 9600 },
     participation,
+    sampled: false,
   });
   history(h);
   h.failing.add("walk");
@@ -1402,6 +1511,7 @@ it("a cold thread's boundary reply that is still unread returns to a warm repair
     channels: ["c0"],
     frontiers: { c0: 1005 },
     participation,
+    sampled: false,
   });
   h.store.push(root, mine, boundary, ...flood("c0", 100, 2000));
   await h.owner.capability.ensure();
@@ -1459,7 +1569,12 @@ it("a cold thread's unread replies return on every launch until read; read, the 
   assert(newest);
   const history = [root, mine, ...answers, ...flood("c0", 100, 3000)];
   const launch = async (frontiers: Readonly<Record<string, number>>) => {
-    const h = await setup({ channels: ["c0"], frontiers, participation });
+    const h = await setup({
+      channels: ["c0"],
+      frontiers,
+      participation,
+      sampled: false,
+    });
     h.store.push(...history);
     await h.owner.capability.ensure();
     return h;
@@ -1838,6 +1953,7 @@ it("a dropped cold read leaves its thread to the next repair and the Inbox parti
     channels: ["c0"],
     frontiers: { c0: 1005 },
     participation,
+    sampled: false,
   });
   const answer = reply("c0", peer, 1100, root);
   h.store.push(
@@ -1969,9 +2085,9 @@ it("clearing the owner while a walk page reads retires the walk: no further page
     release();
   }
   await done;
-  // The page's result is retired with its epoch: the first request and the
-  // page are all that was read.
-  expect(h.reader.read).toHaveBeenCalledTimes(2);
+  // The page's result is retired with its epoch: the first request, the
+  // roster sample beside it and the page are all that was read.
+  expect(h.reader.read).toHaveBeenCalledTimes(3);
   expect(write).not.toHaveBeenCalled();
   expect(h.owner.capability.inbox()).toMatchObject({ freshness: "unknown" });
   expect(await participation.read()).toEqual({ roots: new Map() });

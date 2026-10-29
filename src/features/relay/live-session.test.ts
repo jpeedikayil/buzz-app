@@ -389,6 +389,7 @@ it.each([1, 2, 130])(
       expect(oldHead.signal?.aborted).toBe(true);
       expect(evidence.signal?.aborted).toBe(false);
       const answered: string[] = [];
+      const sampled: string[] = [];
       let authored = 0;
       const answer = (batch: Scripted) => {
         expect(batch.filters.length).toBeLessThanOrEqual(128);
@@ -402,10 +403,17 @@ it.each([1, 2, 130])(
             });
             return [];
           }
+          // The roster sample: up to 128 channels a request, with no start.
+          if (filter.since === undefined) {
+            expect(filter).toMatchObject({ include_aux: true, limit: 500 });
+            expect(filter["#h"]?.length).toBeLessThanOrEqual(128);
+            sampled.push(...(filter["#h"] ?? []));
+            return filter["#h"] ?? [];
+          }
           expect(filter["#h"]).toHaveLength(1);
+          answered.push(filter["#h"]?.[0] ?? "");
           return [filter["#h"]?.[0] ?? ""];
         });
-        answered.push(...batchIds);
         batch.respond(
           batchIds.map((id) =>
             message(peer, id, "unread evidence", 1700000900),
@@ -414,7 +422,11 @@ it.each([1, 2, 130])(
       };
       answer(evidence);
       let heads = 0;
-      while (answered.length < ids.length || heads === 0) {
+      while (
+        answered.length < ids.length ||
+        sampled.length < ids.length ||
+        heads === 0
+      ) {
         await vi.waitFor(() => expect(wire.pending.length).toBeGreaterThan(0));
         const batch = wire.next();
         if (batch.filters[0]?.top_level) {
@@ -430,6 +442,7 @@ it.each([1, 2, 130])(
       }
       expect(heads).toBe(1);
       expect([...answered].sort()).toEqual([...ids].sort());
+      expect([...sampled].sort()).toEqual([...ids].sort());
       while (!authored) {
         await vi.waitFor(() => expect(wire.pending.length).toBeGreaterThan(0));
         answer(wire.next());
