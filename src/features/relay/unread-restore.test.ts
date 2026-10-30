@@ -3937,3 +3937,170 @@ it("a catch-up that ends while the channel list is still being read leaves the w
     (await storage.read())?.participation.roots.has(`added:${root.id}`),
   ).toBe(true);
 });
+
+/** A device's first launch as the live relay showed it (#note:8341a9c0):
+ * the viewer's 100 newest messages are their replies in 50 threads across
+ * channels a–k, read whole. Older, their replies in l–o rank cold, under
+ * roots of their own in l and m and of a peer's in n and o: each channel's
+ * window holds the reply and not the root (the walk's second page returns
+ * the viewer's, and is not evidence), the cold read returns the reply alone,
+ * passed over, and busier traffic keeps both out of the roster's newest
+ * events: 499 of it, so a catch-up's one page is short. */
+function ownColdThreads() {
+  const hotChannels = [..."abcdefghijk"];
+  const hot = Array.from({ length: 50 }, (_, i) => {
+    const channelId = hotChannels[i % hotChannels.length] ?? "a";
+    const root = post(peerKey, channelId, T + 1000 + 10 * i);
+    return [
+      root,
+      reply(viewerKey, channelId, root, root.created_at + 1),
+      reply(viewerKey, channelId, root, root.created_at + 2),
+    ];
+  }).flat();
+  const cold = (
+    [
+      ["l", viewerKey],
+      ["m", viewerKey],
+      ["n", peerKey],
+      ["o", peerKey],
+    ] as const
+  ).map(([channelId, key]) => {
+    const root = post(key, channelId, T + 100);
+    return {
+      channelId,
+      key,
+      root,
+      mine: reply(viewerKey, channelId, root, T + 200),
+    };
+  });
+  return {
+    roster: summaries([...hotChannels, "l", "m", "n", "o", "busy"]),
+    frontiers: {
+      ...BUSY_READ,
+      ...Object.fromEntries(hotChannels.map((id) => [id, T + 2000])),
+      ...Object.fromEntries(cold.map(({ channelId }) => [channelId, T + 150])),
+    },
+    cold,
+    rootIds: cold.map(({ root }) => root.id),
+    store: [
+      ...hot,
+      ...cold.flatMap(({ root, mine }) => [root, mine]),
+      ...busy.slice(1),
+    ],
+  };
+}
+/** The reads by ID of any of `ids`. */
+const fetchesOf = (filters: readonly ReadFilter[], ids: readonly string[]) =>
+  filters.filter((filter) => filter.ids?.some((id) => ids.includes(id)));
+
+it("a full repair ends by fetching by ID the roots of remembered threads whose replies it holds without them, kept as structure or as the viewer's own, so the record saves complete and the next launch reads one delta", async () => {
+  const { roster, frontiers, cold, rootIds, store } = ownColdThreads();
+  const storage = memoryUnreadStorage();
+  const fresh = await launch({ store, storage, roster, frontiers });
+  const launched = await sentDuring(fresh, () =>
+    fresh.owner.capability.ensure(),
+  );
+  const fetched = fetchesOf(launched, rootIds);
+  expect(fetched).toEqual([
+    { kinds: CONTENT, ids: expect.any(Array), include_aux: true, limit: 4 },
+  ]);
+  expect(new Set(fetched[0]?.ids)).toEqual(new Set(rootIds));
+  await fresh.saved;
+  const record = await storage.read();
+  expect(record?.complete).toBe(true);
+  // A peer's root is structure; the viewer's is their own message, which
+  // never counts either.
+  for (const { root, key } of cold)
+    expect(record?.structure.has(root.id)).toBe(key === peerKey);
+  expect(await saved(storage)).toEqual(
+    expect.arrayContaining([...rootIds, ...cold.map(({ mine }) => mine.id)]),
+  );
+  fresh.owner.dispose();
+  const warm = await launch({ store, storage, roster, frontiers });
+  expect(await sentDuring(warm, () => warm.owner.capability.ensure())).toEqual([
+    expect.objectContaining({ kinds: DELTA_KINDS }),
+  ]);
+});
+
+it("a root that full repair's fetch finds deleted is saved as absent, so the record saves complete, a peer's unread reply under it still counts on its own, and the next launch reads one delta", async () => {
+  const { roster, frontiers, cold, rootIds, store } = ownColdThreads();
+  const [first] = cold;
+  assert(first);
+  // Relevant through the viewer's reply beside it, and unread.
+  const answer = reply(peerKey, first.channelId, first.root, T + 300);
+  const deleted = [
+    ...store,
+    answer,
+    ...cold.map(({ key, channelId, root }) => deletion(key, channelId, root)),
+  ];
+  const storage = memoryUnreadStorage();
+  const fresh = await launch({ store: deleted, storage, roster, frontiers });
+  const launched = await sentDuring(fresh, () =>
+    fresh.owner.capability.ensure(),
+  );
+  expect(
+    new Set(fetchesOf(launched, rootIds).flatMap((filter) => filter.ids)),
+  ).toEqual(new Set(rootIds));
+  await fresh.saved;
+  expect(await storage.read()).toMatchObject({
+    complete: true,
+    absent: new Set(rootIds),
+  });
+  expect(await saved(storage)).toContain(answer.id);
+  // Thread activity without its root, a row of its own (docs/inbox.md).
+  const row = expect.objectContaining({
+    messageIds: [answer.id],
+    unreadCount: 1,
+  });
+  expect(fresh.count(first.channelId)).toBe(1);
+  expect(fresh.owner.capability.inbox().items).toContainEqual(row);
+  fresh.owner.dispose();
+  const warm = await launch({ store: deleted, storage, roster, frontiers });
+  expect(await sentDuring(warm, () => warm.owner.capability.ensure())).toEqual([
+    expect.objectContaining({ kinds: DELTA_KINDS }),
+  ]);
+  expect(warm.count(first.channelId)).toBe(1);
+  expect(warm.owner.capability.inbox().items).toContainEqual(row);
+});
+
+it.each([
+  ["launch", false],
+  ["tick", true],
+] as const)(
+  "a full repair whose fetch of those roots drops saves the record incomplete and says some activity could not be checked; the next %s reads the bootstrap, fetches them and saves it complete, and the tick after it reads one delta",
+  async (_, ticking) => {
+    const { roster, frontiers, rootIds, store } = ownColdThreads();
+    const storage = memoryUnreadStorage();
+    const save = vi.spyOn(storage, "save");
+    let failing = true;
+    let h = await launch({
+      store,
+      storage,
+      roster,
+      frontiers,
+      fail: (filters) => failing && fetchesOf(filters, rootIds).length > 0,
+    });
+    const launched = await sentDuring(h, () => h.owner.capability.ensure());
+    // Read once more in its slot, then dropped.
+    expect(fetchesOf(launched, rootIds)).toHaveLength(2);
+    expect(h.owner.capability.inbox().partial).toBe(true);
+    await h.saved;
+    expect((await storage.read())?.complete).toBe(false);
+    failing = false;
+    if (!ticking) {
+      h.owner.dispose();
+      h = await launch({ store, storage, roster, frontiers });
+    }
+    const next = await sentDuring(h, () =>
+      ticking ? h.reconnected() : h.owner.capability.ensure(),
+    );
+    expect(next.filter(deltaFilter)).toEqual([]);
+    expect(fetchesOf(next, rootIds)).toHaveLength(1);
+    expect(h.owner.capability.inbox().partial).toBeFalsy();
+    await save.mock.results.at(-1)?.value;
+    expect((await storage.read())?.complete).toBe(true);
+    expect(await sentDuring(h, () => h.reconnected())).toEqual([
+      expect.objectContaining({ kinds: DELTA_KINDS }),
+    ]);
+  },
+);

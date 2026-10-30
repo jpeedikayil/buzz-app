@@ -178,8 +178,8 @@ once the restored events are in. Besides what it reads once (below), a
 catch-up reads no windows, newest events across the roster or new replies of
 remembered threads: the replies it returns reach their remembered threads, a
 thread newly among the 50 most recently read or written in is read whole
-once, and a remembered thread it brought a reply to whose root nothing holds
-has that root fetched, to group the reply, never counted. The viewer's own
+once, and the roots its remembered threads lack are fetched last, as a full
+repair's are (below). The viewer's own
 messages it returns move the walk on only when it read every channel the
 viewer may have written in; while one is listed but its membership is not
 yet confirmed, or the point does not cover it, the viewer's messages since
@@ -267,9 +267,13 @@ without a record would never show them, rather than kept while they may have
 been deleted, and their threads no longer count as read whole or through. The
 record is then incomplete, so the next check runs the full repair, which reads
 each whole or on its own rather than only since the point; if the read of
-deletions fails, they are kept, and the next repair reads it again. A
-remembered thread whose root the relay returns nothing for, deleted, does not
-keep the record incomplete. Three narrow cases can still leave a
+deletions fails, they are kept, and the next repair reads it again. A full
+repair ends by fetching the root nothing holds of each remembered thread it
+holds a reply in, whichever read brought the reply, to group it, never
+counted, so the record can be saved complete: a root the relay returns
+nothing for, deleted, does not keep it incomplete, and when that fetch fails
+the record stays incomplete and the next check fetches the roots again.
+Three narrow cases can still leave a
 gap after the point: an event dated well ahead of the relay's clock can move
 the point past a late send in a channel read earlier in the same repair; a
 channel whose access the relay revoked before its channel list did stays
@@ -302,9 +306,9 @@ For a roster of up to 128 channels with nothing new, unread reads:
 | Pass | Requests |
 |---|---|
 | Warm tick: a periodic check or reconnect, caught up | One, with one filter: what the roster gained since the point. |
-| Warm launch: caught up | The same one request. A remembered thread's root is fetched only when the catch-up brought the thread a reply and nothing holds the root, and a thread newly among the 50 is read whole once. |
+| Warm launch: caught up | The same one request. A remembered thread's root is fetched only when the thread holds a reply and nothing holds the root, and a thread newly among the 50 is read whole once. |
 | Full repair from a record caught up within the day: Refresh, or a record incomplete or whose catch-up found more than it takes | Three (four at 128 channels): the viewer's recent messages with every channel's window, one read of the remembered threads read through to the point (one more per further 200 of them, and up to eight more for each that comes back full), then the newest events across the roster. Any of the 50 most recently read or written in that was not read whole is read whole beside them. Then the edits and deletions since the point, and each thread not read through, on its own. |
-| Full repair without one: a first launch, lost storage, or a record over its bounds, never caught up or caught up more than a day ago | Two (three at 128 channels, whose windows with the viewer's recent messages take two): the viewer's recent messages with every channel's window, then the newest events across the roster. Then any further pages of the walk and, with a record, each remembered thread: the 50 most recently read or written in whole, the rest each on its own; from a record caught up before, the edits and deletions since its point too. |
+| Full repair without one: a first launch, lost storage, or a record over its bounds, never caught up or caught up more than a day ago | Two (three at 128 channels, whose windows with the viewer's recent messages take two): the viewer's recent messages with every channel's window, then the newest events across the roster. Then any further pages of the walk and, with a record, each remembered thread: the 50 most recently read or written in whole, the rest each on its own; from a record caught up before, the edits and deletions since its point too. Last, the roots nothing holds of the remembered threads holding a reply. |
 
 Read state and the addressed history Inbox reads for mentions are separate
 owners and not counted here.

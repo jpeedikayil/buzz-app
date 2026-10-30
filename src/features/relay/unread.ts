@@ -3192,6 +3192,19 @@ export function createUnread({
         }),
       );
     };
+    /** The threads a held reply is in. */
+    const holding = () =>
+      new Set(
+        [...events.values()].flatMap((event) => {
+          const channelId = channelOf(event);
+          const rootId = contentKind(event)
+            ? threadReference(event)?.rootId
+            : undefined;
+          return channelId && rootId
+            ? [conversationKey(channelId, rootId)]
+            : [];
+        }),
+      );
     // The walk: pages asked for beyond the first, the newest authored time
     // seen, and whether the walk reached its end this repair.
     let pages = 0;
@@ -3431,9 +3444,14 @@ export function createUnread({
         );
       },
       /** Fetches by ID the roots nothing holds of the remembered threads
-       * among `keys`, not yet asked for, so replies a delta brought them
-       * group under them: a cold read passes over replies already held. */
-      ground(keys: ReadonlySet<string>) {
+       * among `keys`, by default those holding a reply, not yet asked for,
+       * so the replies group under them and a save can be complete (see
+       * `retention`). A cold read passes over replies already held, and
+       * fetches no root for them: those a window, the authored page, a
+       * delta or the record brought, as the viewer's own replies under an
+       * older root of theirs that only a later walk page returns. A root the
+       * relay returns nothing for is absent and not asked for again. */
+      ground(keys: ReadonlySet<string> = holding()) {
         const missing = newest().flatMap((key) => {
           const rootId = key.slice(key.indexOf(":") + 1);
           return keys.has(key) &&
@@ -3947,13 +3965,11 @@ export function createUnread({
         const sampled = new Set<string>();
         let sampledNewest: number | undefined;
         // What the delta teaches as it lands: the newest time the viewer
-        // wrote (see `walk.caught`), the threads it brought replies to (see
-        // `ground`), and the channels the mark covers whose chunk read to its
-        // end, observed as a read window observes them. That observation
-        // counts the restored record too, so it is published once restore
-        // admits the record, and not when restore discards it.
+        // wrote (see `walk.caught`), and the channels the mark covers whose
+        // chunk read to its end, observed as a read window observes them.
+        // That observation counts the restored record too, so it is published
+        // once restore admits the record, and not when restore discards it.
         let authored: number | undefined;
-        const touched = new Set<string>();
         // Channels a delta page's evidence made known and no other read of
         // this pass observed: once restore discards the record, what the
         // delta read since the mark less the lookback is no count of them.
@@ -3964,9 +3980,6 @@ export function createUnread({
             if (!channelId || !contentKind(event)) continue;
             if (event.pubkey === viewer)
               authored = Math.max(authored ?? 0, event.created_at);
-            const reference = threadReference(event);
-            if (reference)
-              touched.add(conversationKey(channelId, reference.rootId));
           }
           const reading = new Set(
             catching?.rest().flatMap((filter) => filter["#h"] ?? []),
@@ -4117,11 +4130,11 @@ export function createUnread({
           // Threads the windows, the walk and the delta newly taught: on a
           // device's first repair, the threads the viewer replied in before
           // their newest page. A pass that catches up reads whole the newest
-          // threads not read whole (design §3.6), and fetches the roots the
-          // delta's replies lack; their cold threads learn from the delta.
-          // Threads read past the mark are read on their own once restore
-          // discards the evidence those reads passed over, and the hot ones
-          // otherwise fetch the roots nothing holds, as whole reads do.
+          // threads not read whole (design §3.6); their cold threads learn
+          // from the delta. Threads read past the mark are read on their own
+          // once restore discards the evidence those reads passed over, and
+          // the hot ones otherwise fetch the roots nothing holds, as whole
+          // reads do.
           if (pass.riding.size) {
             await restore?.done;
             if (closed || generation !== epoch) return;
@@ -4131,9 +4144,20 @@ export function createUnread({
           requests.push(
             ...(bootstrapped
               ? [...pass.hot(), ...pass.cold(), ...pass.ground(pass.hotRiding)]
-              : [...pass.promote(settled), ...pass.ground(touched)]),
+              : pass.promote(settled)),
           );
           if (!(await drain())) return;
+          // Last, once restore is in, the roots nothing holds of the
+          // remembered threads holding a reply, whichever read brought it
+          // (see `ground`), so the record can be saved complete; a dropped
+          // fetch leaves it incomplete, and the next pass asks again.
+          if (restoring) await restoring.done;
+          if (closed || generation !== epoch) return;
+          const roots = pass.ground();
+          if (roots.length) {
+            requests.push(...roots);
+            if (!(await drain())) return;
+          }
         } finally {
           run.pooling = false;
         }
