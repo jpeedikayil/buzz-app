@@ -1,5 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useEffectEvent, useState } from "react";
+import { isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { IconButton } from "../../shared/design-system/ui/IconButton";
+import { useToastNotification } from "../../shared/design-system/ui/Toast";
 import {
   ArrowsClockwiseIcon,
   CheckIcon,
@@ -9,6 +12,8 @@ import { useNativeDownload } from "./use-native-download";
 import { isNativeMediaSource } from "./attachment-source";
 
 const FAILURE_DURATION = 6000;
+const SAVED = "Saved to Downloads";
+const FAILED = "Couldn’t download. Try again.";
 
 export function MediaDownloadAction({
   source,
@@ -107,13 +112,42 @@ function NativeMediaDownload({
           : state === "saved"
             ? compact
               ? "Downloaded"
-              : "Saved to Downloads"
+              : SAVED
             : failureShown
               ? compact
                 ? "Download failed"
-                : "Couldn’t download. Try again."
+                : FAILED
               : ""}
       </span>
     </>
   );
+}
+
+/** Results of the native media menu's Download, which has no control to show them. */
+export function MediaMenuDownloadNotice() {
+  const notify = useToastNotification();
+  // The host sends the saved file's name, or null if the download failed.
+  const show = useEffectEvent((name: string | null) => {
+    if (name === null) notify(FAILED, "error");
+    else notify(SAVED, "success");
+  });
+  useEffect(() => {
+    if (!isTauri()) return;
+    let active = true;
+    let unlisten = () => {};
+    listen<string | null>("media-menu-download", ({ payload }) =>
+      show(payload),
+    ).then(
+      (stop) => {
+        if (active) unlisten = stop;
+        else stop();
+      },
+      () => {},
+    );
+    return () => {
+      active = false;
+      unlisten();
+    };
+  }, []);
+  return null;
 }

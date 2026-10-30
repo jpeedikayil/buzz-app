@@ -949,12 +949,13 @@ pub fn run() {
             }
             #[cfg(target_os = "macos")]
             if let Some(main) = app.get_webview_window("main") {
+                let handle = app.handle().clone();
                 let directory = app.path().download_dir().ok();
                 let stream = app
                     .try_state::<relay::MediaStream>()
                     .map(|stream| stream.base().to_owned());
                 if let Err(error) = main.with_webview(move |webview| {
-                    media_context_menu::install(&webview, directory, stream)
+                    media_context_menu::install(&webview, handle, directory, stream)
                 }) {
                     eprintln!("Could not prepare the media menu: {error}");
                 }

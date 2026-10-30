@@ -1033,7 +1033,7 @@ Both validate HTTPS and the `/media/<hash>` URL shape but do not enforce
 saved-community membership; the selected server receives a short-lived token
 scoped to its origin. The scheme signs a fresh 60-second `get` token per request
 and forwards only a bounded single `Range`; non-image/video/audio types (and SVG)
-are served with download disposition and `nosniff`. The main webview does not navigate to protected media for downloads: a narrowly scoped native command authenticates the bounded media GET, saves to the OS Downloads directory without replacing existing files, and rejects unsafe filenames. On macOS, the main webview's native media menu saves relay media to Downloads the same way, and omits the items that would copy, open or share the tokened loopback URL. `relay_upload`
+are served with download disposition and `nosniff`. The main webview does not navigate to protected media for downloads: a narrowly scoped native command authenticates the bounded media GET, saves to the OS Downloads directory without replacing existing files, and rejects unsafe filenames. On macOS, the main webview's native media menu also saves relay media to Downloads without replacing existing files, but under the blob's `<hash>.<ext>` name rather than the attachment name. WebKit streams that download to disk, and a failed one's partial file is removed. The menu omits the items that would copy, open or share the tokened loopback URL, and its Download item when Buzz cannot save it. `relay_upload`
 hashes, signs (`upload` + `x`) and sends the exact bytes JavaScript passes it;
 shared TypeScript (`hostUpload`) owns limits, error mapping and descriptor
 validation. JavaScript never signs kind 24242. Packaged HEIC and video

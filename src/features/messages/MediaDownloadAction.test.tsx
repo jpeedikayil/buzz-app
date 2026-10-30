@@ -9,13 +9,17 @@ import {
 } from "@testing-library/react";
 import { useRef } from "react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { ToastProvider } from "../../shared/design-system/ui/Toast";
+import { MediaMenuDownloadNotice } from "./MediaDownloadAction";
 import { VideoPlayer } from "./VideoPlayer";
 import { AudioAttachment } from "./AudioAttachment";
 import { VoiceNoteCard } from "../../bundled/voice-notes/VoiceNoteCard";
 import { AttachmentDownloadContext } from "./AttachmentDownloadContext";
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(), isTauri: vi.fn() }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 const url = `https://relay.test/media/${"a".repeat(64)}.mp4`;
 const source = `buzz-media://localhost/${encodeURIComponent(url)}`;
 const name = "recording.mp4";
@@ -63,6 +67,7 @@ beforeEach(() => {
   vi.mocked(invoke)
     .mockReset()
     .mockResolvedValue("http://127.0.0.1:4321/token/");
+  vi.mocked(listen).mockReset();
   vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
   vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
   vi.stubGlobal(
@@ -198,3 +203,64 @@ it.each<Kind>(["video", "audio", "voice note"])(
     ).not.toBeInTheDocument();
   },
 );
+
+it("shows native media menu download results until unmounted", async () => {
+  vi.mocked(isTauri).mockReturnValue(true);
+  let publish!: (event: { payload: string | null }) => void;
+  const registered = held();
+  const unlisten = vi.fn();
+  vi.mocked(listen).mockImplementation(async (event, handler) => {
+    expect(event).toBe("media-menu-download");
+    publish = handler as typeof publish;
+    registered.resolve();
+    return unlisten;
+  });
+  const view = render(
+    <ToastProvider>
+      <MediaMenuDownloadNotice />
+    </ToastProvider>,
+  );
+  await act(() => registered.promise);
+  act(() => publish({ payload: `${"a".repeat(64)}.mp4` }));
+  expect(
+    await screen.findByRole("dialog", { name: "Saved to Downloads" }),
+  ).toBeVisible();
+  act(() => publish({ payload: null }));
+  expect(
+    await screen.findByRole("dialog", {
+      name: "Couldn’t download. Try again.",
+    }),
+  ).toBeVisible();
+  view.unmount();
+  expect(unlisten).toHaveBeenCalledOnce();
+});
+
+it("stops a menu download listener that registers after unmount", async () => {
+  vi.mocked(isTauri).mockReturnValue(true);
+  let register!: (unlisten: () => void) => void;
+  vi.mocked(listen).mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        register = resolve;
+      }),
+  );
+  const view = render(
+    <ToastProvider>
+      <MediaMenuDownloadNotice />
+    </ToastProvider>,
+  );
+  view.unmount();
+  const unlisten = vi.fn();
+  await act(async () => register(unlisten));
+  expect(unlisten).toHaveBeenCalledOnce();
+});
+
+it("does not listen for menu downloads outside the desktop host", () => {
+  vi.mocked(isTauri).mockReturnValue(false);
+  render(
+    <ToastProvider>
+      <MediaMenuDownloadNotice />
+    </ToastProvider>,
+  );
+  expect(listen).not.toHaveBeenCalled();
+});
