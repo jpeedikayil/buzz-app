@@ -7,9 +7,10 @@
 //!   cancels it. For relay media, Buzz attaches a `WKDownloadDelegate` that
 //!   saves to Downloads under the media's `<hash>.<ext>` name, not the
 //!   attachment name the player's Download uses; WebKit streams the file
-//!   and quarantines it. A failed download's partial file is removed. Each
-//!   result is sent to the main window as `media-menu-download`: the saved
-//!   file's name, or null if it failed.
+//!   and quarantines it. The partial file of a download that fails, or is
+//!   still running when Buzz quits, is removed. Each result is sent to the
+//!   main window as `media-menu-download`: the saved file's name, or null if
+//!   it failed.
 //! - `<video>` and `<audio>` play from the tokened loopback listener
 //!   (`relay::media_stream`). Copy … Address, Open … in New Window and
 //!   Share… would hand that URL, token included, to the clipboard, a window
@@ -145,14 +146,9 @@ define_class!(
                 error.domain(),
                 error.code()
             );
-            // WebKit keeps what arrived for resuming, which Buzz never offers.
             // Only a destination this delegate handed out is removed.
             if let Some(partial) = self.release(download) {
-                if let Err(error) = std::fs::remove_file(partial) {
-                    if error.kind() != std::io::ErrorKind::NotFound {
-                        eprintln!("Could not remove a partial media download: {error}");
-                    }
-                }
+                remove_partial(&partial);
             }
             self.notify(None);
         }
@@ -192,6 +188,33 @@ impl DownloadDelegate {
 /// The destination WebKit accepted for `download`, if any.
 fn destination_of(download: &WKDownload) -> Option<PathBuf> {
     download.progress().fileURL()?.to_file_path()
+}
+
+/// Removes the partial files of menu downloads still running. WebKit does
+/// not fail them when Buzz quits. Call on the main thread as Buzz exits.
+pub(crate) fn discard_pending() {
+    MAIN.with(|main| {
+        if let Some(downloads) = main.get().and_then(|main| main.downloads.as_ref()) {
+            discard(&downloads.ivars().pending);
+        }
+    });
+}
+
+/// Removes every `pending` destination, leaving none pending.
+fn discard(pending: &RefCell<HashSet<PathBuf>>) {
+    for partial in pending.take() {
+        remove_partial(&partial);
+    }
+}
+
+/// Removes what WebKit kept of a download for resuming, which Buzz never
+/// offers. A symlink is removed, never followed.
+fn remove_partial(path: &Path) {
+    if let Err(error) = std::fs::remove_file(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("Could not remove a partial media download: {error}");
+        }
+    }
 }
 
 /// Installs both hooks for the main window's webview. Downloads go to
@@ -574,5 +597,30 @@ mod tests {
             free_path(dir.path(), "clip.mp4", &pending).unwrap(),
             dir.path().join("clip.mp4")
         );
+    }
+
+    #[test]
+    fn quitting_removes_only_running_downloads_partial_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("keep.mp4");
+        std::fs::write(&target, b"kept").unwrap();
+        std::fs::write(dir.path().join("partial.mp4"), b"part").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("link.mp4")).unwrap();
+        std::fs::write(dir.path().join("saved.mp4"), b"done").unwrap();
+        // `uncreated.mp4` was accepted, but the network process has not
+        // created it yet.
+        let pending = RefCell::new(HashSet::from(
+            ["partial.mp4", "link.mp4", "uncreated.mp4"].map(|name| dir.path().join(name)),
+        ));
+        discard(&pending);
+        assert!(pending.borrow().is_empty());
+        let mut left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["saved.mp4"]);
+        assert_eq!(std::fs::read(&target).unwrap(), b"kept");
     }
 }
