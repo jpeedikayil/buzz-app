@@ -58,6 +58,8 @@ mod keep_awake;
 #[cfg(target_os = "macos")]
 mod legacy_cli_shortcut;
 mod legacy_communities;
+#[cfg(target_os = "macos")]
+mod media_context_menu;
 #[cfg(any(not(target_os = "macos"), test))]
 mod microphone;
 #[cfg(target_os = "macos")]
@@ -944,6 +946,18 @@ pub fn run() {
                     app.manage(stream);
                 }
                 Err(error) => eprintln!("Could not start the media listener: {error}"),
+            }
+            #[cfg(target_os = "macos")]
+            if let Some(main) = app.get_webview_window("main") {
+                let directory = app.path().download_dir().ok();
+                let stream = app
+                    .try_state::<relay::MediaStream>()
+                    .map(|stream| stream.base().to_owned());
+                if let Err(error) = main.with_webview(move |webview| {
+                    media_context_menu::install(&webview, directory, stream)
+                }) {
+                    eprintln!("Could not prepare the media menu: {error}");
+                }
             }
             // Only app-owned storage is created; a development build keeps its agents
             // in the installed app's (`legacy_identifier::agents`). Preview uses the

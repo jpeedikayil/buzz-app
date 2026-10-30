@@ -1607,7 +1607,7 @@ fn window_origin(url: &Url) -> Option<tauri::http::HeaderValue> {
 
 /// Decode only the custom scheme URLs emitted by convertFileSrc. The media URL
 /// is independently checked before any authenticated request is made.
-fn download_target(source: &str) -> Option<Url> {
+pub(crate) fn download_target(source: &str) -> Option<Url> {
     let url = Url::parse(source).ok()?;
     let host_ok = match url.scheme() {
         "buzz-media" => url.host_str() == Some("localhost"),
@@ -1631,7 +1631,7 @@ fn download_target(source: &str) -> Option<Url> {
 
 /// Never interpret untrusted attachment names as paths. A missing or invalid name
 /// falls back to the validated blob's basename.
-fn download_name<'a>(name: &'a str, url: &'a Url) -> &'a str {
+pub(crate) fn download_name<'a>(name: &'a str, url: &'a Url) -> &'a str {
     if safe_download_name(name) {
         name
     } else {
@@ -1717,27 +1717,33 @@ pub(crate) fn mark_download(_file: &std::fs::File, _path: &std::path::Path) -> s
     Ok(())
 }
 
+/// `filename`, then `stem (1).ext` up to `stem (999).ext`: the names a
+/// download tries in turn while each is taken. `Ada.agent.png` counts as
+/// `Ada (1).agent.png`, which still reads as a snapshot by its suffix.
+pub(crate) fn download_names(filename: &str) -> impl Iterator<Item = String> + '_ {
+    let (stem, ext) = filename
+        .find(".agent.")
+        .or_else(|| filename.rfind('.'))
+        .filter(|&at| at > 0)
+        .map_or((filename, ""), |at| (&filename[..at], &filename[at + 1..]));
+    (0..1000).map(move |index| {
+        if index == 0 {
+            filename.to_owned()
+        } else if ext.is_empty() {
+            format!("{stem} ({index})")
+        } else {
+            format!("{stem} ({index}).{ext}")
+        }
+    })
+}
+
 fn save_download(
     directory: &std::path::Path,
     filename: &str,
     body: &[u8],
 ) -> Result<std::path::PathBuf> {
     use std::io::Write as _;
-    // `Ada.agent.png` counts as `Ada (1).agent.png`, which still reads as a
-    // snapshot by its suffix.
-    let (stem, ext) = filename
-        .find(".agent.")
-        .or_else(|| filename.rfind('.'))
-        .filter(|&at| at > 0)
-        .map_or((filename, ""), |at| (&filename[..at], &filename[at + 1..]));
-    for index in 0..1000 {
-        let candidate = if index == 0 {
-            filename.to_owned()
-        } else if ext.is_empty() {
-            format!("{stem} ({index})")
-        } else {
-            format!("{stem} ({index}).{ext}")
-        };
+    for candidate in download_names(filename) {
         let path = directory.join(candidate);
         match std::fs::OpenOptions::new()
             .write(true)

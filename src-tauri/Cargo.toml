@@ -94,11 +94,11 @@ tauri-plugin-mcp-bridge = { git = "https://github.com/hypothesi/mcp-server-tauri
 security-framework = "3.7"
 block2 = "=0.6.2"
 objc2 = "=0.6.4"
-objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["NSApplication", "NSResponder", "NSScreen", "NSWindow", "NSEvent", "NSWorkspace", "NSRunningApplication", "block2"] }
-objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSObject", "NSThread", "NSBundle", "NSString", "NSURL", "NSError", "NSUserDefaults", "NSProcessInfo"] }
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["NSApplication", "NSResponder", "NSScreen", "NSWindow", "NSEvent", "NSWorkspace", "NSRunningApplication", "NSMenu", "NSMenuItem", "NSUserInterfaceItemIdentification", "block2"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSObject", "NSThread", "NSBundle", "NSString", "NSURL", "NSError", "NSUserDefaults", "NSProcessInfo", "NSData", "NSURLRequest", "NSURLResponse"] }
 objc2-user-notifications = { version = "=0.3.2", default-features = false, features = ["UNError", "UNUserNotificationCenter", "UNNotificationSettings", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationTrigger", "block2"] }
 
-objc2-web-kit = { version = "=0.3.2", default-features = false, features = ["std", "objc2-app-kit", "block2", "WKWebView", "WKUIDelegate", "WKFrameInfo", "WKSecurityOrigin", "WKWebViewConfiguration", "WKWebsiteDataStore", "WKHTTPCookieStore"] }
+objc2-web-kit = { version = "=0.3.2", default-features = false, features = ["std", "objc2-app-kit", "block2", "WKWebView", "WKUIDelegate", "WKFrameInfo", "WKSecurityOrigin", "WKWebViewConfiguration", "WKWebsiteDataStore", "WKHTTPCookieStore", "WKDownload", "WKDownloadDelegate", "WKNavigationDelegate"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 webview2-com = "=0.39.1"
