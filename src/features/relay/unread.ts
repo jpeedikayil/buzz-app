@@ -1925,11 +1925,16 @@ export function createUnread({
   // MARK_SPLITS times a filter: 1 + MARK_SPLITS requests, each of at most two
   // filters, so (1 + 2 × MARK_SPLITS) × MARK_LIMIT events. Eight splits take
   // one busy root of 200 down to itself. A read by ID asks ID_BATCH IDs a
-  // filter (the relay plans 100 as a scan: 5 → 66 ms).
+  // filter (the relay plans 100 as a scan: 5 → 66 ms); the participation
+  // pass's reads by ID ride ID_FILTERS a request. A filter of 50 IDs is
+  // ~3.4 KB, so 16 are ~55 KB, within the 64 KiB of filters the reader
+  // takes: it refuses 20, every time, since a refusal is not split (see
+  // `split`).
   const MARK_ROOTS = 200;
   const MARK_LIMIT = 500;
   const MARK_SPLITS = 8;
   const ID_BATCH = 50;
+  const ID_FILTERS = 16;
   // The walk over the viewer's authored history teaches the threads they
   // replied in. A device's first repair pages back from the authored page in
   // the first request, SEED_PAGE a page behind the windows, until a short
@@ -3181,15 +3186,19 @@ export function createUnread({
           return fetched.has(key) ? [key] : [];
         }),
       );
+    /** Requests fetching `rootIds` by ID, ID_FILTERS filters each. */
     const byId = (rootIds: readonly string[]) => {
       for (const id of rootIds) fetchedIds.add(id);
-      return chunk(rootIds, ID_BATCH).map(
-        (ids): ReadFilter => ({
-          kinds: contentKinds,
-          ids,
-          include_aux: true,
-          limit: ids.length,
-        }),
+      return chunk(
+        chunk(rootIds, ID_BATCH).map(
+          (ids): ReadFilter => ({
+            kinds: contentKinds,
+            ids,
+            include_aux: true,
+            limit: ids.length,
+          }),
+        ),
+        ID_FILTERS,
       );
     };
     /** The threads a held reply is in. */
@@ -3216,15 +3225,21 @@ export function createUnread({
       const missing = [...groups.values()]
         .flat()
         .filter((rootId) => !structural(rootId));
-      return chunk<ReadFilter>(
-        [
-          ...[...groups].map(([channelId, rootIds]) =>
-            threads(channelId, rootIds),
-          ),
-          ...byId(missing),
-        ],
-        UNREAD_WINDOW_BATCH,
-      );
+      // The fetch's first request rides with the reads (a whole read asks at
+      // most HOT_THREADS roots, so one filter).
+      const [fetch = [], ...more] = byId(missing);
+      return [
+        ...chunk<ReadFilter>(
+          [
+            ...[...groups].map(([channelId, rootIds]) =>
+              threads(channelId, rootIds),
+            ),
+            ...fetch,
+          ],
+          UNREAD_WINDOW_BATCH,
+        ),
+        ...more,
+      ];
     };
     return {
       roots,
@@ -3461,7 +3476,7 @@ export function createUnread({
             ? [rootId]
             : [];
         });
-        return chunk(byId(missing), UNREAD_WINDOW_BATCH);
+        return byId(missing);
       },
       /** Learns a thread a lookup found the viewer in, or fetched the root
        * of, and returns its read when not yet asked for: whole when it ranks
@@ -3675,8 +3690,7 @@ export function createUnread({
             !rows.has(rootId) &&
             !fetchedIds.has(rootId),
         );
-        if (missing.length)
-          requests.unshift(...chunk(byId(missing), UNREAD_WINDOW_BATCH));
+        if (missing.length) requests.unshift(...byId(missing));
         const accepted = accept(
           kept.filter((event) => !fetchedRoots.has(event)),
         );
@@ -4150,13 +4164,20 @@ export function createUnread({
           // Last, once restore is in, the roots nothing holds of the
           // remembered threads holding a reply, whichever read brought it
           // (see `ground`), so the record can be saved complete; a dropped
-          // fetch leaves it incomplete, and the next pass asks again.
-          if (restoring) await restoring.done;
-          if (closed || generation !== epoch) return;
-          const roots = pass.ground();
-          if (roots.length) {
-            requests.push(...roots);
-            if (!(await drain())) return;
+          // fetch leaves it incomplete, and the next pass asks again. It
+          // holds the mark only in a pass that reads the bootstrap: one that
+          // caught up still moves it, as meant, since that delta read every
+          // reply since the mark and a root is structure, never counted. A
+          // pass in which nothing landed fails without it.
+          if (progress.landed) {
+            if (restoring) await restoring.done;
+            if (closed || generation !== epoch) return;
+            pass.learn();
+            const roots = pass.ground();
+            if (roots.length) {
+              requests.push(...roots);
+              if (!(await drain())) return;
+            }
           }
         } finally {
           run.pooling = false;

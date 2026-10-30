@@ -107,10 +107,11 @@ const hashed = (
   created_at: number,
   kind = 9,
   tags: string[][] = [],
+  pubkey = peerKey.pubkey,
 ): RelayEvent => {
   const template = {
     kind,
-    pubkey: peerKey.pubkey,
+    pubkey,
     created_at,
     content: `${channelId} ${created_at} ${hashes++}`,
     tags: [["h", channelId], ...tags],
@@ -124,6 +125,9 @@ const hashed = (
 };
 
 const ROSTER = ["team", "quiet", "dm", "busy"];
+/** The bytes of a request's filters, which the reader caps at 64 KiB. */
+const requestBytes = (filters: readonly ReadFilter[]) =>
+  new TextEncoder().encode(JSON.stringify(filters)).byteLength;
 const summaries = (ids: readonly string[]) =>
   ids.map(
     (id): ChannelSummary => ({
@@ -145,8 +149,9 @@ afterEach(() => {
  * filter's newest matches, leaves deleted events out, matches an event with
  * no `h` tag to `#h` by its target's channel, and, as the relay does,
  * attaches edits and deletions only to top-level and depth-limited
- * reads, which the repair does not send. `down` fails every evidence read
- * (the repair's, the delta's and the read of deletions), `fail` the ones it
+ * reads, which the repair does not send. Like the reader, it refuses a
+ * request over 64 KiB of filters. `down` fails every evidence read (the
+ * repair's, the delta's and the read of deletions), `fail` the ones it
  * matches; `now` is the device clock, and `rosterSettled` says whether the
  * channel list is the relay's whole answer. */
 async function launch({
@@ -186,6 +191,8 @@ async function launch({
   let waiting: (filters: readonly ReadFilter[]) => void = () => {};
   const reader = {
     read: vi.fn(async (filters: readonly ReadFilter[]) => {
+      if (requestBytes(filters) > 64 * 1024)
+        throw new Error("Relay filters exceed the request budget");
       if (
         filters.some(
           (filter) => filter.kinds?.includes(9) || filter.kinds?.includes(5),
@@ -4104,3 +4111,152 @@ it.each([
     ]);
   },
 );
+
+it("the roots of 1,000 remembered threads a catch-up brought replies to are fetched at most 16 filters of 50 IDs a request, each within the reader's 64 KiB, so the record saves complete", async () => {
+  // The viewer's replies, 100 to each channel's window, under roots older
+  // than the delta: only the fetch at the end of the pass brings them.
+  const channelIds = Array.from({ length: 10 }, (_, i) => `c${i}`);
+  const threads = Array.from({ length: 1000 }, (_, i) => {
+    const channelId = channelIds[i % channelIds.length] ?? "c0";
+    const root = hashed(channelId, T + i);
+    const mine = hashed(
+      channelId,
+      SECONDS - 1000 + i,
+      9,
+      [["e", root.id, "", "reply"]],
+      viewer,
+    );
+    return { key: `${channelId}:${root.id}`, root, mine };
+  });
+  const keys = threads.map(({ key }) => key);
+  const storage = memoryUnreadStorage();
+  await storage.save({
+    participation: {
+      roots: new Map(
+        threads.map(({ key, root }) => [key, { at: root.created_at }]),
+      ),
+    },
+    events: [],
+    structure: new Set(),
+    complete: true,
+    mark: { at: SECONDS - 600, checked: SECONDS - 60 },
+    roster: new Set(channelIds),
+    // Read whole, so the catch-up promotes none of them.
+    whole: new Set(keys),
+  });
+  const save = vi.spyOn(storage, "save");
+  const h = await launch({
+    store: threads.flatMap(({ root, mine }) => [root, mine]),
+    storage,
+    roster: summaries(channelIds),
+  });
+  await h.owner.capability.ensure();
+  const fetches = h.reader.read.mock.calls
+    .map(([filters]) => filters)
+    .filter((filters) => filters.some((filter) => filter.ids));
+  expect(fetches.map((filters) => filters.length)).toEqual([16, 4]);
+  for (const filters of fetches)
+    expect(requestBytes(filters)).toBeLessThanOrEqual(64 * 1024);
+  expect(new Set(fetches.flat().flatMap((filter) => filter.ids ?? []))).toEqual(
+    new Set(threads.map(({ root }) => root.id)),
+  );
+  expect(h.owner.capability.inbox().partial).toBeFalsy();
+  await save.mock.results.at(-1)?.value;
+  expect((await storage.read())?.complete).toBe(true);
+});
+
+/** Replies only the record holds, whose roots nothing else brings: an
+ * unread answer in a remembered DM thread, below the DM's window full of
+ * newer messages and cold behind 50 hotter threads, read since a mark after
+ * it (a DM reply counts without a lookup); and the viewer's reply in a
+ * thread the record does not remember, before the walk mark and the
+ * channel's window, which once restored teaches the thread, newest, so it
+ * ranks among the hot ones. Busier traffic fills the roster sample. */
+function onlyRecordHolds() {
+  const hot = Array.from({ length: 50 }, (_, i) =>
+    post(peerKey, "team", T + 100 + i),
+  );
+  const root = post(peerKey, "dm", T);
+  const answer = reply(peerKey, "dm", root, T + 10);
+  const newer = Array.from({ length: 100 }, (_, i) =>
+    post(peerKey, "dm", T + 20 + i),
+  );
+  const begun = post(peerKey, "quiet", T + 240);
+  const mine = reply(viewerKey, "quiet", begun, T + 250);
+  return {
+    rootIds: [root.id, begun.id],
+    record: {
+      participation: {
+        roots: new Map([
+          ...hot.map((event): [string, { at: number }] => [
+            `team:${event.id}`,
+            { at: event.created_at },
+          ]),
+          [`dm:${root.id}`, { at: T + 11 }],
+        ]),
+        walk: { since: T + 260 },
+      },
+      // Restore yields between batches of eight, where a test may hold it.
+      events: [answer, mine, ...newer.slice(0, 8)],
+      structure: new Set<string>(),
+      complete: false,
+      mark: { at: SECONDS - 600, checked: SECONDS - 60 },
+      roster: new Set(ROSTER),
+    },
+    store: [...hot, root, answer, ...newer, begun, mine, ...busy],
+    frontiers: { ...BUSY_READ, team: T + 200, dm: T + 5, quiet: T + 300 },
+  };
+}
+
+it("a full repair whose reads land before restore is in waits for it, then fetches the roots of the remembered threads whose replies only the record holds, one restore taught included, so the record saves complete", async () => {
+  const { rootIds, record, store, frontiers } = onlyRecordHolds();
+  const [root] = rootIds;
+  const storage = memoryUnreadStorage();
+  await storage.save(record);
+  const save = vi.spyOn(storage, "save");
+  const release = holdRestore();
+  const coldOf = (filter: ReadFilter) =>
+    !!root && !!filter["#e"]?.includes(root) && filter.since !== undefined;
+  const h = await launch({
+    store,
+    storage,
+    frontiers,
+    // Restore is let go once the bootstrap has read the DM thread, which
+    // returns nothing of it.
+    fail: (filters) => {
+      if (filters.some(coldOf)) release();
+      return false;
+    },
+  });
+  await h.owner.capability.ensure();
+  const fetched = fetchesOf(
+    h.reader.read.mock.calls.flatMap(([filters]) => filters),
+    rootIds,
+  );
+  expect(fetched).toEqual([
+    { kinds: CONTENT, ids: expect.any(Array), include_aux: true, limit: 2 },
+  ]);
+  expect(new Set(fetched[0]?.ids)).toEqual(new Set(rootIds));
+  await save.mock.results.at(-1)?.value;
+  const saved = await storage.read();
+  expect(saved?.complete).toBe(true);
+  for (const id of rootIds) expect(saved?.structure.has(id)).toBe(true);
+});
+
+it("a repair in which nothing lands fails without fetching the roots of the remembered threads its record holds replies in", async () => {
+  const { rootIds, record, store, frontiers } = onlyRecordHolds();
+  const storage = memoryUnreadStorage();
+  await storage.save(record);
+  const h = await launch({ store, storage, frontiers, down: true });
+  await h.owner.capability.ensure();
+  expect(h.owner.capability.inbox()).toMatchObject({
+    freshness: "stale",
+    error: "Relay read timed out",
+  });
+  expect(
+    fetchesOf(
+      h.reader.read.mock.calls.flatMap(([filters]) => filters),
+      rootIds,
+    ),
+  ).toEqual([]);
+});
