@@ -10,9 +10,12 @@ import {
 import { StrictMode, type ReactNode } from "react";
 import { ChannelTimeline } from "./ChannelTimeline";
 import { createRelaySession } from "../relay/session";
-import type { ChannelWindow } from "../relay/contracts";
+import type { ChannelMessage, ChannelWindow } from "../relay/contracts";
+import type { RelayEvent } from "../relay/events";
+import type { ReadTarget } from "../relay/read-state-model";
 import { keypair, message, scriptedTransport } from "../relay/testing";
 import { readView, writeView } from "../../shared/view-state";
+import { MessageManagement } from "./MessageManagement";
 
 // Real React lifecycle; only the virtualizer's imperative layout boundary is
 // modeled here. Browser journeys retain the actual same-message/4px contract.
@@ -23,7 +26,7 @@ const scroll = vi.hoisted(() => ({
   resized: () => {},
 }));
 vi.mock("virtua", async () => {
-  const { forwardRef, useImperativeHandle } = await import("react");
+  const { Children, forwardRef, useImperativeHandle } = await import("react");
   return {
     Virtualizer: forwardRef(function Virtualizer(
       { children, onResize }: { children: ReactNode; onResize?: () => void },
@@ -37,7 +40,13 @@ vi.mock("virtua", async () => {
         scrollToIndex: scroll.toIndex,
         scrollTo: scroll.toOffset,
       }));
-      return <ol style={{ height: 2000 }}>{children}</ol>;
+      return (
+        <ol style={{ height: 2000 }}>
+          {Children.map(children, (child) => (
+            <li>{child}</li>
+          ))}
+        </ol>
+      );
     }),
   };
 });
@@ -209,6 +218,934 @@ function mount(bottom = false, revealOnMount = false, anchorLoaded = true) {
     },
   };
 }
+
+function boundaryFixture() {
+  const viewer = keypair(),
+    peer = keypair(),
+    relay = keypair();
+  const owner = createRelaySession(
+    scriptedTransport(viewer.pubkey, relay.pubkey).transport,
+  );
+  owners.push(owner);
+  const unreadIds = new Set<string>(),
+    forcedIds = new Set<string>(),
+    unknownIds = new Set<string>(),
+    pendingIds = new Set<string>(),
+    ineligibleIds = new Set<string>(),
+    listeners = new Set<() => void>();
+  const syncListeners = new Set<() => void>();
+  let readRevision = owner.session.unread.revision();
+  let syncSnapshot = owner.session.unread.sync();
+  const entries: {
+    promise: Promise<void>;
+    resolve: () => void;
+    reject: (cause: Error) => void;
+    settled: boolean;
+  }[] = [];
+  const enterChannel = vi.fn(() => {
+    let resolve!: () => void;
+    let reject!: (cause: Error) => void;
+    const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+      resolve = () => resolvePromise();
+      reject = rejectPromise;
+    });
+    entries.push({ promise, resolve, reject, settled: false });
+    return promise;
+  });
+  const channelList = {
+    status: "ready" as const,
+    channels: ["c", "other"].map((id) => ({
+      id,
+      name: id,
+      members: [viewer.pubkey],
+    })),
+  };
+  const windows = new Map<string, ChannelWindow>();
+  const channels = {
+    ...owner.session.channels,
+    window: (id: string) =>
+      windows.get(id) ?? owner.session.channels.window(id),
+    list: () => channelList,
+    subscribeList: () => () => {},
+  };
+  const snapshot = (channelId: string) => {
+    return {
+      target: { kind: "channel" as const, channelId },
+      observedCount: unreadIds.size,
+      attentionCount: 0,
+      coverage: "observed" as const,
+      freshness: "observed" as const,
+      manual: "none" as const,
+    };
+  };
+  const snapshots = new Map([
+    ["c", snapshot("c")],
+    ["other", snapshot("other")],
+  ]);
+  const unread = {
+    ...owner.session.unread,
+    enterChannel,
+    snapshot(target: ReadTarget) {
+      return snapshots.get(target.channelId) ?? snapshot(target.channelId);
+    },
+    subscribe(_target: ReadTarget, listener: () => void) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    sync: () => syncSnapshot,
+    subscribeSync(listener: () => void) {
+      syncListeners.add(listener);
+      return () => syncListeners.delete(listener);
+    },
+    attention(_channelId: string, id: string) {
+      return {
+        status: unknownIds.has(id)
+          ? ("unknown" as const)
+          : ineligibleIds.has(id)
+            ? ("ineligible" as const)
+            : ("eligible" as const),
+        ...(pendingIds.has(id) ? { pending: true } : {}),
+        unread: unreadIds.has(id),
+        forced: forcedIds.has(id),
+        viewing: false,
+      };
+    },
+    revision: () => readRevision,
+  };
+  const session = { ...owner.session, channels, unread };
+  function row(
+    event: RelayEvent,
+    channelId = "c",
+    extra: Partial<ChannelMessage> = {},
+  ): ChannelMessage {
+    snapshots.set(channelId, snapshot(channelId));
+    return {
+      id: event.id,
+      channelId,
+      authorId: event.pubkey,
+      content: event.content,
+      createdAt: event.created_at,
+      mentions: [],
+      participants: [],
+      attachments: [],
+      reactions: [],
+      replyCount: 0,
+      ...extra,
+    };
+  }
+  function tree(
+    channelId: string,
+    rows: readonly ChannelMessage[],
+    hasMore = false,
+    active = true,
+    presented = true,
+  ) {
+    const window: ChannelWindow = {
+      channelId,
+      status: "ready",
+      freshness: "verified",
+      hasMore,
+      loadingOlder: false,
+      historyLimited: false,
+      error: undefined,
+      rows,
+    };
+    windows.set(channelId, window);
+    return (
+      <MessageManagement
+        session={session}
+        channelId={channelId}
+        active={active}
+      >
+        {presented ? (
+          <ChannelTimeline
+            channelId={channelId}
+            scope="scope"
+            viewer={viewer.pubkey}
+            queries={session}
+            window={window}
+            onOpenLink={() => false}
+          />
+        ) : (
+          <p role="status">Loading messages…</p>
+        )}
+      </MessageManagement>
+    );
+  }
+  function publish(channelId = "c") {
+    snapshots.set(channelId, snapshot(channelId));
+    act(() => {
+      for (const listener of [...listeners]) listener();
+    });
+  }
+  function completeReadStateSnapshot() {
+    syncSnapshot = {
+      ...syncSnapshot,
+      status: "reconciled",
+      completeness: "snapshot",
+    };
+    act(() => {
+      for (const listener of [...syncListeners]) listener();
+    });
+  }
+  return {
+    owner,
+    viewer,
+    peer,
+    row,
+    tree,
+    unread,
+    unreadIds,
+    forcedIds,
+    unknownIds,
+    pendingIds,
+    ineligibleIds,
+    enterChannel,
+    subscribers: () => ({ unread: listeners.size, sync: syncListeners.size }),
+    completeReadStateSnapshot,
+    async completeEntry() {
+      const entry = entries.find((candidate) => !candidate.settled);
+      if (!entry) throw new Error("No pending channel entry");
+      entry.settled = true;
+      await act(async () => {
+        entry.resolve();
+        await entry.promise;
+      });
+    },
+    async failEntry() {
+      const entry = entries.find((candidate) => !candidate.settled);
+      if (!entry) throw new Error("No pending channel entry");
+      entry.settled = true;
+      await act(async () => {
+        entry.reject(new Error("Could not restore unread state."));
+        await entry.promise.catch(() => {});
+      });
+    },
+    notifyAttention() {
+      act(() => {
+        for (const listener of [...syncListeners]) listener();
+      });
+    },
+    advanceReadRevision() {
+      readRevision++;
+    },
+    publish,
+  };
+}
+
+it("waits for entry and unread evidence before selecting a verified entry boundary", async () => {
+  const h = boundaryFixture();
+  const own = h.row(message(h.viewer, "c", "Own message", 1));
+  const agents = h.row(message(h.peer, "c", "Agent coordination", 2), "c", {
+    audience: "agents",
+  });
+  const joined = h.row(message(h.peer, "c", "Membership activity", 3), "c", {
+    membership: {
+      type: "member_joined",
+      actor: h.viewer.pubkey,
+      target: h.peer.pubkey,
+    },
+  });
+  const firstUnread = h.row(message(h.peer, "c", "First unread message", 4));
+  const laterUnread = h.row(message(h.peer, "c", "Later unread message", 5));
+  h.forcedIds.add(own.id);
+  h.unreadIds.add(agents.id);
+  h.unreadIds.add(firstUnread.id);
+  h.forcedIds.add(firstUnread.id);
+  h.unreadIds.add(laterUnread.id);
+  const rows = [own, agents, joined, firstUnread, laterUnread];
+  const mounted = render(h.tree("c", rows));
+  expect(h.enterChannel).toHaveBeenCalledExactlyOnceWith("c");
+  expect(screen.queryByText("New messages", { exact: true })).toBeNull();
+  await h.completeEntry();
+  expect(screen.queryByText("New messages", { exact: true })).toBeNull();
+
+  h.unknownIds.add(firstUnread.id);
+  mounted.rerender(h.tree("c", rows));
+  h.publish();
+  expect(screen.queryByText("New messages", { exact: true })).toBeNull();
+
+  h.unknownIds.delete(firstUnread.id);
+  h.pendingIds.add(firstUnread.id);
+  h.notifyAttention();
+  expect(screen.queryByText("New messages", { exact: true })).toBeNull();
+  h.pendingIds.delete(firstUnread.id);
+  h.ineligibleIds.add(firstUnread.id);
+  h.notifyAttention();
+  expect(screen.queryByText("New messages", { exact: true })).toBeNull();
+  h.completeReadStateSnapshot();
+  h.publish();
+  const separator = screen.getByText("New messages", { exact: true });
+  const first = screen.getByText("First unread message", { exact: true });
+  const row = (id: string) =>
+    document.querySelector(`[data-message-id="${id}"]`);
+  for (const preceding of [own, agents, joined]) {
+    const earlier = row(preceding.id);
+    expect(earlier).not.toBeNull();
+    expect(
+      (earlier?.compareDocumentPosition(separator) ?? 0) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
+  }
+  expect(
+    separator.compareDocumentPosition(first) & Node.DOCUMENT_POSITION_FOLLOWING,
+  ).not.toBe(0);
+  expect(screen.queryByText("Own message", { exact: true })).not.toBeNull();
+});
+
+it.each([
+  { remoteRead: false, presented: true },
+  { remoteRead: true, presented: true },
+  { remoteRead: true, presented: false },
+])(
+  "does not infer an entry boundary after incomplete history: %j",
+  async ({ remoteRead, presented }) => {
+    const h = boundaryFixture();
+    const older = h.row(
+      message(h.peer, "c", "Older unread outside the entry window", 1),
+    );
+    const read = h.row(message(h.peer, "c", "Read in loaded window", 2));
+    const unread = h.row(message(h.peer, "c", "Unread in loaded window", 3));
+    h.unreadIds.add(older.id);
+    h.unreadIds.add(unread.id);
+    h.completeReadStateSnapshot();
+    h.publish();
+    const revision = h.unread.revision();
+    const mounted = render(h.tree("c", [read, unread], true, true, presented));
+    await h.completeEntry();
+    expect(
+      screen.queryByRole("separator", { name: "New messages" }),
+    ).toBeNull();
+
+    if (remoteRead) h.unreadIds.delete(older.id);
+    h.publish();
+    mounted.rerender(h.tree("c", [older, read, unread]));
+    h.publish();
+    expect(
+      screen.queryByRole("separator", { name: "New messages" }),
+    ).toBeNull();
+    expect(h.unread.attention("c", older.id).unread).toBe(!remoteRead);
+    expect(h.unread.attention("c", unread.id).unread).toBe(true);
+    expect(h.unread.revision()).toBe(revision);
+    mounted.unmount();
+  },
+);
+
+it("does not select a stale unread row after reading advances while unread evidence is pending", async () => {
+  const h = boundaryFixture();
+  const read = h.row(message(h.peer, "c", "Already read", 1));
+  const unread = h.row(message(h.peer, "c", "Unread before paging", 2));
+  h.unreadIds.add(unread.id);
+  const mounted = render(h.tree("c", [read, unread]));
+
+  await h.completeEntry();
+  h.advanceReadRevision();
+  h.completeReadStateSnapshot();
+  mounted.rerender(h.tree("c", [read, unread]));
+  h.publish();
+
+  expect(screen.queryByText("New messages", { exact: true })).toBeNull();
+  mounted.unmount();
+});
+
+it("omits a pending boundary after a shared read revision changes without changing this channel's unread evidence", async () => {
+  const h = boundaryFixture();
+  const unread = h.row(message(h.peer, "c", "Still unread in this channel", 1));
+  h.unreadIds.add(unread.id);
+  h.publish();
+  const target = { kind: "channel" as const, channelId: "c" };
+  const entrySnapshot = h.unread.snapshot(target);
+  const entryAttention = h.unread.attention("c", unread.id);
+  const mounted = render(h.tree("c", [unread]));
+  await h.completeEntry();
+
+  h.advanceReadRevision();
+  h.publish("other");
+  h.completeReadStateSnapshot();
+  mounted.rerender(h.tree("c", [unread]));
+
+  expect(screen.queryByRole("separator", { name: "New messages" })).toBeNull();
+  expect(h.unread.snapshot(target)).toBe(entrySnapshot);
+  expect(h.unread.snapshot(target).observedCount).toBe(1);
+  expect(h.unread.attention("c", unread.id)).toEqual(entryAttention);
+  expect(h.unread.attention("c", unread.id).unread).toBe(true);
+  mounted.unmount();
+});
+
+it.each([1, 10, 11])(
+  "excludes a post-entry arrival at timestamp %s while snapshot evidence is pending",
+  async (createdAt) => {
+    const h = boundaryFixture();
+    const read = h.row({
+      ...message(h.viewer, "c", "Own message at entry", 10),
+      id: "0".repeat(64),
+    });
+    const mounted = render(h.tree("c", [read]));
+    await h.completeEntry();
+
+    const live = h.row({
+      ...message(h.peer, "c", "Arrived during entry", createdAt),
+      id: "f".repeat(64),
+    });
+    h.unreadIds.add(live.id);
+    const rows = createdAt < 10 ? [live, read] : [read, live];
+    mounted.rerender(h.tree("c", rows));
+    h.completeReadStateSnapshot();
+    h.publish();
+
+    expect(
+      screen.queryByRole("separator", { name: "New messages" }),
+    ).toBeNull();
+    expect(h.unread.attention("c", live.id).unread).toBe(true);
+    mounted.unmount();
+  },
+);
+
+it("does not adopt later-loaded unread rows as entry membership", async () => {
+  const h = boundaryFixture();
+  const mounted = render(h.tree("c", []));
+  const late = h.row(message(h.peer, "c", "First loaded after entry", 1));
+  h.unreadIds.add(late.id);
+  mounted.rerender(h.tree("c", [late]));
+  await h.completeEntry();
+  h.completeReadStateSnapshot();
+  h.publish();
+
+  expect(screen.queryByRole("separator", { name: "New messages" })).toBeNull();
+  expect(h.unread.attention("c", late.id).unread).toBe(true);
+  mounted.unmount();
+});
+
+it.each([
+  { entryReady: false, unreadAtEntry: false },
+  { entryReady: true, unreadAtEntry: false },
+  { entryReady: false, unreadAtEntry: true },
+  { entryReady: true, unreadAtEntry: true },
+])(
+  "uses entry unread rows after a pre-mount arrival: %j",
+  async ({ entryReady, unreadAtEntry }) => {
+    const h = boundaryFixture();
+    const entry = h.row(
+      message(unreadAtEntry ? h.peer : h.viewer, "c", "Message at entry", 10),
+    );
+    if (unreadAtEntry) {
+      h.unreadIds.add(entry.id);
+      h.completeReadStateSnapshot();
+    }
+    const mounted = render(h.tree("c", [entry], false, true, false));
+    if (entryReady) await h.completeEntry();
+    const revision = h.unread.revision();
+
+    const live = h.row(message(h.peer, "c", "Arrived while loading", 1));
+    h.unreadIds.add(live.id);
+    mounted.rerender(h.tree("c", [live, entry]));
+    if (!entryReady) await h.completeEntry();
+    h.completeReadStateSnapshot();
+    h.publish();
+
+    expect(
+      screen.getByText("Arrived while loading", { exact: true }),
+    ).toBeTruthy();
+    if (unreadAtEntry) {
+      const boundary = screen.getByRole("separator", { name: "New messages" });
+      expect(
+        screen
+          .getByText("Arrived while loading")
+          .compareDocumentPosition(boundary) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).not.toBe(0);
+      expect(
+        boundary.compareDocumentPosition(screen.getByText("Message at entry")) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ).not.toBe(0);
+    } else {
+      expect(
+        screen.queryByRole("separator", { name: "New messages" }),
+      ).toBeNull();
+    }
+    expect(h.unread.attention("c", entry.id).unread).toBe(unreadAtEntry);
+    expect(h.unread.attention("c", live.id).unread).toBe(true);
+    expect(h.unread.revision()).toBe(revision);
+    expect(h.enterChannel).toHaveBeenCalledTimes(1);
+    mounted.unmount();
+  },
+);
+
+it("retains loaded entry membership through a delayed first timeline mount", async () => {
+  const h = boundaryFixture();
+  const unread = h.row(message(h.peer, "c", "Unread at entry", 1));
+  h.unreadIds.add(unread.id);
+  const mounted = render(h.tree("c", [unread], false, true, false));
+  await h.completeEntry();
+  h.completeReadStateSnapshot();
+  h.publish();
+  mounted.rerender(h.tree("c", [unread]));
+
+  expect(screen.getByRole("separator", { name: "New messages" })).toBeTruthy();
+  expect(h.unread.attention("c", unread.id).unread).toBe(true);
+  mounted.unmount();
+});
+
+it("omits a delayed first-mount boundary after entry read intent changes", async () => {
+  const h = boundaryFixture();
+  const unread = h.row(message(h.peer, "c", "Unread at entry", 1));
+  h.unreadIds.add(unread.id);
+  const mounted = render(h.tree("c", [unread], false, true, false));
+  h.advanceReadRevision();
+  await h.completeEntry();
+  h.completeReadStateSnapshot();
+  h.publish();
+  mounted.rerender(h.tree("c", [unread]));
+
+  expect(screen.queryByRole("separator", { name: "New messages" })).toBeNull();
+  expect(h.unread.attention("c", unread.id).unread).toBe(true);
+  mounted.unmount();
+});
+
+it("omits a delayed first-mount boundary after synchronized entry reading changes", async () => {
+  const h = boundaryFixture();
+  const first = h.row(message(h.peer, "c", "Unread at entry", 1));
+  const later = h.row(message(h.peer, "c", "Still unread after sync", 2));
+  h.unreadIds.add(first.id);
+  h.unreadIds.add(later.id);
+  h.completeReadStateSnapshot();
+  const mounted = render(h.tree("c", [first, later], false, true, false));
+  await h.completeEntry();
+
+  const entryRevision = h.unread.revision();
+  h.unreadIds.delete(first.id);
+  h.notifyAttention();
+  mounted.rerender(h.tree("c", [first, later]));
+
+  expect(screen.queryByRole("separator", { name: "New messages" })).toBeNull();
+  expect(h.unread.revision()).toBe(entryRevision);
+  expect(h.unread.attention("c", later.id).unread).toBe(true);
+  mounted.unmount();
+});
+
+it("omits the boundary if entry reconciliation changes read intent", async () => {
+  const h = boundaryFixture();
+  const unread = h.row(message(h.peer, "c", "Unread during entry", 1));
+  h.unreadIds.add(unread.id);
+  const mounted = render(h.tree("c", [unread]));
+  h.advanceReadRevision();
+  await h.completeEntry();
+  h.completeReadStateSnapshot();
+  h.publish();
+
+  expect(screen.queryByRole("separator", { name: "New messages" })).toBeNull();
+  expect(h.unread.attention("c", unread.id).unread).toBe(true);
+  mounted.unmount();
+});
+
+it("omits the boundary and releases listeners when channel-entry reconciliation fails", async () => {
+  const h = boundaryFixture();
+  const unread = h.row(message(h.peer, "c", "Unread before failed entry", 1));
+  h.unreadIds.add(unread.id);
+  render(h.tree("c", [unread]));
+  h.completeReadStateSnapshot();
+  h.publish();
+  expect(h.subscribers()).toEqual({ unread: 1, sync: 1 });
+
+  await h.failEntry();
+
+  expect(screen.getByRole("alert").textContent).toContain(
+    "Could not restore unread state.",
+  );
+  expect(screen.queryByText("New messages", { exact: true })).toBeNull();
+  expect(h.subscribers()).toEqual({ unread: 0, sync: 0 });
+});
+
+it("keeps the first boundary stable through automatic reading and live messages", async () => {
+  const h = boundaryFixture();
+  const read = h.row(message(h.peer, "c", "Already read", 1));
+  const firstUnread = h.row(message(h.peer, "c", "Previously unread", 2));
+  h.unreadIds.add(firstUnread.id);
+  const mounted = render(h.tree("c", [read, firstUnread]));
+  expect(screen.queryByText("New messages", { exact: true })).toBeNull();
+  await h.completeEntry();
+  expect(screen.queryByText("New messages", { exact: true })).toBeNull();
+  h.completeReadStateSnapshot();
+  const before = (content: string) => {
+    const separator = screen.getByRole("separator", { name: "New messages" });
+    const target = screen.getByText(content, { exact: true });
+    return !!(
+      separator.compareDocumentPosition(target) &
+      Node.DOCUMENT_POSITION_FOLLOWING
+    );
+  };
+  expect(before("Previously unread")).toBe(true);
+
+  h.unreadIds.delete(firstUnread.id);
+  h.publish();
+  const live = h.row(message(h.peer, "c", "Arrived during visit", 3));
+  h.unreadIds.add(live.id);
+  mounted.rerender(h.tree("c", [read, firstUnread, live]));
+  expect(before("Previously unread")).toBe(true);
+  expect(before("Arrived during visit")).toBe(true);
+
+  const nextVisit = h.row(
+    message(h.peer, "other", "Unread in another channel", 4),
+    "other",
+  );
+  h.unreadIds.clear();
+  h.unreadIds.add(nextVisit.id);
+  h.publish("other");
+  mounted.rerender(h.tree("other", [nextVisit]));
+  await h.completeEntry();
+  expect(before("Unread in another channel")).toBe(true);
+  mounted.unmount();
+});
+
+it.each([true, false])(
+  "retains a completed channel boundary through a temporary timeline unmount, unread at entry=%s",
+  async (unreadAtEntry) => {
+    const h = boundaryFixture();
+    const first = h.row(message(h.peer, "c", "First entry message", 1));
+    if (unreadAtEntry) h.unreadIds.add(first.id);
+    const mounted = render(h.tree("c", [first]));
+    await h.completeEntry();
+    h.completeReadStateSnapshot();
+    expect(!!screen.queryByRole("separator", { name: "New messages" })).toBe(
+      unreadAtEntry,
+    );
+
+    mounted.rerender(h.tree("c", [first], false, true, false));
+    expect(
+      screen.queryByRole("region", { name: "Channel message history" }),
+    ).toBeNull();
+    h.unreadIds.delete(first.id);
+    h.advanceReadRevision();
+    const live = h.row(message(h.peer, "c", "Arrived during inline reveal", 2));
+    h.unreadIds.add(live.id);
+    h.publish();
+    mounted.rerender(h.tree("c", [first, live]));
+
+    expect(h.enterChannel).toHaveBeenCalledTimes(1);
+    const boundary = screen.queryByRole("separator", { name: "New messages" });
+    if (unreadAtEntry) {
+      expect(boundary).not.toBeNull();
+      expect(
+        (boundary?.compareDocumentPosition(
+          screen.getByText("First entry message"),
+        ) ?? 0) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).not.toBe(0);
+    } else expect(boundary).toBeNull();
+    mounted.unmount();
+  },
+);
+
+it.each(["read intent", "backdated arrival"])(
+  "retains the pending entry baseline through an inline-reveal unmount and %s",
+  async (change) => {
+    const h = boundaryFixture();
+    const entry = h.row(message(h.peer, "c", "Present at entry", 2));
+    if (change === "read intent") h.unreadIds.add(entry.id);
+    const mounted = render(h.tree("c", [entry]));
+    await h.completeEntry();
+    expect(
+      screen.queryByRole("separator", { name: "New messages" }),
+    ).toBeNull();
+    mounted.rerender(h.tree("c", [entry], false, true, false));
+
+    const rows = [entry];
+    if (change === "read intent") h.advanceReadRevision();
+    else {
+      const live = h.row(message(h.peer, "c", "Backdated after entry", 1));
+      rows.unshift(live);
+      h.unreadIds.add(live.id);
+    }
+    h.completeReadStateSnapshot();
+    h.publish();
+    mounted.rerender(h.tree("c", rows));
+
+    expect(h.enterChannel).toHaveBeenCalledTimes(1);
+    expect(
+      screen.queryByRole("separator", { name: "New messages" }),
+    ).toBeNull();
+    expect(rows.some((row) => h.unread.attention("c", row.id).unread)).toBe(
+      true,
+    );
+    mounted.unmount();
+  },
+);
+
+it.each([
+  "entry",
+  "before inline reveal",
+  "before snapshot",
+  "before first mount",
+] as const)(
+  "omits a pending boundary after synchronized reading changes attention captured at %s",
+  async (timing) => {
+    const h = boundaryFixture();
+    const first = h.row(message(h.peer, "c", "Unread at entry", 1));
+    const second = h.row(
+      message(h.peer, "c", "Still unread after remote reading", 2),
+    );
+    h.unreadIds.add(first.id);
+    h.unreadIds.add(second.id);
+    if (timing === "entry") h.completeReadStateSnapshot();
+    const revision = h.unread.revision();
+    const mounted = render(
+      h.tree(
+        "c",
+        [first, second],
+        false,
+        true,
+        timing !== "before first mount",
+      ),
+    );
+    if (timing !== "entry") await h.completeEntry();
+
+    if (timing === "before inline reveal") {
+      mounted.rerender(h.tree("c", [first, second], false, true, false));
+      h.completeReadStateSnapshot();
+      expect(
+        screen.queryByRole("region", { name: "Channel message history" }),
+      ).toBeNull();
+    }
+
+    h.unreadIds.delete(first.id);
+    h.notifyAttention();
+    h.publish();
+    expect(h.unread.revision()).toBe(revision);
+    expect(h.unread.attention("c", first.id).unread).toBe(false);
+    if (timing === "before snapshot" || timing === "before first mount")
+      h.completeReadStateSnapshot();
+    if (timing === "entry") await h.completeEntry();
+    mounted.rerender(h.tree("c", [first, second]));
+
+    expect(
+      screen.queryByRole("separator", { name: "New messages" }),
+    ).toBeNull();
+    expect(h.unread.attention("c", second.id).unread).toBe(true);
+    expect(h.enterChannel).toHaveBeenCalledTimes(1);
+    mounted.unmount();
+  },
+);
+
+it.each([
+  ["unknown", "entry"],
+  ["pending", "entry"],
+  ["unknown", "snapshot"],
+  ["pending", "snapshot"],
+  ["unknown", "delayed mount"],
+  ["pending", "delayed mount"],
+] as const)(
+  "does not adopt synchronized reading after %s attention at %s",
+  async (attention, timing) => {
+    const h = boundaryFixture();
+    const first = h.row(message(h.peer, "c", "Unresolved at entry", 1));
+    const later = h.row(message(h.peer, "c", "Still unread after sync", 2));
+    h.unreadIds.add(first.id);
+    h.unreadIds.add(later.id);
+    const unresolved = attention === "unknown" ? h.unknownIds : h.pendingIds;
+    unresolved.add(first.id);
+    if (timing !== "snapshot") h.completeReadStateSnapshot();
+    const revision = h.unread.revision();
+    const mounted = render(
+      h.tree("c", [first, later], false, true, timing !== "delayed mount"),
+    );
+    await h.completeEntry();
+    if (timing === "snapshot") h.completeReadStateSnapshot();
+    expect(
+      screen.queryByRole("separator", { name: "New messages" }),
+    ).toBeNull();
+
+    // A remote read arrives before the reply's root/classification lookup ends.
+    h.unreadIds.delete(first.id);
+    h.notifyAttention();
+    unresolved.delete(first.id);
+    h.notifyAttention();
+    mounted.rerender(h.tree("c", [first, later]));
+    h.publish();
+
+    expect(h.unread.revision()).toBe(revision);
+    expect(h.unread.attention("c", first.id).unread).toBe(false);
+    expect(h.unread.attention("c", later.id).unread).toBe(true);
+    expect(
+      screen.queryByRole("separator", { name: "New messages" }),
+    ).toBeNull();
+    mounted.unmount();
+  },
+);
+
+it.each([false, true])(
+  "captures a new boundary only while active, initially active=%s",
+  async (initiallyActive) => {
+    const h = boundaryFixture();
+    const first = h.row(message(h.peer, "c", "Earlier unread message", 1));
+    const next = h.row(message(h.peer, "c", "Next visit unread message", 2));
+    h.unreadIds.add(first.id);
+    const mounted = render(h.tree("c", [first, next], false, initiallyActive));
+    if (!initiallyActive) {
+      expect(h.subscribers()).toEqual({ unread: 0, sync: 0 });
+      mounted.rerender(h.tree("c", [first, next]));
+    }
+    expect(h.subscribers()).toEqual({ unread: 1, sync: 1 });
+    await h.completeEntry();
+    h.completeReadStateSnapshot();
+    h.publish();
+    expect(h.subscribers()).toEqual({ unread: 0, sync: 0 });
+    expect(
+      screen
+        .getByText("New messages", { exact: true })
+        .compareDocumentPosition(
+          screen.getByText("Earlier unread message", { exact: true }),
+        ) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
+
+    h.unreadIds.delete(first.id);
+    h.unreadIds.add(next.id);
+    mounted.rerender(h.tree("c", [first, next], false, false));
+    expect(h.subscribers()).toEqual({ unread: 0, sync: 0 });
+    expect(screen.queryByText("New messages", { exact: true })).toBeNull();
+
+    mounted.rerender(h.tree("c", [first, next]));
+    expect(h.subscribers()).toEqual({ unread: 1, sync: 1 });
+    await h.completeEntry();
+    h.publish();
+    expect(h.subscribers()).toEqual({ unread: 0, sync: 0 });
+    const separator = screen.getByText("New messages", { exact: true });
+    expect(
+      separator.compareDocumentPosition(
+        screen.getByText("Next visit unread message", { exact: true }),
+      ) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
+    expect(h.enterChannel).toHaveBeenCalledTimes(2);
+    mounted.unmount();
+    expect(h.subscribers()).toEqual({ unread: 0, sync: 0 });
+  },
+);
+
+it("does not move a completed no-boundary visit when unrelated unread arrives", async () => {
+  const h = boundaryFixture();
+  const read = h.row(message(h.peer, "c", "Already read", 1));
+  const joined = h.row(message(h.peer, "c", "Membership activity", 2), "c", {
+    membership: {
+      type: "member_joined",
+      actor: h.peer.pubkey,
+      target: h.peer.pubkey,
+    },
+  });
+  const mounted = render(h.tree("c", [read, joined]));
+  await h.completeEntry();
+  h.completeReadStateSnapshot();
+  h.publish();
+  expect(screen.queryByText("New messages", { exact: true })).toBeNull();
+
+  const live = h.row(message(h.peer, "c", "Arrived during visit", 3));
+  h.unreadIds.add(live.id);
+  mounted.rerender(h.tree("c", [read, joined, live]));
+  h.publish();
+  expect(screen.queryByText("New messages", { exact: true })).toBeNull();
+  mounted.unmount();
+});
+
+it("finalizes an excluded unread row before a live eligible message arrives", async () => {
+  const h = boundaryFixture();
+  const agent = h.row(message(h.peer, "c", "Agent coordination", 1), "c", {
+    audience: "agents",
+  });
+  h.unreadIds.add(agent.id);
+  const mounted = render(h.tree("c", [agent]));
+  await h.completeEntry();
+  h.completeReadStateSnapshot();
+  h.publish();
+  expect(screen.queryByText("New messages", { exact: true })).toBeNull();
+
+  const live = h.row(message(h.peer, "c", "Arrived during visit", 2));
+  h.unreadIds.add(live.id);
+  mounted.rerender(h.tree("c", [agent, live]));
+  h.publish();
+  expect(screen.queryByText("New messages", { exact: true })).toBeNull();
+  mounted.unmount();
+});
+
+it("does not let an earlier entry completion ready a replacement visit", async () => {
+  const h = boundaryFixture();
+  const unread = h.row(message(h.peer, "c", "Unread after re-entry", 1));
+  h.unreadIds.add(unread.id);
+  const mounted = render(h.tree("c", [unread]));
+  await h.completeReadStateSnapshot();
+  h.publish();
+  expect(screen.queryByText("New messages", { exact: true })).toBeNull();
+
+  mounted.rerender(h.tree("c", [unread], false, false));
+  mounted.rerender(h.tree("c", [unread]));
+  expect(h.enterChannel).toHaveBeenCalledTimes(2);
+  await h.completeEntry();
+  expect(screen.queryByText("New messages", { exact: true })).toBeNull();
+
+  await h.completeEntry();
+  expect(screen.getByText("New messages", { exact: true })).toBeTruthy();
+  mounted.unmount();
+});
+it.each([false, true])(
+  "preserves a restored row when the boundary appears and disappears, initially settled=%s",
+  async (initiallySettled) => {
+    const h = boundaryFixture();
+    const read = h.row(message(h.peer, "c", "Earlier read message", 1));
+    const unread = h.row(message(h.peer, "c", "Restored unread message", 2));
+    h.unreadIds.add(unread.id);
+    writeView("scope", "scroll:c", {
+      offset: 900,
+      bottom: false,
+      anchor: { id: unread.id, y: 100 },
+    });
+    const mounted = render(h.tree("c", [read, unread]));
+    const scroller = screen.getByRole("region", {
+      name: "Channel message history",
+    });
+    // This models the hold/settled permutations; new-message-boundary.spec.mjs
+    // covers saved-offset geometry with the real virtualizer.
+    scroll.itemOffset.mockReturnValue(100);
+    scroll.toIndex.mockImplementation((_index, { offset = 0 }) => {
+      scroller.scrollTop = 100 + offset;
+    });
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      function (this: HTMLElement) {
+        if (this === scroller) return new DOMRect(0, 0, 800, 600);
+        if (this.tagName === "LI")
+          return new DOMRect(0, 100 - scroller.scrollTop, 800, 80);
+        if (this.dataset.messageId === unread.id) {
+          const boundary = document.querySelector(
+            "[data-new-messages-boundary]",
+          );
+          return new DOMRect(
+            0,
+            100 + (boundary ? 32 : 0) - scroller.scrollTop,
+            800,
+            80,
+          );
+        }
+        return new DOMRect(0, 0, 800, 80);
+      },
+    );
+    if (initiallySettled) await frame();
+
+    await h.completeEntry();
+    h.completeReadStateSnapshot();
+    h.publish();
+    expect(screen.getByText("New messages", { exact: true })).toBeTruthy();
+    await frame();
+    expect(scroll.toIndex).toHaveBeenLastCalledWith(1, {
+      align: "start",
+      offset: -68,
+    });
+    expect(scroller.scrollTop).toBe(32);
+
+    mounted.rerender(h.tree("c", [read, unread], false, false));
+    expect(screen.queryByText("New messages", { exact: true })).toBeNull();
+    await frame();
+    expect(scroll.toIndex).toHaveBeenLastCalledWith(1, {
+      align: "start",
+      offset: -100,
+    });
+    expect(scroller.scrollTop).toBe(0);
+    mounted.unmount();
+  },
+);
 it.each([
   { offset: 0, gap: 1400 },
   { offset: 400, gap: 1000 },

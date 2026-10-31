@@ -25,6 +25,7 @@ import { useAgentOwnerEvidence } from "../profiles/useAgentOwnerEvidence";
 import type { ChannelMessage } from "../relay/contracts";
 import { useListedChannel } from "../relay/listed-channel";
 import type { RelaySession } from "../relay/session";
+import type { MessageAttention } from "../relay/unread";
 import type { AgentOwnerAuthorization } from "../relay/messages";
 import type { OutgoingEvent } from "../relay/outbox";
 import { MessageEditScope, useMessageEditScope } from "./MessageEditScope";
@@ -84,6 +85,35 @@ const Management = createContext<
     }
   | undefined
 >(undefined);
+type MessageVisit = Readonly<{
+  session: RelaySession;
+  channelId: string | undefined;
+  token: object;
+  entryMessageIds: ReadonlySet<string>;
+  entryHistoryComplete: boolean;
+  entryReadRevision: number;
+  entryAttention: ReadonlyMap<
+    string,
+    Pick<MessageAttention, "unread" | "forced"> | null
+  >;
+  active: boolean;
+  ready: boolean;
+  failed: boolean;
+}>;
+const MessageVisitContext = createContext<MessageVisit | undefined>(undefined);
+
+/** The channel visit that owns automatic reading and its entry reconciliation. */
+export function useMessageVisit(
+  session: RelaySession,
+  channelId: string,
+): MessageVisit | null | undefined {
+  const visit = useContext(MessageVisitContext);
+  if (!visit) return undefined;
+  return visit.session === session && visit.channelId === channelId
+    ? visit
+    : null;
+}
+
 export function useMessageDeletion() {
   const management = useContext(Management);
   const editor = useMessageEditScope();
@@ -222,14 +252,52 @@ export function MessageManagement({
         ? channel.id
         : undefined,
   );
-  const [notice, setNotice] = useState<{
-    visit: {
-      session: RelaySession;
-      channelId: string | undefined;
-      visitChannelId: string | undefined;
+  // The timeline may mount only after loading or an inline seek completes.
+  // Entry membership and provisional read evidence belong to this visit, not
+  // to that later render or the first complete read snapshot.
+  const captureVisit = () => {
+    const window = channelId ? session.channels.window(channelId) : undefined;
+    const rows = window?.rows ?? [];
+    const entryAttention = new Map<
+      string,
+      Pick<MessageAttention, "unread" | "forced"> | null
+    >();
+    if (channelId)
+      for (const row of rows) {
+        const attention = session.unread.attention(channelId, row.id);
+        entryAttention.set(
+          row.id,
+          attention.status === "unknown" || attention.pending
+            ? null
+            : { unread: attention.unread, forced: attention.forced },
+        );
+      }
+    return {
+      session,
+      channelId,
+      visitChannelId,
+      entryMessageIds: new Set(rows.map((row) => row.id)),
+      entryHistoryComplete:
+        window?.status === "ready" &&
+        window.freshness === "verified" &&
+        !window.refreshing &&
+        !window.loadingOlder &&
+        !window.hasMore &&
+        !window.historyLimited,
+      entryReadRevision: session.unread.revision(),
+      entryAttention,
     };
+  };
+  const [notice, setNotice] = useState<{
+    visit: ReturnType<typeof captureVisit>;
     error?: string | undefined;
-  }>(() => ({ visit: { session, channelId, visitChannelId } }));
+    entryReady: boolean;
+    entryFailed: boolean;
+  }>(() => ({
+    visit: captureVisit(),
+    entryReady: false,
+    entryFailed: false,
+  }));
   const { visit } = notice;
   const currentVisit =
     visit.session === session &&
@@ -237,8 +305,10 @@ export function MessageManagement({
     visit.visitChannelId === visitChannelId;
   if (!currentVisit)
     setNotice({
-      visit: { session, channelId, visitChannelId },
+      visit: captureVisit(),
       error: undefined,
+      entryReady: false,
+      entryFailed: false,
     });
   // Captured reporters cannot overwrite errors from a later visit, even to
   // the same channel. Reset during render so stale alerts never reach children.
@@ -263,6 +333,21 @@ export function MessageManagement({
     }),
     [session, channelId, operations, visit],
   );
+  const messageVisit = useMemo(
+    () => ({
+      session: visit.session,
+      channelId: visit.channelId,
+      token: visit,
+      entryMessageIds: visit.entryMessageIds,
+      entryHistoryComplete: visit.entryHistoryComplete,
+      entryReadRevision: visit.entryReadRevision,
+      entryAttention: visit.entryAttention,
+      active: !!visit.visitChannelId,
+      ready: notice.visit === visit && notice.entryReady,
+      failed: notice.visit === visit && notice.entryFailed,
+    }),
+    [visit, notice.visit, notice.entryReady, notice.entryFailed],
+  );
   useEffect(() => {
     const { session, visitChannelId } = visit;
     let active = true;
@@ -270,20 +355,38 @@ export function MessageManagement({
       ? enterVisit(session, visitChannelId)
       : undefined;
     if (presence)
-      void presence.ready.catch((cause) => {
-        if (active)
-          setNotice((current) =>
-            current.visit === visit
-              ? {
-                  ...current,
-                  error:
-                    cause instanceof Error
-                      ? cause.message
-                      : "Could not restore unread state.",
-                }
-              : current,
-          );
-      });
+      void presence.ready.then(
+        () => {
+          if (active)
+            setNotice((current) =>
+              current.visit === visit
+                ? { ...current, entryReady: true }
+                : current,
+            );
+        },
+        (cause) => {
+          if (active)
+            setNotice((current) =>
+              current.visit === visit
+                ? {
+                    ...current,
+                    entryReady: true,
+                    entryFailed: true,
+                    error:
+                      cause instanceof Error
+                        ? cause.message
+                        : "Could not restore unread state.",
+                  }
+                : current,
+            );
+        },
+      );
+    else
+      setNotice((current) =>
+        current.visit === visit
+          ? { ...current, entryReady: true, entryFailed: false }
+          : current,
+      );
     return () => {
       active = false;
       presence?.leave();
@@ -291,7 +394,9 @@ export function MessageManagement({
   }, [visit]);
   return (
     <Management.Provider value={management}>
-      <MessageEditScope>{children}</MessageEditScope>
+      <MessageVisitContext.Provider value={messageVisit}>
+        <MessageEditScope>{children}</MessageEditScope>
+      </MessageVisitContext.Provider>
       {currentVisit && notice.error && <p role="alert">{notice.error}</p>}
       {presented && selection && available && (
         <DeleteMessageDialog

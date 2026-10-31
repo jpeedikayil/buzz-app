@@ -3266,6 +3266,23 @@ html[data-keyboard-navigation] .rawDiff:focus-visible {
   margin-inline: auto;
   padding-block: var(--space-1);
 }
+.newMessages {
+  width: min(100%, var(--timeline-measure));
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin: var(--space-2) auto;
+  color: var(--text-subtle);
+  @apply text-caption;
+}
+.newMessages::before,
+.newMessages::after {
+  content: "";
+  height: 1px;
+  min-width: 0;
+  flex: 1;
+  background: var(--border-standard);
+}
 .activityChevron {
   transform: rotate(-90deg);
 }

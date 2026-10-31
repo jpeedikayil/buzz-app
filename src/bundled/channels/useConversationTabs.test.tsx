@@ -1809,6 +1809,7 @@ it("a hidden retained thread tab's rows re-render for new panels, not channel-li
     messages: { retry: () => {} },
     media: () => undefined,
     unread: {
+      revision: () => 0,
       sync: () => sync,
       snapshot: () => undefined,
       subscribe: () => () => {},

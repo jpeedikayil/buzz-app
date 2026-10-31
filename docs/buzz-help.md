@@ -116,6 +116,12 @@ that agent in Buzz; they do not notify the external app through this connection.
   Folders are optional unless **Work in a new worktree** is on. In that mode,
   add at least one project folder; the form shows a message beside Folders
   until you add one or turn worktree mode off.
+- **New messages** marks the first known unread incoming channel message when
+  you enter. Once established, the divider stays in place for that visit as you
+  read, reveal another message, or receive new messages. It is absent for a visit
+  that starts with incomplete or unverified history, even if older rows load
+  later. It may also be absent when unread evidence is incomplete, or read intent
+  or known read evidence changes before the boundary can be established.
 - **Communities** have their own channels, people, and agents. Switching
   communities changes the available context. A channel reopens where you
   stopped reading, or at the latest message once you had caught up. You and

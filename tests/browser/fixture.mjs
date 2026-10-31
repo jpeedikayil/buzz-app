@@ -2215,6 +2215,10 @@ export const test = base.extend({
             : 3,
         );
         const filter = body[0];
+        if (body.length === 1 && filter.read_state_snapshot === 1) {
+          report.queries.push({ community, filter });
+          return send(response, answer(community, filter));
+        }
         const result = [
           ...new Map(
             body
@@ -2723,6 +2727,7 @@ export const test = base.extend({
           root,
           parent,
           attachmentTags = [],
+          createdAt,
         ) {
           const history = histories.get(`${community}/${channel}`);
           const event = sign(
@@ -2741,7 +2746,7 @@ export const test = base.extend({
             ],
             content ?? `Live append ${history.length}`,
             own ? userKey : peerKey,
-            (history.at(-1)?.created_at ?? 1700000900) + 1,
+            createdAt ?? (history.at(-1)?.created_at ?? 1700000900) + 1,
           );
           history.push(event);
           if (relay && deliver) relay.publish(community, event);
