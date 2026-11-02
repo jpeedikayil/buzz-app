@@ -640,8 +640,11 @@ export function policyRelay({
               resolve(Response.json(result));
             });
           });
+        // A history page reads older rows below a cursor. The unread owner's
+        // catch-up pages (`since` from its mark, keyset-paged) are not held.
         if (
           filter.search === undefined &&
+          filter.since === undefined &&
           filter.until !== undefined &&
           holdOlder
         )

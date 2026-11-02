@@ -2308,8 +2308,11 @@ export const test = base.extend({
           ).values(),
         ];
         for (const { id } of result) served.add(id);
+        // A history page reads older rows below a cursor. The unread owner's
+        // catch-up pages (`since` from its mark, keyset-paged) are not held.
         if (
           filter.search === undefined &&
+          filter.since === undefined &&
           filter.until !== undefined &&
           filter["#h"]?.length
         ) {

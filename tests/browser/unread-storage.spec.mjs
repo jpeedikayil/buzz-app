@@ -258,7 +258,8 @@ appTest.describe("warm relaunch", () => {
       // That answer, and the peer thread the viewer joined, the class of a
       // thread older than the reads reach (a lost thread).
       const saved = ["Peer answer", "Unread reply 1"];
-      // What the unread owner reads: not channel heads or the mention feed.
+      // What the unread owner reads: not channel heads, the mention feed or
+      // the message search the palette sends while `openPage` types "Inbox".
       const unreadReads = (from) =>
         app.report.queries
           .slice(from)
@@ -267,7 +268,8 @@ appTest.describe("warm relaunch", () => {
               community === "primary" &&
               filter.kinds?.includes(9) &&
               !filter.top_level &&
-              !filter["#p"],
+              !filter["#p"] &&
+              filter.search === undefined,
           )
           .map(({ filter }) => filter);
       const delta = ({ at }) => ({
