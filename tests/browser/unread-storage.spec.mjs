@@ -2,7 +2,7 @@ import { test, expect } from "./source-fixture.mjs";
 
 // Real IndexedDB boundary of the Inbox's device record; what the owner
 // restores from it is in src/features/relay/unread-restore.test.ts.
-test("unread record survives reload, keeps the last record over a refused write, and is purged with only its partition", async ({
+test("unread record survives reload with its mark kept apart, keeps the last record over a refused write, and is purged with only its partition", async ({
   page,
   context,
   sourceOrigin,
@@ -35,6 +35,7 @@ test("unread record survives reload, keeps the last record over a refused write,
             events: record.events.map((event) => event.id),
             structure: [...record.structure],
             complete: record.complete,
+            mark: record.mark,
           };
         const before = describe(await store.read());
         if (!save) return { before };
@@ -49,29 +50,53 @@ test("unread record survives reload, keeps the last record over a refused write,
           ...extra,
         });
         try {
-          await store.save({
-            participation: {
-              roots: new Map([
-                [save.root, { at: 5, newestId: "b".repeat(64) }],
-              ]),
-              walk: { since: 3 },
+          await store.save(
+            {
+              participation: {
+                roots: new Map([
+                  [save.root, { at: 5, newestId: "b".repeat(64) }],
+                ]),
+                walk: { since: 3 },
+              },
+              events: save.events.map((id) =>
+                // A function is not cloneable: the write fails inside the
+                // transaction, after the events were read.
+                save.uncloneable === id
+                  ? event(id, { extra: () => {} })
+                  : event(id),
+              ),
+              structure: new Set(save.structure ?? []),
+              complete: true,
+              ...(save.mark ? { mark: save.mark } : {}),
             },
-            events: save.events.map((id) =>
-              // A function is not cloneable: the write fails inside the
-              // transaction, after the events were read.
-              save.uncloneable === id
-                ? event(id, { extra: () => {} })
-                : event(id),
-            ),
-            structure: new Set(save.structure ?? []),
-            complete: true,
-          });
+            { sameMeta: save.sameMeta },
+          );
           return { before, saved: true };
         } catch (error) {
           return { before, saved: false, error: String(error) };
         }
       },
       { scope, save },
+    );
+  // The partition's meta and mark entries as stored.
+  const raw = (scope) =>
+    page.evaluate(
+      (scope) =>
+        new Promise((resolve, reject) => {
+          const request = indexedDB.open("buzz-unread-v1");
+          request.onerror = () => reject(request.error);
+          request.onsuccess = () => {
+            const db = request.result;
+            const tx = db.transaction("meta");
+            const meta = tx.objectStore("meta").get(scope);
+            const mark = tx.objectStore("meta").get([scope, "mark"]);
+            tx.oncomplete = () => {
+              db.close();
+              resolve({ meta: meta.result, mark: mark.result });
+            };
+          };
+        }),
+      scope,
     );
   const forget = (window) =>
     window.evaluate(() => {
@@ -80,13 +105,27 @@ test("unread record survives reload, keeps the last record over a refused write,
     });
   const [one, two, three] = ["1", "2", "3"].map((digit) => digit.repeat(64));
   try {
+    const here = {
+      root: "team:a",
+      events: [one, two],
+      structure: [two],
+      mark: { at: 4, checked: 6 },
+    };
+    expect(await session(page, "here", here)).toEqual({
+      before: undefined,
+      saved: true,
+    });
+    const { meta: first } = await raw("here");
+    expect(first).not.toHaveProperty("mark");
+    // A save of the same meta moves the mark and leaves the meta alone.
+    const mark = { at: 4, checked: 7 };
     expect(
-      await session(page, "here", {
-        root: "team:a",
-        events: [one, two],
-        structure: [two],
-      }),
-    ).toEqual({ before: undefined, saved: true });
+      await session(page, "here", { ...here, mark, sameMeta: true }),
+    ).toMatchObject({ saved: true });
+    expect(await raw("here")).toEqual({
+      meta: first,
+      mark: { meta: first.revision, mark },
+    });
     await session(page, "neighbor", { root: "team:n", events: [three] });
     await page.reload();
     const record = {
@@ -95,20 +134,41 @@ test("unread record survives reload, keeps the last record over a refused write,
       events: [one, two],
       structure: [two],
       complete: true,
+      mark,
     };
     expect(await session(page, "here")).toEqual({ before: record });
     // Another window holds a session for the same partition.
     expect(await session(peer, "here")).toEqual({ before: record });
 
-    // A write that fails partway leaves the last record whole.
+    // A write that fails partway leaves the last record whole, mark and all.
+    const moved = { at: 8, checked: 9 };
     const refused = await session(page, "here", {
       root: "team:b",
       events: [two, three],
       uncloneable: three,
+      mark: moved,
     });
     expect(refused).toMatchObject({ saved: false });
+    expect(await session(peer, "here")).toEqual({ before: record });
+    // The refused meta never landed, so a save of it writes it whole.
+    expect(
+      await session(page, "here", {
+        root: "team:b",
+        events: [two],
+        mark: moved,
+        sameMeta: true,
+      }),
+    ).toMatchObject({ saved: true });
     await forget(page);
-    expect(await session(page, "here")).toEqual({ before: record });
+    expect(await session(page, "here")).toEqual({
+      before: {
+        ...record,
+        roots: [["team:b", { at: 5, newestId: "b".repeat(64) }]],
+        events: [two],
+        structure: [],
+        mark: moved,
+      },
+    });
 
     // Leaving the community purges its partition alone.
     await page.evaluate(async () => {
@@ -117,6 +177,7 @@ test("unread record survives reload, keeps the last record over a refused write,
       );
       await purgeUnreadStorage("here");
     });
+    expect((await raw("here")).mark).toBeUndefined();
     await forget(page);
     expect(await session(page, "neighbor")).toEqual({
       before: {
@@ -233,11 +294,17 @@ appTest.describe("warm relaunch", () => {
                 const all = db.transaction("meta").objectStore("meta").getAll();
                 all.onsuccess = () => {
                   db.close();
-                  const [meta, ...more] = all.result;
+                  // The record's meta, and the entry beside it with its mark.
+                  const [meta, ...more] = all.result.filter(
+                    (entry) => "version" in entry,
+                  );
+                  const beside = all.result.find(
+                    (entry) => entry.meta === meta?.revision,
+                  );
                   if (more.length) reject(new Error("More than one record"));
                   else
                     resolve(
-                      meta && { complete: meta.complete, mark: meta.mark },
+                      meta && { complete: meta.complete, mark: beside?.mark },
                     );
                 };
                 all.onerror = () => {

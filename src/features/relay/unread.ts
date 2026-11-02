@@ -1964,6 +1964,12 @@ export function createUnread({
   const MARK_SPLITS = 8;
   const ID_BATCH = 50;
   const ID_FILTERS = 16;
+  // Marked messages whose channel is not known are asked HOME_BATCH a
+  // request, in one filter of ~6.7 KB: the live relay answers 100 IDs in
+  // about the time of 50 (44 against 40 ms a request), so this takes half
+  // the requests. The pass's reads by ID ride ID_FILTERS a request, which
+  // at 100 IDs would exceed the 64 KiB, so they keep ID_BATCH.
+  const HOME_BATCH = 100;
   // The walk over the viewer's authored history teaches the threads they
   // replied in. A device's first repair pages back from the authored page in
   // the first request, SEED_PAGE a page behind the windows, until a short
@@ -2968,18 +2974,23 @@ export function createUnread({
   }
   // The record the saves issued leave once they land, so a save writes only
   // a change: one that fails clears it unless a later save was issued since,
-  // and the next save writes again.
-  let issuedKey: string | undefined;
+  // and the next save writes again. `meta` is all of it but the events and
+  // the mark: a save whose meta is the last one's writes only those.
+  let issued: Readonly<{ key: string; meta: string }> | undefined;
   // A save refused because the partition was purged after this session
   // first read it: nothing it holds is saved again.
   let fenced = false;
   let owed: ThreadParticipation | undefined;
-  function save(record: UnreadRecord, key?: string) {
-    issuedKey = key;
-    const saving = storage.save(record);
+  function save(
+    record: UnreadRecord,
+    keys?: Readonly<{ key: string; meta: string }>,
+  ) {
+    const sameMeta = keys !== undefined && keys.meta === issued?.meta;
+    issued = keys;
+    const saving = storage.save(record, { sameMeta });
     void saving.catch((cause: unknown) => {
       if (cause instanceof UnreadRecordPurged) fenced = true;
-      if (issuedKey === key) issuedKey = undefined;
+      if (issued === keys) issued = undefined;
     });
     return saving;
   }
@@ -3026,19 +3037,21 @@ export function createUnread({
       roster: new Set(covered),
       ...(mark ? { mark } : {}),
     };
-    const key = JSON.stringify([
+    // A tick that reads nothing new moves only the mark's `checked`.
+    const meta = JSON.stringify([
       [...participation.roots],
       participation.walk?.since,
-      record.events.map((event) => event.id).sort(),
       [...record.structure].sort(),
       record.complete,
-      mark,
       [...record.roster].sort(),
       [...record.whole].sort(),
       [...record.through].sort(),
       [...record.absent].sort(),
     ]);
-    if (key !== issuedKey) save(record, key);
+    const key =
+      meta +
+      JSON.stringify([record.events.map((event) => event.id).sort(), mark]);
+    if (key !== issued?.key) save(record, { key, meta });
     return { fits, events: selection.events.length, bytes };
   }
   async function rememberedRoots(): Promise<ThreadParticipation> {
@@ -4382,8 +4395,8 @@ export function createUnread({
       const found: Record<string, string> = {};
       try {
         const wanted = [...ids];
-        for (let offset = 0; offset < wanted.length; offset += ID_BATCH) {
-          const batch = wanted.slice(offset, offset + ID_BATCH);
+        for (let offset = 0; offset < wanted.length; offset += HOME_BATCH) {
+          const batch = wanted.slice(offset, offset + HOME_BATCH);
           for (const id of batch) askedHomes.add(id);
           const signal = AbortSignal.any([
             lifetime.signal,

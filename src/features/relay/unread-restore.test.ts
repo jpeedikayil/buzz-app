@@ -14,12 +14,14 @@ import { keypair, signed, type Key } from "./testing";
 import { memoryThreadFollows } from "./thread-follows";
 import { createUnread } from "./unread";
 import {
+  browserUnreadStorage,
   memoryUnreadStorage,
   UNREAD_RECORD_BYTES,
   UNREAD_RECORD_EVENTS,
   UnreadRecordPurged,
   type UnreadStorage,
 } from "./unread-storage";
+import { memoryIndexedDB } from "./unread-storage-testing";
 
 // Unit tests get a no-op recorder; this one records restore verification
 // and each repair pass.
@@ -150,6 +152,7 @@ afterEach(() => {
   restoreHold.held = undefined;
   for (const owner of owners.splice(0)) owner.dispose();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 /** One launch against a relay holding `store`: its query returns each
@@ -321,8 +324,8 @@ async function launch({
     // Spies a test puts on `storage` later still see each call.
     storage: {
       read: () => storage.read(),
-      save(record) {
-        const landed = storage.save(record);
+      save(record, options) {
+        const landed = storage.save(record, options);
         issued(landed);
         return landed;
       },
@@ -2011,6 +2014,93 @@ it("a delta that reads nothing newer keeps the mark's time and confirms it now",
   expect((await storage.read())?.mark).toEqual({ at, checked: SECONDS });
 });
 
+it("a check that only moves the mark puts the mark entry and not the meta, and one that moves a remembered thread or covers a channel puts the meta", async () => {
+  const idb = memoryIndexedDB();
+  const scope = "https://relay.example:viewer";
+  const at = SECONDS - 600;
+  // A thread the viewer replied in, read whole and held, and walked to.
+  const root = post(peerKey, "team", T);
+  const mine = reply(viewerKey, "team", root, T + 1);
+  const key = `team:${root.id}`;
+  await browserUnreadStorage(scope).save({
+    participation: {
+      roots: new Map([[key, { at: mine.created_at }]]),
+      walk: { since: mine.created_at },
+    },
+    events: [root, mine],
+    structure: new Set(),
+    complete: true,
+    mark: { at, checked: SECONDS - 60 },
+    roster: new Set(ROSTER),
+    whole: new Set([key]),
+  });
+  let clock = NOW;
+  const storage = browserUnreadStorage(scope);
+  const store: RelayEvent[] = [root, mine];
+  const h = await launch({
+    store,
+    storage,
+    frontiers: { team: SECONDS },
+    now: () => clock,
+  });
+  await h.owner.capability.ensure();
+  await h.saved;
+  /** The meta store's keys `pass` put, a minute on, once its saves land. */
+  async function put(pass: () => Promise<unknown>) {
+    clock += 60_000;
+    const save = vi.spyOn(storage, "save");
+    idb.writes.splice(0);
+    try {
+      await pass();
+      await Promise.all(save.mock.results.map(({ value }) => value));
+    } finally {
+      save.mockRestore();
+    }
+    return idb.writes.flatMap(([name, , key]) =>
+      name === "meta" ? [key] : [],
+    );
+  }
+  const next = () => browserUnreadStorage(scope).read();
+  // A tick that reads nothing new confirms the mark now, and puts that alone.
+  expect(await put(() => h.reconnected())).toEqual([[scope, "mark"]]);
+  expect(idb.writes).toHaveLength(1);
+  expect((await next())?.mark).toEqual({ at, checked: SECONDS + 60 });
+  // A peer answers in the thread: only its remembered time moves on.
+  const answer = reply(peerKey, "team", root, SECONDS - 300);
+  store.push(answer);
+  expect(await put(() => h.reconnected())).toEqual([scope, [scope, "mark"]]);
+  expect((await next())?.participation.roots.get(key)).toEqual({
+    at: answer.created_at,
+    newestId: answer.id,
+  });
+  // Joining a channel adds it to what the mark covers.
+  expect(
+    await put(() => {
+      h.roster(summaries([...ROSTER, "fresh"]));
+      return h.owner.capability.ensure();
+    }),
+  ).toEqual([scope, [scope, "mark"]]);
+  expect((await next())?.roster).toEqual(new Set([...ROSTER, "fresh"]));
+  expect(await put(() => h.reconnected())).toEqual([[scope, "mark"]]);
+  // A relaunch reads the mark from beside the meta, and catches up from it.
+  expect((await next())?.mark).toEqual({
+    at: answer.created_at,
+    checked: SECONDS + 240,
+  });
+  h.owner.dispose();
+  const warm = await launch({
+    store,
+    storage: browserUnreadStorage(scope),
+    frontiers: { team: SECONDS },
+    now: () => clock,
+  });
+  const launched = await sentDuring(warm, () => warm.owner.capability.ensure());
+  expect(launched[0]).toMatchObject({
+    kinds: DELTA_KINDS,
+    since: answer.created_at - 1865,
+  });
+});
+
 it("a chunk still full at six delta pages leaves the pass to the bootstrap, whose sample sets the mark the next delta reads to its end from", async () => {
   const at = SECONDS - 4000;
   const storage = await marked({ at, checked: SECONDS - 60 });
@@ -3686,7 +3776,7 @@ it("a remembered thread not read through since the mark, whose newest time preda
   );
 });
 
-it("a read by ID asks 50 IDs a filter at most: the roots replies lack, and the marked messages whose channel is not known", async () => {
+it("a read by ID asks 50 IDs a filter at most for the roots replies lack, and 100 for the marked messages whose channel is not known", async () => {
   const roots = Array.from({ length: 120 }, (_, i) =>
     post(peerKey, "team", T + i),
   );
@@ -3723,20 +3813,18 @@ it("a read by ID asks 50 IDs a filter at most: the roots replies lack, and the m
     h.reader.read.mock.calls.flatMap(([filters]) =>
       filters.flatMap((filter) => (filter.ids ? [filter] : [])),
     );
+  const homes = () => asked().filter((filter) => !filter.include_aux);
   await vi.waitFor(() =>
-    expect(
-      asked()
-        .filter((filter) => !filter.include_aux)
-        .flatMap((filter) => filter.ids ?? []),
-    ).toHaveLength(60),
+    expect(homes().flatMap((filter) => filter.ids ?? [])).toHaveLength(60),
   );
-  const fetched = asked()
-    .filter((filter) => filter.include_aux)
-    .flatMap((filter) => filter.ids ?? []);
-  expect(new Set(fetched)).toEqual(new Set(roots.map((root) => root.id)));
-  expect(Math.max(...asked().map((filter) => filter.ids?.length ?? 0))).toBe(
+  const fetches = asked().filter((filter) => filter.include_aux);
+  expect(new Set(fetches.flatMap((filter) => filter.ids ?? []))).toEqual(
+    new Set(roots.map((root) => root.id)),
+  );
+  expect(Math.max(...fetches.map((filter) => filter.ids?.length ?? 0))).toBe(
     50,
   );
+  expect(homes().map((filter) => filter.ids?.length)).toEqual([60]);
 });
 
 it("restored evidence discarded after a full repair from the mark asked its threads past it has them read again on their own, so the reply that read passed over still counts", async () => {

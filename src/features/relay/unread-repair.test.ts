@@ -1199,6 +1199,7 @@ it("remembered participation is saved and refetches the thread after the authore
         walk: { since: 1010 },
       },
     }),
+    expect.anything(),
   );
   first.owner.dispose();
   // A later session, days on, so it reads the bootstrap rather than a delta

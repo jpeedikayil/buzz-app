@@ -3662,6 +3662,42 @@ it("finds the channels of marked messages that are not loaded, then drops the co
   ).toHaveLength(2);
 });
 
+it("asks for the channels of 2,200 marked messages in 22 requests of at most 100 IDs", async () => {
+  const marked = Array.from({ length: 2200 }, (_, i) =>
+    (i + 1).toString(16).padStart(64, "0"),
+  );
+  const h = setup({}, true, (journal) => ({
+    ...journal,
+    state: { frontiers: { room: 30 }, overrides: {} },
+    reserve: Object.fromEntries(marked.map((id) => [`msg:${id}`, 12])),
+  }));
+  h.grant("room");
+  await h.session.unread.ensure();
+  // Marked messages are asked by ID alone; lookups carry `include_aux`.
+  const homes = () =>
+    h.query.mock.calls.flatMap(([filters]) =>
+      filters.every((filter) => filter.ids && !filter.include_aux)
+        ? [filters]
+        : [],
+    );
+  // Each is asked once, so every one asked is the lookup's end.
+  await vi.waitFor(() =>
+    expect(
+      new Set(
+        homes()
+          .flat()
+          .flatMap((filter) => filter.ids),
+      ),
+    ).toEqual(new Set(marked)),
+  );
+  expect(homes()).toHaveLength(22);
+  for (const filters of homes()) {
+    expect(filters).toHaveLength(1);
+    expect(filters[0]?.ids?.length).toBeLessThanOrEqual(100);
+    expect(filters[0]?.limit).toBe(filters[0]?.ids?.length);
+  }
+});
+
 it("a loaded message in a channel too long to save does not block other reads", async () => {
   const long = "c".repeat(257);
   const author = keypair();
