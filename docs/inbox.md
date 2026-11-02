@@ -194,20 +194,20 @@ therefore mostly moves on at launch and in a full repair.
 The point moves once that read reaches its end in every channel, to the
 newest event it returned. Wherever it moves, it goes no further ahead of this
 device's clock than the relay accepts a message's date, so one dated beyond
-that cannot make later checks start after the present. A repair runs in full instead
-on a device's first launch, after its storage was lost, on a launch from a
-record over its bounds, when the record is incomplete (as after a walk that
-stopped short) or was not caught up within the day, when restored events fail
-verification, and on Refresh. In a full repair restored events only add to
-what it reads: one that a read should have returned and did not, deleted
-while the device
-was closed, is dropped, and one whose channel membership is not confirmed yet
-waits for it. A catch-up that finds a channel with more new events than it
-takes, or whose restored events fail verification after it started, runs the
-full repair in the same pass. After a failed verification the Inbox loads
-once that repair's first reads land, and a channel only the catch-up read is
-not counted until the repair reads it. Either way the full repair
-moves the point then: once it has read the newest events across the roster and every thread
+that cannot make later checks start after the present. A repair runs in
+full instead on a device's first launch, after its storage was lost, on
+a launch from a record over its bounds, when the record is incomplete
+(as after a walk that stopped short) or was not caught up within the day,
+when restored events fail verification, and on Refresh. In a full repair
+restored events only add to what it reads: one that a read should have
+returned and did not, deleted while the device was closed, is dropped, and
+one whose channel membership is not confirmed yet waits for it. A catch-up
+that finds a channel with more new events than it takes, or whose restored
+events fail verification after it started, runs the full repair in the
+same pass. After a failed verification the Inbox loads once that repair's
+first reads land, and a channel only the catch-up read is not counted
+until the repair reads it. Either way the full repair moves the point
+then: once it has read the newest events across the roster and every thread
 and the viewer's own recent messages it asked for and, after an earlier
 point, the edits and deletions since it in every channel holding events, so a
 message deleted meanwhile is not kept past it; after a catch-up that stopped
@@ -249,21 +249,19 @@ halves of its threads rather than paged, up to eight times; a half still full
 after that is dropped as a failed read is: its threads no longer count as read
 through, so the next full repair asks each on its own, and the point stays
 where it was with the Inbox saying some recent activity could not be checked.
-Of the 50 most recently read
-or written in, only those read whole ride that read; the others, such as one
-newly among them, are read whole. A thread not read through since the point
-is still asked on its own for replies since the newest one the viewer wrote
-or read, as is every thread on a device's first launch, after its storage was
-lost, on a launch from a record over its bounds or from one that never caught
-up. Such a thread was learned beside a catch-up, which read none of its
-replies from before the point, or had replies that were not kept or restored
-replies dropped (below),
-or is in a channel the point no longer covers. When restored events fail
-verification after that read, the threads it covered are read again on their
-own in the same pass. A dropped
-read leaves the point where it was and the Inbox saying some recent activity
-could not be checked, and the next check reads those threads again. Refresh
-always runs the full repair: pressed while a
+Of the 50 most recently read or written in, only those read whole ride that
+read; the others, such as one newly among them, are read whole. A thread
+not read through since the point is still asked on its own for replies since
+the newest one the viewer wrote or read, as is every thread on a device's
+first launch, after its storage was lost, on a launch from a record over its
+bounds or from one that never caught up. Such a thread was learned beside
+a catch-up, which read none of its replies from before the point, or had
+replies that were not kept or restored replies dropped (below), or is in a
+channel the point no longer covers. When restored events fail verification
+after that read, the threads it covered are read again on their own in
+the same pass. A dropped read leaves the point where it was and the Inbox
+saying some recent activity could not be checked, and the next check reads
+those threads again. Refresh always runs the full repair: pressed while a
 catch-up runs, it runs once that ends, and pressed before a check has chosen
 to catch up, that check runs it instead. The full repair also reads the
 deletions made since that point in the channels holding restored events the

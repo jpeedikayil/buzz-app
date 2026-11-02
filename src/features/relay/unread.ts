@@ -1954,21 +1954,25 @@ export function createUnread({
   // MARK_SPLITS times a filter: 1 + MARK_SPLITS requests, each of at most two
   // filters, so (1 + 2 × MARK_SPLITS) × MARK_LIMIT events. Eight splits take
   // one busy root of 200 down to itself. A read by ID asks ID_BATCH IDs a
-  // filter (the relay plans 100 as a scan: 5 → 66 ms); the participation
-  // pass's reads by ID ride ID_FILTERS a request. A filter of 50 IDs is
-  // ~3.4 KB, so 16 are ~55 KB, within the 64 KiB of filters the reader
-  // takes: it refuses 20, every time, since a refusal is not split (see
-  // `split`).
+  // filter: a local relay on PostgreSQL 18.6 planned 100 as a scan
+  // (5 → 66 ms), which the live relay did not (see HOME_BATCH). The
+  // participation pass's reads by ID ride ID_FILTERS a request. A filter of
+  // 50 IDs is ~3.4 KB, so 16 are ~55 KB, within the 64 KiB of filters the
+  // reader takes: it refuses 20, every time, since a refusal is not split
+  // (see `split`).
   const MARK_ROOTS = 200;
   const MARK_LIMIT = 500;
   const MARK_SPLITS = 8;
   const ID_BATCH = 50;
   const ID_FILTERS = 16;
   // Marked messages whose channel is not known are asked HOME_BATCH a
-  // request, in one filter of ~6.7 KB: the live relay answers 100 IDs in
-  // about the time of 50 (44 against 40 ms a request), so this takes half
-  // the requests. The pass's reads by ID ride ID_FILTERS a request, which
-  // at 100 IDs would exceed the 64 KiB, so they keep ID_BATCH.
+  // request, in one filter of ~6.7 KB: replaying real ID sets, the live
+  // relay answered 100 IDs in about the time of 50 (44 against 40 ms of
+  // relay time a request), with no cliff at 100, so this takes half the
+  // requests. Should its planner show the local relay's cliff (see
+  // ID_BATCH), lower this back to ID_BATCH. The pass's reads by ID ride
+  // ID_FILTERS a request, which at 100 IDs would exceed the 64 KiB, so
+  // they keep ID_BATCH.
   const HOME_BATCH = 100;
   // The walk over the viewer's authored history teaches the threads they
   // replied in. A device's first repair pages back from the authored page in
