@@ -378,6 +378,9 @@ export function createUnread({
   let indexed = false;
   const byChannel = new Map<string, Evidence[]>();
   const byId = new Map<string, Evidence>();
+  // Retained edits and deletions by each event they reference, which
+  // `foldable` gathers for a channel's content.
+  const byTarget = new Map<string, RelayEvent[]>();
   const tombstones = new Set<string>();
   // Conversation membership: the viewer's own messages, and the parents the
   // viewer has replied to, each keyed by channel. A conversation is the set of
@@ -534,16 +537,21 @@ export function createUnread({
     indexed = true;
     byChannel.clear();
     byId.clear();
+    byTarget.clear();
     tombstones.clear();
     own.clear();
     joined.clear();
     ownThreads.clear();
     for (const event of events.values()) {
-      if (event.kind !== 5 && event.kind !== 9005) continue;
+      if (contentKind(event)) continue;
       for (const [name, id] of event.tags) {
-        const target = id ? events.get(id) : undefined;
+        if (name !== "e" || !id) continue;
+        const overlays = byTarget.get(id) ?? [];
+        overlays.push(event);
+        byTarget.set(id, overlays);
+        const target = events.get(id);
         if (
-          name === "e" &&
+          (event.kind === 5 || event.kind === 9005) &&
           target &&
           deletionApplies(event, target, signingAuthority)
         )
@@ -599,6 +607,24 @@ export function createUnread({
   function deleted(event: RelayEvent): boolean {
     indexEvidence();
     return tombstones.has(event.id);
+  }
+  /** What `foldMessages` reads to show a channel's evidence: its content, the
+   * edits and deletions referencing it, and the deletions of those, whatever
+   * channel they name, if any. The fold reads no deeper, and a deleted message
+   * is no row, so its rows are those of folding every retained event, at the
+   * cost of the channel's events rather than all of them. Call after
+   * `indexEvidence`. */
+  function foldable(channelId: string): RelayEvent[] {
+    const result = new Set<RelayEvent>();
+    for (const { event } of byChannel.get(channelId) ?? []) {
+      result.add(event);
+      for (const overlay of byTarget.get(event.id) ?? []) {
+        result.add(overlay);
+        for (const deletion of byTarget.get(overlay.id) ?? [])
+          result.add(deletion);
+      }
+    }
+    return [...result];
   }
   /** Evidence of the target's channel: the index already resolved its channel
    * and reply root, which every selector would otherwise derive per event. */
@@ -978,7 +1004,7 @@ export function createUnread({
         continue;
       const current = grouped.get(rootId);
       presented ??= new Map(
-        foldMessages(channelId, "", [...events.values()], {
+        foldMessages(channelId, "", foldable(channelId), {
           includeReplies: true,
           signingAuthority,
           agentOwner: profiles?.owner && agentOwner,
@@ -1126,7 +1152,7 @@ export function createUnread({
           groups.set(id, group);
         }
         if (!groups.size) continue;
-        const rows = foldMessages(channel.id, "", [...events.values()], {
+        const rows = foldMessages(channel.id, "", foldable(channel.id), {
           includeReplies: true,
           signingAuthority,
           agentOwner: profiles?.owner && agentOwner,

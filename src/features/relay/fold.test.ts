@@ -449,6 +449,70 @@ describe("message fold", () => {
       ),
     ).toEqual([[2, [relay.pubkey]]]);
   });
+  it("folds the same rows without pending replies as with none layered", () => {
+    const root = message(alice, channel, "root", 10);
+    const reply = message(bob, channel, "re", 11, [
+      ["e", root.id, "", "root"],
+      ["e", root.id, "", "reply"],
+    ]);
+    const shared = message(bob, channel, "shared", 12, [
+      ["e", root.id, "", "reply"],
+      ["broadcast", "1"],
+    ]);
+    const elsewhere = message(bob, "elsewhere", "re", 13, [
+      ["e", root.id, "", "reply"],
+    ]);
+    const events = [
+      root,
+      reply,
+      shared,
+      elsewhere,
+      summary(relay, channel, root.id, {
+        descendant_count: 2,
+        participants: [bob.pubkey],
+      }),
+      signed(alice, {
+        kind: 40003,
+        content: "root, edited",
+        created_at: 14,
+        tags: [["e", root.id]],
+      }),
+      signed(bob, {
+        kind: 5,
+        content: "",
+        created_at: 15,
+        tags: [["e", shared.id]],
+      }),
+      signed(carol, {
+        kind: 7,
+        content: "+",
+        created_at: 16,
+        tags: [["e", root.id]],
+      }),
+    ];
+    for (const includeReplies of [false, true]) {
+      const rows = foldMessages(channel, relay.pubkey, events, {
+        includeReplies,
+      });
+      expect(rows.map((row) => row.id)).toEqual(
+        includeReplies ? [root.id, reply.id] : [root.id],
+      );
+      // The summary alone: no reply is pending.
+      expect(rows[0]).toMatchObject({
+        content: "root, edited",
+        replyCount: 2,
+        participants: [bob.pubkey],
+      });
+      // An empty set, or one naming no reply of this channel, layers nothing.
+      for (const pending of [[], [root.id, elsewhere.id]])
+        expect(
+          foldMessages(channel, relay.pubkey, events, {
+            includeReplies,
+            pendingReplies: new Set(pending),
+          }),
+        ).toEqual(rows);
+    }
+  });
   it("does not exhaust the call stack while projecting deeply nested untrusted Markdown", () => {
     const nested = message(
       alice,
