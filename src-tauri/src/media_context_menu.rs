@@ -10,7 +10,9 @@
 //!   and quarantines it. The partial file of a download that fails, or is
 //!   still running when Buzz quits, is removed. Each result is sent to the
 //!   main window as `media-menu-download`: the saved file's name, or null if
-//!   it failed.
+//!   it failed. A `just desktop` build with a pinned viewer plays media from
+//!   its dev server's relay broker instead, whose media URLs on that origin
+//!   are named the same way.
 //! - `<video>` and `<audio>` play from the tokened loopback listener
 //!   (`relay::media_stream`). Copy … Address, Open … in New Window and
 //!   Share… would hand that URL, token included, to the clipboard, a window
@@ -44,6 +46,7 @@ use objc2_foundation::{
 };
 use objc2_web_kit::{WKDownload, WKDownloadDelegate, WKWebView};
 use tauri::Emitter as _;
+use url::Url;
 
 /// Items on a `<video>` or `<audio>` menu that hand out its URL. Elsewhere
 /// Share… shares an image or the selection, so it stays there.
@@ -85,6 +88,9 @@ struct Downloads {
     /// The loopback listener's base URL, from which `<video>` and `<audio>`
     /// load.
     stream: Option<String>,
+    /// The dev server Buzz loads its pages from, whose relay broker serves
+    /// media when a viewer is pinned.
+    dev: Option<Url>,
     /// Destinations WebKit has accepted for downloads still running. The
     /// network process creates each file later, so until then only this
     /// shows the name is taken.
@@ -161,7 +167,12 @@ impl DownloadDelegate {
         let source = unsafe { download.originalRequest() }?
             .URL()?
             .absoluteString()?;
-        media_name(&source.to_string(), self.ivars().stream.as_deref())
+        let downloads = self.ivars();
+        media_name(
+            &source.to_string(),
+            downloads.stream.as_deref(),
+            downloads.dev.as_ref(),
+        )
     }
 
     /// Frees `download`'s destination for later downloads, returning it if
@@ -219,13 +230,14 @@ fn remove_partial(path: &Path) {
 
 /// Installs both hooks for the main window's webview. Downloads go to
 /// `directory`, if there is one, and their results to `app`'s main window;
-/// `stream` is the loopback listener's base URL. Call once, on the main
-/// thread.
+/// `stream` is the loopback listener's base URL and `dev` the dev server's,
+/// if Buzz loads its pages from one. Call once, on the main thread.
 pub(crate) fn install(
     webview: &tauri::webview::PlatformWebview,
     app: tauri::AppHandle,
     directory: Option<PathBuf>,
     stream: Option<String>,
+    dev: Option<Url>,
 ) {
     let Some(marker) = MainThreadMarker::new() else {
         return;
@@ -241,6 +253,7 @@ pub(crate) fn install(
                 app,
                 directory,
                 stream,
+                dev,
                 pending: RefCell::default(),
             });
             let delegate: Retained<DownloadDelegate> = unsafe { msg_send![super(allocated), init] };
@@ -435,15 +448,41 @@ fn hidden_items(items: &[Item], saves: bool) -> Vec<usize> {
 }
 
 /// The Downloads name for a menu download of relay media: the loopback URL
-/// a `<video>` or `<audio>` plays, which ends in its `buzz-media` path, or
-/// the `buzz-media` URL an image shows. Any other source has none.
-fn media_name(source: &str, stream: Option<&str>) -> Option<String> {
-    let source = match stream.and_then(|base| source.strip_prefix(base)) {
+/// a `<video>` or `<audio>` plays, which ends in its `buzz-media` path, the
+/// `buzz-media` URL an image shows, or the `dev` server's broker media URL.
+/// Any other source has none.
+fn media_name(source: &str, stream: Option<&str>, dev: Option<&Url>) -> Option<String> {
+    let path = stream
+        .and_then(|base| source.strip_prefix(base))
+        .map(str::to_owned)
+        .or_else(|| dev.and_then(|dev| broker_target(source, dev)));
+    let source = match path {
         Some(path) => format!("buzz-media://localhost/{path}"),
         None => source.to_owned(),
     };
     let url = crate::relay::download_target(&source)?;
     Some(crate::relay::download_name("", &url).to_owned())
+}
+
+/// The encoded relay URL a media URL of the `dev` server's relay broker,
+/// `/api/relay[/<community>]/media?url=<target>`, loads.
+fn broker_target(source: &str, dev: &Url) -> Option<String> {
+    let url = Url::parse(source).ok()?;
+    let segments: Vec<&str> = url.path_segments()?.collect();
+    let mut query = url.query_pairs();
+    let (key, target) = query.next()?;
+    (url.origin() == dev.origin()
+        && matches!(
+            segments[..],
+            ["api", "relay", "media"] | ["api", "relay", _, "media"]
+        )
+        && key == "url"
+        && query.next().is_none()
+        && url.fragment().is_none())
+    .then(|| {
+        percent_encoding::utf8_percent_encode(&target, percent_encoding::NON_ALPHANUMERIC)
+            .to_string()
+    })
 }
 
 /// The first of `name`'s numbered names that nothing in `directory` has
@@ -529,34 +568,88 @@ mod tests {
         }
     }
 
+    fn encode(url: &str) -> String {
+        percent_encoding::utf8_percent_encode(url, percent_encoding::NON_ALPHANUMERIC).to_string()
+    }
+
     #[test]
     fn menu_downloads_are_named_only_for_relay_media() {
         let base = "http://127.0.0.1:4321/token/";
-        let encode = |url: &str| {
-            percent_encoding::utf8_percent_encode(url, percent_encoding::NON_ALPHANUMERIC)
-                .to_string()
-        };
         let hash = "a".repeat(64);
         let video = encode(&format!("https://relay.test/media/{hash}.mp4"));
         let image = encode(&format!("https://relay.test/media/{hash}.png"));
-        assert_eq!(
-            media_name(&format!("{base}{video}"), Some(base)),
-            Some(format!("{hash}.mp4"))
-        );
-        assert_eq!(
-            media_name(&format!("buzz-media://localhost/{image}"), Some(base)),
-            Some(format!("{hash}.png"))
+        let server = Url::parse("http://localhost:1430").unwrap();
+        // A dev server changes nothing for these sources.
+        for dev in [None, Some(&server)] {
+            assert_eq!(
+                media_name(&format!("{base}{video}"), Some(base), dev),
+                Some(format!("{hash}.mp4"))
+            );
+            assert_eq!(
+                media_name(&format!("buzz-media://localhost/{image}"), Some(base), dev),
+                Some(format!("{hash}.png"))
+            );
+            for source in [
+                format!("{base}{video}?download"),
+                format!("{base}{}", encode("https://relay.test/other.mp4")),
+                format!("http://127.0.0.1:4321/other/{video}"),
+                format!("https://relay.test/media/{hash}.mp4"),
+                "https://example.test/file.zip".to_owned(),
+            ] {
+                assert_eq!(media_name(&source, Some(base), dev), None, "{source}");
+            }
+            assert_eq!(media_name(&format!("{base}{video}"), None, dev), None);
+        }
+    }
+
+    #[test]
+    fn dev_broker_media_is_named_only_on_the_dev_servers_origin() {
+        let dev = Url::parse("http://localhost:10175").unwrap();
+        let hash = "a".repeat(64);
+        let video = encode(&format!("https://relay.test/media/{hash}.mp4"));
+        let community = format!(
+            "http://localhost:10175/api/relay/{}",
+            encode("https://relay.test")
         );
         for source in [
-            format!("{base}{video}?download"),
-            format!("{base}{}", encode("https://relay.test/other.mp4")),
-            format!("http://127.0.0.1:4321/other/{video}"),
-            format!("https://relay.test/media/{hash}.mp4"),
-            "https://example.test/file.zip".to_owned(),
+            format!("{community}/media?url={video}"),
+            format!("http://localhost:10175/api/relay/media?url={video}"),
         ] {
-            assert_eq!(media_name(&source, Some(base)), None, "{source}");
+            assert_eq!(
+                media_name(&source, None, Some(&dev)),
+                Some(format!("{hash}.mp4")),
+                "{source}"
+            );
+            // Packaged builds have no dev server.
+            assert_eq!(media_name(&source, None, None), None, "{source}");
         }
-        assert_eq!(media_name(&format!("{base}{video}"), None), None);
+        for source in [
+            // Another origin.
+            format!("http://localhost:1430/api/relay/media?url={video}"),
+            format!("http://127.0.0.1:10175/api/relay/media?url={video}"),
+            format!("https://localhost:10175/api/relay/media?url={video}"),
+            // No `url`, or more than it.
+            format!("{community}/media"),
+            format!("{community}/media?target={video}"),
+            format!("{community}/media?url={video}&download"),
+            format!("{community}/media?url={video}#t=1"),
+            // Another route.
+            format!("{community}/upload?url={video}"),
+            format!("http://localhost:10175/media?url={video}"),
+            format!("{community}/extra/media?url={video}"),
+            // A target that is not relay media.
+            format!(
+                "{community}/media?url={}",
+                encode("https://relay.test/other.mp4")
+            ),
+            format!(
+                "{community}/media?url={}",
+                encode(&format!("https://relay.test/media/{hash}.mp4?x=1"))
+            ),
+            format!("{community}/media?url={}", encode("file:///etc/passwd")),
+        ] {
+            assert_eq!(media_name(&source, None, Some(&dev)), None, "{source}");
+        }
     }
 
     #[test]

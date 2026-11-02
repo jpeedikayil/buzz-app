@@ -954,8 +954,15 @@ pub fn run() {
                 let stream = app
                     .try_state::<relay::MediaStream>()
                     .map(|stream| stream.base().to_owned());
+                // Packaged builds keep `devUrl` in their config but never load it.
+                let dev = app
+                    .config()
+                    .build
+                    .dev_url
+                    .clone()
+                    .filter(|_| tauri::is_dev());
                 if let Err(error) = main.with_webview(move |webview| {
-                    media_context_menu::install(&webview, handle, directory, stream)
+                    media_context_menu::install(&webview, handle, directory, stream, dev)
                 }) {
                     eprintln!("Could not prepare the media menu: {error}");
                 }
