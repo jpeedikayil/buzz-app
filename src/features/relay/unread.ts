@@ -1962,7 +1962,8 @@ export function createUnread({
   // DELETION_PAGES pages, so the halves add at most 400 requests. A read
   // needing more is dropped there, its queued requests unread, and the next
   // pass resumes it (see `byIdReads`).
-  const DELTA_LOOKBACK = 900 + 960 + 5;
+  const FUTURE_TOLERANCE = 900;
+  const DELTA_LOOKBACK = FUTURE_TOLERANCE + 960 + 5;
   const DELTA_PAGE = 500;
   const DELTA_PAGES = 6;
   const DELETION_PAGES = 2;
@@ -2175,11 +2176,17 @@ export function createUnread({
   const route = (catchUp: boolean): "delta" | "bootstrap" =>
     catchUp && complete && mark && recent(mark) ? "delta" : "bootstrap";
   /** A read of every chunk of the roster to its end confirms the mark now,
-   * raised to the newest time it returned. Live events never move it: a
-   * dropped frame could leave them behind the delta's lookback. */
+   * raised to the newest time it returned, but no further than
+   * FUTURE_TOLERANCE past now: an event dated beyond what the relay accepts
+   * would start the next delta after the present. Live events never move
+   * it: a dropped frame could leave them behind the delta's lookback. */
   function confirm(newest: number | undefined) {
-    const at = Math.max(mark?.at ?? -1, newest ?? -1);
-    if (at >= 0) mark = { at, checked: Math.floor(now() / 1000) };
+    const seconds = Math.floor(now() / 1000);
+    const at = Math.min(
+      Math.max(mark?.at ?? -1, newest ?? -1),
+      seconds + FUTURE_TOLERANCE,
+    );
+    if (at >= 0) mark = { at, checked: seconds };
   }
   /** One filter of `kinds` per SAMPLE_CHANNELS of `ids`, since `since`. */
   const sinceReads = (

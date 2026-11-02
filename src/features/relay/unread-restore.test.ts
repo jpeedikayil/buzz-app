@@ -1964,11 +1964,45 @@ it("an event dated 900 s ahead raises the mark, and the next delta still reads a
   expect(h.owner.event(late.id)).toBeDefined();
 });
 
+it.each([
+  ["a delta", true],
+  ["a fresh device's roster sample", false],
+] as const)(
+  "an event dated further ahead than the relay accepts raises the mark %s confirms only to 900 s past the device clock, saved so, and the next delta still reads a send the relay committed late before it",
+  async (_, warm) => {
+    const storage = warm
+      ? await marked({ at: SECONDS - 600, checked: SECONDS - 60 })
+      : memoryUnreadStorage();
+    // Dated past the relay's 900 s tolerance, which a relay that enforces it
+    // never returns.
+    const store = [hashed("team", SECONDS + 100_000)];
+    const h = await launch({
+      store,
+      storage,
+      fail: (filters) => warm && sampleRead(filters),
+    });
+    await h.owner.capability.ensure();
+    await h.saved;
+    expect((await storage.read())?.mark).toEqual({
+      at: SECONDS + 900,
+      checked: SECONDS,
+    });
+    const late = hashed("quiet", SECONDS - 965);
+    store.push(late);
+    await h.reconnected();
+    expect(deltas(h).at(-1)).toEqual(
+      expect.objectContaining({ since: SECONDS - 965 }),
+    );
+    expect(h.owner.event(late.id)).toBeDefined();
+  },
+);
+
 it("a delta that reads nothing newer keeps the mark's time and confirms it now", async () => {
   const at = SECONDS - 600;
   const storage = await marked({ at, checked: SECONDS - 3600 });
+  // Only older than the mark: the event it was raised to was deleted since.
   const h = await launch({
-    store: [hashed("team", at)],
+    store: [hashed("team", at - 100)],
     storage,
     fail: sampleRead,
   });

@@ -90,37 +90,23 @@ timeline and the thread being read, without reading unopened threads' replies.
   the viewer's conversations (see [Relevant replies](#relevant-replies)). It is **not an exact total or lower
   bound**: missing markers/deletions can overcount; missing history can undercount.
 - `coverage` and `freshness` describe message evidence, separately from `sync()`.
-  Evidence is capped at 4,096 events / 8 MiB. Repair queries the membership roster
-  in sequential batches of at most 128 explicit channel IDs (the relay limit, in ID
-  order, so a rename does not move them),
-  with up to 500 recent rows **per batch**, not a shared remainder or one head
-  request per sidebar row. A 278-channel roster therefore makes three reads.
-  Earlier results publish progressively and survive a later transport failure;
-  capacity overflow retains the existing visible error/clear policy and stops repair.
-  A batch whose last read returned fewer rows than its limit (500), and at least one,
-  is read again only from sixteen minutes (960 s) before the newest of them: that read
-  saw everything in its window, and the relay accepts a `created_at` up to 900 s from
-  its own clock, so an event stored just after it can be backdated that far, and the
-  margin covers it, together with client clock skew and the relay's replica read budget.
-  "Fewer than its limit" means nothing was cut off because the relay applies the limit
-  to the rows it returns and does not filter repair kinds (9, 40002, 40008) out after
-  it. The mark never passes the present, so a skewed clock or a
-  future-dated event cannot hide history. A read that returned its full limit may have
-  cut off older rows (a later deletion frees a slot for one), so it installs no mark
-  and drops any existing one: the next repair of that batch reads in full, as it did
-  before. Retained evidence only grows between resets, so a bounded read adds what is
-  newer to what the earlier reads already returned. Cache clears, access changes,
-  capacity overflow and an explicit `refresh()` forget the marks and read every batch
-  in full. A repair still waiting for its answer when they do, or still accepting it
-  (a subscriber notified of the answer may refresh), installs no mark, and
-  after an overflow it also leaves the error and its refresh offer in place; `refresh()`
-  waits for it, then reads in full. An empty read installs no mark: a batch that has
-  never returned a row is read in full, and an existing mark stays, since its window
-  held nothing newer. Edits and deletions
-  of messages older than the window arrive through live traffic, as they do for the
-  unbounded read.
-  Querying every ID does not mean observing every channel: busy channels can still
-  consume their batch's sample, and missing thread roots can affect inherited markers.
+  Evidence is capped at 4,096 events / 8 MiB; once it is full, the busiest
+  channel's oldest ordinary evidence goes first, and a channel left with none is
+  unknown rather than zero. A full repair reads each joined channel's recent
+  window on its own, the newest events of up to 128 channels at a time, and the
+  threads the viewer took part in; earlier results publish progressively and
+  survive a later transport failure. The device keeps what the next repair would
+  read and how far it last read the whole roster. While that record is complete
+  and was confirmed within the last day, a launch, reconnect, periodic check or
+  access change catches up instead, reading only what the joined channels gained
+  since that point, from far enough before it that a late commit is still read
+  and never from after the present, however far ahead an event is dated. A
+  device's first launch, a lost or incomplete record or one not confirmed within
+  the day, a catch-up with more new events than it takes, and an explicit
+  `refresh()` run the full repair. See
+  [Inbox: ownership and limits](inbox.md#ownership-and-limits) for what each
+  reads and when the point moves. Missing thread roots can affect inherited
+  markers.
   Repair evidence does not seed channel windows, alter cursors, or mark messages read.
 - Initial marker/evidence observation and explicit evidence refresh are foreground
   reads so optional profiles do not block them. Reconnect/periodic sync and marker

@@ -192,7 +192,9 @@ check, each of which reads it again beside the catch-up, the walk stays where
 it was, so a channel that list then adds is walked from there; the walk
 therefore mostly moves on at launch and in a full repair.
 The point moves once that read reaches its end in every channel, to the
-newest event it returned. A repair runs in full instead
+newest event it returned. Wherever it moves, it goes no further ahead of this
+device's clock than the relay accepts a message's date, so one dated beyond
+that cannot make later checks start after the present. A repair runs in full instead
 on a device's first launch, after its storage was lost, on a launch from a
 record over its bounds, when the record is incomplete (as after a walk that
 stopped short) or was not caught up within the day, when restored events fail
