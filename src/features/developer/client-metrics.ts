@@ -42,6 +42,17 @@ type QueryRecord = Readonly<{
   ok: boolean;
   phase: number;
 }>;
+/** One unread repair pass: the reads it took, a catch-up from the saved
+ * mark or the full repair, and the evidence its save selected, with whether
+ * that fit the saved record's bounds. */
+type UnreadPass = Readonly<{
+  route: "delta" | "bootstrap";
+  fits: boolean;
+  events: number;
+  bytes: number;
+  at: number;
+  phase: number;
+}>;
 type LongTask = Readonly<{
   start: number;
   duration: number;
@@ -59,6 +70,7 @@ type LiveState = Readonly<{
 const OPEN_LIMIT = 500;
 const QUERY_LIMIT = 4000;
 const TASK_LIMIT = 2000;
+const UNREAD_PASS_LIMIT = 1000;
 const LAG_SAMPLE_MS = 50;
 const PAINT_FRAMES = 30;
 
@@ -111,6 +123,7 @@ export function createClientMetrics({
 } = {}) {
   const opens: ChannelOpen[] = [];
   const queries: QueryRecord[] = [];
+  const unreadPasses: UnreadPass[] = [];
   const longTasks: LongTask[] = [];
   const phases: LivePhase[] = [
     {
@@ -352,6 +365,14 @@ export function createClientMetrics({
         );
       },
     ),
+    /** An unread repair pass saved its record. One call per pass. */
+    unreadPass: active((input: Omit<UnreadPass, "at" | "phase">) => {
+      push(
+        unreadPasses,
+        Object.freeze({ ...input, at: now(), phase: phase() }),
+        UNREAD_PASS_LIMIT,
+      );
+    }),
     /** Synchronous main-thread work measured by its caller, per batch. */
     cpu: active((stage: string, ms: number, count: number) => {
       const entry = cpu.get(stage) ?? { ms: 0, count: 0 };
@@ -432,12 +453,14 @@ export function createClientMetrics({
         summary: summary(),
         opens: [...opens],
         queries: [...queries],
+        unreadPasses: [...unreadPasses],
         longTasks: [...longTasks],
       };
     },
     reset() {
       opens.length = 0;
       queries.length = 0;
+      unreadPasses.length = 0;
       longTasks.length = 0;
       cpu.clear();
       skipped = 0;

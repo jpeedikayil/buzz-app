@@ -53,7 +53,10 @@ export type UnreadStorage = Readonly<{
   close(): void;
 }>;
 
-/** What one launch re-verifies, and half the in-memory evidence budget. */
+/** What one launch re-verifies, and half the in-memory evidence budget. The
+ * owner saves a selection beyond either bound as no events and incomplete,
+ * so a launch from it repairs in full; the session that selected it keeps
+ * catching up (see `persist` in unread.ts). */
 export const UNREAD_RECORD_EVENTS = 2048;
 export const UNREAD_RECORD_BYTES = 4 * 1024 * 1024;
 /** Far beyond any roster seen. */

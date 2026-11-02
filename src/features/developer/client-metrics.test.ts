@@ -392,12 +392,32 @@ it("records event-loop lag as long tasks and sums CPU per stage", () => {
   expect(mainThread.cpu["verify.read"]).toEqual({ ms: 15, count: 30 });
 });
 
+it("keeps the newest 1,000 unread passes in the export until reset", () => {
+  const h = setup();
+  const pass = (events: number) =>
+    ({ route: "delta", fits: true, events, bytes: 2 }) as const;
+  h.metrics.unreadPass({ ...pass(0), route: "bootstrap", fits: false });
+  h.advance(5);
+  for (let i = 1; i <= 1000; i++) h.metrics.unreadPass(pass(i));
+  const { unreadPasses } = h.metrics.export();
+  expect(unreadPasses).toHaveLength(1000);
+  expect(unreadPasses[0]).toEqual({ ...pass(1), at: 5, phase: 0 });
+  expect(unreadPasses.at(-1)).toEqual({ ...pass(1000), at: 5, phase: 0 });
+  h.metrics.reset();
+  expect(h.metrics.export().unreadPasses).toEqual([]);
+});
+
 it("records nothing when disabled, and unit tests get the disabled singleton", () => {
   const h = setup({ enabled: false });
   h.metrics.channelMounted("alpha");
   h.metrics.channelRendered("alpha");
   h.metrics.query("a", { ms: 1, bytes: 1, priority: "foreground", ok: true });
+  h.metrics.unreadPass({ route: "delta", fits: true, events: 1, bytes: 2 });
   h.paint();
-  expect(h.metrics.export()).toMatchObject({ opens: [], queries: [] });
+  expect(h.metrics.export()).toMatchObject({
+    opens: [],
+    queries: [],
+    unreadPasses: [],
+  });
   expect(clientMetrics.enabled).toBe(false);
 });

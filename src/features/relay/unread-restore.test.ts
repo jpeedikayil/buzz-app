@@ -1,5 +1,6 @@
 import { getEventHash, verifiedSymbol } from "nostr-tools";
 import { afterEach, assert, expect, it, vi } from "vitest";
+import { byteSize } from "./budget";
 import type { ChannelQueries, ChannelSummary } from "./contracts";
 import type { ReadFilter, RelayEvent } from "./events";
 import type { InboxItem } from "./inbox";
@@ -15,16 +16,22 @@ import { createUnread } from "./unread";
 import {
   memoryUnreadStorage,
   UNREAD_RECORD_BYTES,
+  UNREAD_RECORD_EVENTS,
   UnreadRecordPurged,
   type UnreadStorage,
 } from "./unread-storage";
 
-// Unit tests get a no-op recorder; this one records restore verification.
+// Unit tests get a no-op recorder; this one records restore verification
+// and each repair pass.
 const cpu = vi.hoisted(() => vi.fn());
+const unreadPass = vi.hoisted(() => vi.fn());
 vi.mock("../developer/client-metrics", async (importOriginal) => {
   const actual =
     await importOriginal<typeof import("../developer/client-metrics")>();
-  return { ...actual, clientMetrics: { ...actual.clientMetrics, cpu } };
+  return {
+    ...actual,
+    clientMetrics: { ...actual.clientMetrics, cpu, unreadPass },
+  };
 });
 // Restore yields between its batches; a test may hold it there.
 const restoreHold = vi.hoisted(() => ({
@@ -3421,6 +3428,98 @@ it("a warm Refresh reads the threads read through to the mark in one read of the
   expect((await storage.read())?.through?.size).toBe(60);
 });
 
+it.each(["events", "bytes"] as const)(
+  "a selection over the record's bound on %s is saved as no events and incomplete, while the session keeps what it selected: the next tick reads one delta and no window, a Refresh reads the threads read through past the mark in one read, and only a launch from that record reads the full repair",
+  async (bound) => {
+    unreadPass.mockClear();
+    const roots = Array.from({ length: 60 }, (_, i) =>
+      post(peerKey, "team", T + i),
+    );
+    // Unread, so their windows return them all: 80 in each of 20 channels,
+    // or 5 in one, each a quarter of the byte bound.
+    const filled =
+      bound === "events"
+        ? Array.from({ length: 20 }, (_, i) => `f${i}`)
+        : ["quiet"];
+    const filler =
+      bound === "events"
+        ? filled.flatMap((id) =>
+            Array.from({ length: 80 }, (_, i) => hashed(id, T + 1000 + i)),
+          )
+        : Array.from({ length: 5 }, (_, i) =>
+            post(
+              peerKey,
+              "quiet",
+              T + 1000 + i,
+              [],
+              "x".repeat(UNREAD_RECORD_BYTES / 4),
+            ),
+          );
+    // 499 of the busy traffic, so a catch-up's one page is short.
+    const store = [
+      ...roots,
+      ...roots.map((root, i) => reply(viewerKey, "team", root, T + 100 + i)),
+      ...filler,
+      ...busy.slice(1),
+    ];
+    const roster = summaries(["team", ...filled, "busy"]);
+    const storage = memoryUnreadStorage();
+    const save = vi.spyOn(storage, "save");
+    const h = await launch({ store, storage, roster, frontiers: BUSY_READ });
+    await h.owner.capability.ensure();
+    await save.mock.results.at(-1)?.value;
+    const record = await storage.read();
+    expect(record).toMatchObject({ events: [], complete: false });
+    expect(record?.whole).toBeUndefined();
+    expect(record?.through).toBeUndefined();
+    const mark = record?.mark?.at ?? 0;
+    expect(await sentDuring(h, () => h.reconnected())).toEqual([
+      expect.objectContaining({ kinds: DELTA_KINDS }),
+    ]);
+    const refreshed = await sentDuring(h, () => h.owner.capability.refresh());
+    expect(threadReads(refreshed)).toEqual([
+      {
+        kinds: CONTENT,
+        "#h": ["team"],
+        "#e": expect.arrayContaining(roots.map((root) => root.id)),
+        since: mark - 1865,
+        include_aux: true,
+        limit: 500,
+      },
+    ]);
+    expect(threadReads(refreshed)[0]?.["#e"]).toHaveLength(60);
+    expect(refreshed.filter(windowOf("team"))).toHaveLength(1);
+    // Each pass reports its reads and a selection over the bound.
+    expect(
+      unreadPass.mock.calls.map(([{ route, fits, events, bytes }]) => [
+        route,
+        fits,
+        bound === "events"
+          ? events > UNREAD_RECORD_EVENTS
+          : bytes > UNREAD_RECORD_BYTES,
+      ]),
+    ).toEqual([
+      ["bootstrap", false, true],
+      ["delta", false, true],
+      ["bootstrap", false, true],
+    ]);
+    await save.mock.results.at(-1)?.value;
+    expect(await storage.read()).toMatchObject({ events: [], complete: false });
+    h.owner.dispose();
+    const relaunched = await launch({
+      store,
+      storage,
+      roster,
+      frontiers: BUSY_READ,
+    });
+    const next = await sentDuring(relaunched, () =>
+      relaunched.owner.capability.ensure(),
+    );
+    expect(next.filter(deltaFilter)).toEqual([]);
+    expect(next.filter(windowOf("team"))).toHaveLength(1);
+  },
+);
+
 it("a full read past the mark is read again in halves of its roots, each naming its own channels, and not paged", async () => {
   const a = post(peerKey, "team", T);
   const b = post(peerKey, "quiet", T + 1);
@@ -4070,6 +4169,40 @@ it("a root that full repair's fetch finds deleted is saved as absent, so the rec
   expect(warm.owner.capability.inbox().items).toContainEqual(row);
 });
 
+it("a root that full repair's fetch returns with no channel, which groups nothing, is saved as absent, so the record saves complete and the next launch reads one delta", async () => {
+  const { roster, frontiers, cold, store } = ownColdThreads();
+  const n = cold.find(({ channelId }) => channelId === "n");
+  assert(n);
+  const root = signed(peerKey, {
+    kind: 9,
+    content: "no channel",
+    created_at: T + 100,
+    tags: [],
+  });
+  const mine = reply(viewerKey, "n", root, T + 200);
+  const untagged = [
+    ...store.filter((event) => event !== n.root && event !== n.mine),
+    root,
+    mine,
+  ];
+  const storage = memoryUnreadStorage();
+  const fresh = await launch({ store: untagged, storage, roster, frontiers });
+  const launched = await sentDuring(fresh, () =>
+    fresh.owner.capability.ensure(),
+  );
+  expect(fetchesOf(launched, [root.id])).toHaveLength(1);
+  await fresh.saved;
+  const record = await storage.read();
+  expect(record?.complete).toBe(true);
+  expect(record?.absent).toEqual(new Set([root.id]));
+  expect(await saved(storage)).toContain(mine.id);
+  fresh.owner.dispose();
+  const warm = await launch({ store: untagged, storage, roster, frontiers });
+  expect(await sentDuring(warm, () => warm.owner.capability.ensure())).toEqual([
+    expect.objectContaining({ kinds: DELTA_KINDS }),
+  ]);
+});
+
 it.each([
   ["launch", false],
   ["tick", true],
@@ -4259,4 +4392,29 @@ it("a repair in which nothing lands fails without fetching the roots of the reme
       rootIds,
     ),
   ).toEqual([]);
+});
+
+it("each pass reports whether it read the full repair or caught up, the events and bytes its save selected, and whether they fit the record", async () => {
+  unreadPass.mockClear();
+  const storage = memoryUnreadStorage();
+  const save = vi.spyOn(storage, "save");
+  const store = [post(peerKey, "team", T), ...busy.slice(1)];
+  const h = await launch({ store, storage, frontiers: BUSY_READ });
+  await h.owner.capability.ensure();
+  await save.mock.results.at(-1)?.value;
+  const events = (await storage.read())?.events ?? [];
+  expect(events).toHaveLength(store.length);
+  const selection = {
+    fits: true,
+    events: events.length,
+    bytes: byteSize(events),
+  };
+  expect(unreadPass.mock.calls).toEqual([
+    [{ route: "bootstrap", ...selection }],
+  ]);
+  await h.reconnected();
+  expect(unreadPass.mock.calls).toEqual([
+    [{ route: "bootstrap", ...selection }],
+    [{ route: "delta", ...selection }],
+  ]);
 });

@@ -398,8 +398,9 @@ export function createUnread({
   // storage once, then what the last repair saved.
   let persisted: ThreadParticipation | undefined;
   // The record's mark and whether it is complete (see unread-storage.ts):
-  // read with it, then what this session confirmed and last saved. Together
-  // they choose a pass's reads (see `route`).
+  // read with it, then what this session confirmed and last selected, saved
+  // or too large to save (see `persist`). Together they choose a pass's reads
+  // (see `route`).
   let mark: UnreadMark | undefined;
   let complete = false;
   // The channels the mark covers and the remembered threads read whole (see
@@ -1614,13 +1615,14 @@ export function createUnread({
    * window or the roster sample returns it, so a repair counts the same
    * whether the root came from a lookup, a thread read or storage. The
    * viewer's own root witnesses their membership of its thread, as it does
-   * for a lookup that fetched it. */
+   * for a lookup that fetched it. Returns whether it was kept: one with no
+   * channel, or the viewer's own deleted message, groups nothing. */
   function keepRoot(event: RelayEvent) {
     const channelId = channelOf(event);
     if (!channelId || (event.pubkey === viewer && retracted.has(event.id)))
-      return;
+      return false;
     keep(event);
-    if (event.pubkey !== viewer) return;
+    if (event.pubkey !== viewer) return true;
     const key = conversationKey(channelId, event.id);
     const found = lookups.get(key);
     const lookup: Lookup = found?.done
@@ -1628,6 +1630,7 @@ export function createUnread({
       : { channelId, done: true, evidence: undefined, more: false };
     remember(key, lookup);
     witness(lookup, event);
+    return true;
   }
   /** IDs a landed fetch asked for and did not return are absent; one it
    * returned is not. */
@@ -2735,16 +2738,16 @@ export function createUnread({
    * repair passes it); every row the projection counts unread or cannot
    * decide yet; and what kept rows depend on: their roots and parents, the
    * viewer's messages in their threads, and the edits (each editor's
-   * newest, the one held: see `editKeys`) and deletions of them. Beyond the
-   * record's bounds nothing is kept; that, a selected event retention
-   * dropped, a remembered thread's reply kept without its root (unless the
-   * relay returned nothing for it: `absent`, saved with the record), a
-   * roster sample owed since a leave, a walk owed (see `unwalked`), or a
-   * thread owed since its evidence was forgotten (see `forgotten`), leaves
-   * the record incomplete. Of the threads read whole, those still hot,
-   * followed and in a channel the mark covers stay so; of those read
-   * through, those still remembered and in a channel the mark covers, none
-   * of whose selected content was dropped. */
+   * newest, the one held: see `editKeys`) and deletions of them. A selected
+   * event retention dropped, a remembered thread's reply kept without its
+   * root (unless the relay returned nothing for it: `absent`, saved with the
+   * record), a roster sample owed since a leave, a walk owed (see
+   * `unwalked`), or a thread owed since its evidence was forgotten (see
+   * `forgotten`), leaves the selection incomplete; `fits` says whether it is
+   * within the record's bounds (see `persist`). Of the threads read whole,
+   * those still hot, followed and in a channel the mark covers stay so; of
+   * those read through, those still remembered and in a channel the mark
+   * covers, none of whose selected content was dropped. */
   function retention(participation: ThreadParticipation) {
     indexEvidence();
     const ids = rosterIds();
@@ -2907,9 +2910,7 @@ export function createUnread({
       forgotten ||
       retained.length < kept.size;
     retained.push(...waiting.filter(awaitingAccess));
-    const fits =
-      retained.length <= UNREAD_RECORD_EVENTS &&
-      listByteSize(retained) <= UNREAD_RECORD_BYTES;
+    const bytes = listByteSize(retained);
     // Held only by the lookup cache, or restored from it and waiting.
     const structure = new Set(
       retained.flatMap(({ id }) =>
@@ -2920,23 +2921,17 @@ export function createUnread({
           : [],
       ),
     );
-    return fits
-      ? {
-          events: retained,
-          structure,
-          complete: !lost,
-          whole: stillWhole,
-          through: stillThrough,
-          absent: gone,
-        }
-      : {
-          events: [],
-          structure: new Set<string>(),
-          complete: false,
-          whole: new Set<string>(),
-          through: new Set<string>(),
-          absent: new Set<string>(),
-        };
+    return {
+      events: retained,
+      structure,
+      complete: !lost,
+      whole: stillWhole,
+      through: stillThrough,
+      absent: gone,
+      fits:
+        retained.length <= UNREAD_RECORD_EVENTS && bytes <= UNREAD_RECORD_BYTES,
+      bytes,
+    };
   }
   // The record the saves issued leave once they land, so a save writes only
   // a change: one that fails clears it unless a later save was issued since,
@@ -2958,7 +2953,13 @@ export function createUnread({
   /** The one way the record is saved: the threads with the evidence kept
    * for them (see `retention`), so a save carrying new threads never drops
    * saved evidence. While restored evidence is still being verified the
-   * save waits for it, rather than replace it with what is held so far. */
+   * save waits for it, rather than replace it with what is held so far. A
+   * selection beyond the record's bounds is saved with no events and
+   * incomplete, so a launch from it reads the full repair; this session
+   * still holds what it selected, so its `complete`, `whole` and `through`
+   * stand in memory and the next catch-up reads the delta. Returns the
+   * selection's size and whether it fit, or nothing while fenced or waiting
+   * for restore. */
   function persist(participation: ThreadParticipation) {
     if (fenced) return;
     if (restoring) {
@@ -2973,15 +2974,25 @@ export function createUnread({
       owed = participation;
       return;
     }
+    const { fits, bytes, ...selection } = retention(participation);
+    complete = selection.complete;
+    whole = new Set(selection.whole);
+    through = new Set(selection.through);
     const record = {
       participation,
-      ...retention(participation),
+      ...(fits
+        ? selection
+        : {
+            events: [],
+            structure: new Set<string>(),
+            complete: false,
+            whole: new Set<string>(),
+            through: new Set<string>(),
+            absent: new Set<string>(),
+          }),
       roster: new Set(covered),
       ...(mark ? { mark } : {}),
     };
-    complete = record.complete;
-    whole = new Set(record.whole);
-    through = new Set(record.through);
     const key = JSON.stringify([
       [...participation.roots],
       participation.walk?.since,
@@ -2995,6 +3006,7 @@ export function createUnread({
       [...record.absent].sort(),
     ]);
     if (key !== issuedKey) save(record, key);
+    return { fits, events: selection.events.length, bytes };
   }
   async function rememberedRoots(): Promise<ThreadParticipation> {
     if (!persisted) {
@@ -3667,7 +3679,9 @@ export function createUnread({
               readWhole.add(key);
           }
         // A root fetched by ID is structure (see `keepRoot`), kept before the
-        // replies are accepted so they group under it at once.
+        // replies are accepted so they group under it at once. One it cannot
+        // keep is as good as absent, so its replies do not leave every save
+        // incomplete (see `retention`).
         const fetchedRoots = new Set(
           kept.filter(
             (event) =>
@@ -3676,7 +3690,11 @@ export function createUnread({
               !events.has(event.id),
           ),
         );
-        for (const event of fetchedRoots) keepRoot(event);
+        const unkept = [...fetchedRoots].filter((event) => !keepRoot(event));
+        noteAbsent(
+          unkept.map(({ id }) => id),
+          [],
+        );
         // A root an admitted reply names that nothing holds is fetched, so
         // the reply groups under it rather than standing as its own row.
         const missing = [
@@ -3746,7 +3764,7 @@ export function createUnread({
             ? { since: newestWalked }
             : stored.walk;
         persisted = { roots: nextRoots, ...(walk ? { walk } : {}) };
-        persist(persisted);
+        return persist(persisted);
       },
     };
   }
@@ -4253,7 +4271,14 @@ export function createUnread({
         if (!(await settleDeletions(ids, generation, priority))) return;
         unwalked = (bootstrapped || walking) && !pass.walk.ended();
         pass.learn();
-        pass.save();
+        // One metric a pass: its reads, and whether the record it saved fit,
+        // since one that did not has every launch read the full repair.
+        const selection = pass.save();
+        if (selection)
+          clientMetrics.unreadPass({
+            route: bootstrapped ? "bootstrap" : "delta",
+            ...selection,
+          });
         // A lookup that landed between the last drain and the pool's release
         // queued its read for a pool that had finished; it is the follow-up's.
         if (requests.length) void followUp(run);
