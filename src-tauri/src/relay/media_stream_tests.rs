@@ -242,8 +242,9 @@ async fn full_head_suffix_and_open_ended_responses_have_exact_boundaries() {
     spool_files_deleted().await;
 }
 
-/// Serves the first block by `Range`, then fails every later request.
-fn failing_media_server(blob: Vec<u8>) -> Url {
+/// Serves the first block of `blob` by `Range`, as part of a blob of `total`
+/// bytes, then fails every later request.
+fn failing_media_server(blob: Vec<u8>, total: u64) -> Url {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
     std::thread::spawn(move || {
@@ -258,9 +259,8 @@ fn failing_media_server(blob: Vec<u8>) -> Url {
             let response = if index == 0 {
                 let body = &blob[..BLOCK as usize];
                 let range = format!(
-                    "Content-Range: bytes 0-{}/{}\r\nContent-Length: {}\r\n",
+                    "Content-Range: bytes 0-{}/{total}\r\nContent-Length: {}\r\n",
                     BLOCK - 1,
-                    blob.len(),
                     body.len()
                 );
                 media_response("206 Partial Content", &range, body)
@@ -280,7 +280,7 @@ async fn a_failure_mid_stream_ends_the_response_short_of_its_length() {
     let blob = media_blob(total);
     let stream = stream();
     // A range origin failing after the first block.
-    let url = failing_media_server(blob.clone())
+    let url = failing_media_server(blob.clone(), total)
         .join(&format!("/media/{}.mp4", "4".repeat(64)))
         .unwrap();
     let reply = get(&stream, &url, "").await;
@@ -333,6 +333,30 @@ async fn a_failure_mid_stream_ends_the_response_short_of_its_length() {
     assert!(reply.body.len() < total as usize);
     assert_eq!(reply.body, &blob[..reply.body.len()]);
     spool_files_deleted().await;
+}
+
+/// A relay serving a blob by `Range` may declare any total behind one valid
+/// block. The listener sends that total as a whole response's
+/// `Content-Length`, which only the media menu's limit keeps off the disk.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn menu_downloads_refuse_an_oversized_declared_total() {
+    let stream = stream();
+    let blob = media_blob(BLOCK);
+    for (total, saves) in [(3 * BLOCK, true), (1 << 40, false)] {
+        let url = failing_media_server(blob.clone(), total)
+            .join(&format!("/media/{}.mp4", "b".repeat(64)))
+            .unwrap();
+        let reply = get(&stream, &url, "").await;
+        assert_eq!(reply.status, 200);
+        assert_eq!(length(&reply) as u64, total);
+        assert_eq!(reply.body, blob);
+        assert_eq!(
+            crate::media_context_menu::fits(length(&reply) as i64),
+            saves,
+            "{total}"
+        );
+    }
 }
 
 /// Sends a request and keeps the connection, reading at most `read` bytes of

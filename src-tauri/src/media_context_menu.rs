@@ -7,12 +7,13 @@
 //!   cancels it. For relay media, Buzz attaches a `WKDownloadDelegate` that
 //!   saves to Downloads under the media's `<hash>.<ext>` name, not the
 //!   attachment name the player's Download uses; WebKit streams the file
-//!   and quarantines it. The partial file of a download that fails, or is
-//!   still running when Buzz quits, is removed. Each result is sent to the
-//!   main window as `media-menu-download`: the saved file's name, or null if
-//!   it failed. A `just desktop` build with a pinned viewer plays media from
-//!   its dev server's relay broker instead, whose media URLs on that origin
-//!   are named the same way.
+//!   and quarantines it. A response of unknown length, or longer than the
+//!   largest video Buzz uploads, is refused. The partial file of a download
+//!   that fails, or is still running when Buzz quits, is removed. Each
+//!   result is sent to the main window as `media-menu-download`: the saved
+//!   file's name, or null if it failed. A `just desktop` build with a pinned
+//!   viewer plays media from its dev server's relay broker instead, whose
+//!   media URLs on that origin are named the same way.
 //! - `<video>` and `<audio>` play from the tokened loopback listener
 //!   (`relay::media_stream`). Copy … Address, Open … in New Window and
 //!   Share… would hand that URL, token included, to the clipboard, a window
@@ -63,6 +64,11 @@ const MEDIA_ITEMS: [&str; 4] = [
     DOWNLOAD_MEDIA,
     "WKMenuItemIdentifierShowHideMediaControls",
 ];
+/// The largest menu download: the largest video Buzz uploads or spools
+/// whole. A relay serving a blob by `Range` declares its total length, which
+/// the loopback listener sends as `Content-Length` and streams to, so only
+/// this bounds what lands on disk.
+const MAX_DOWNLOAD: u64 = crate::relay::WHOLE_VIDEO_MAX;
 
 type DidCreateDownload =
     unsafe extern "C-unwind" fn(&AnyObject, Sel, Option<&WKWebView>, Option<&WKDownload>);
@@ -116,10 +122,13 @@ define_class!(
             completion_handler: &Block<dyn Fn(*mut NSURL)>,
         ) {
             let downloads = self.ivars();
-            // An error's body is not the media. No destination cancels it.
+            // An error's body is not the media, and a length unknown or over
+            // `MAX_DOWNLOAD` could fill the disk. No destination cancels it.
             let path = response
                 .downcast_ref::<NSHTTPURLResponse>()
-                .filter(|response| response.statusCode() == 200)
+                .filter(|response| {
+                    response.statusCode() == 200 && fits(response.expectedContentLength())
+                })
                 .and_then(|_| self.name(download))
                 .and_then(|name| {
                     free_path(&downloads.directory, &name, &downloads.pending.borrow())
@@ -194,6 +203,15 @@ impl DownloadDelegate {
             .app
             .emit_to("main", "media-menu-download", name);
     }
+}
+
+/// Whether a download whose response declared `expected` bytes, or -1
+/// (`NSURLResponseUnknownLength`) for none, may be saved. WebKit reads no
+/// more than a declared `Content-Length`, and no source Buzz names sends a
+/// `Content-Encoding`, so the file cannot outgrow it; nothing is checked as
+/// bytes arrive.
+pub(crate) fn fits(expected: i64) -> bool {
+    u64::try_from(expected).is_ok_and(|length| length <= MAX_DOWNLOAD)
 }
 
 /// The destination WebKit accepted for `download`, if any.
@@ -649,6 +667,21 @@ mod tests {
             format!("{community}/media?url={}", encode("file:///etc/passwd")),
         ] {
             assert_eq!(media_name(&source, None, Some(&dev)), None, "{source}");
+        }
+    }
+
+    #[test]
+    fn menu_downloads_need_a_known_length_within_the_limit() {
+        let limit = i64::try_from(MAX_DOWNLOAD).unwrap();
+        for (expected, saves) in [
+            (0, true),
+            (limit, true),
+            // `NSURLResponseUnknownLength`: no `Content-Length`.
+            (-1, false),
+            (limit + 1, false),
+            (i64::MAX, false),
+        ] {
+            assert_eq!(fits(expected), saves, "{expected}");
         }
     }
 

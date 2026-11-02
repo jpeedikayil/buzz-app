@@ -1537,8 +1537,9 @@ const FILE_DOWNLOAD_MAX: usize = 10 * 1024 * 1024;
 /// development broker's video limit. A video of exactly this size plays; a
 /// larger `Content-Length` gets 413 before any download, and a response
 /// without one is stopped and rejected with 413 once it passes this size.
-/// Edit this value to change the limit; it is compiled into the binary.
-const WHOLE_VIDEO_MAX: u64 = 500 * 1024 * 1024;
+/// On macOS it also bounds a download from the native media menu. Edit this
+/// value to change the limit; it is compiled into the binary.
+pub(crate) const WHOLE_VIDEO_MAX: u64 = 500 * 1024 * 1024;
 /// Open-ended ranges are shortened so playback starts after one small chunk;
 /// the media element requests the next range itself.
 const MEDIA_CHUNK: u64 = 4 * 1024 * 1024;
