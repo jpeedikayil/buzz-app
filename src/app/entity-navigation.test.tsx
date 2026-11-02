@@ -718,6 +718,7 @@ it("keeps a failed message read in place until its own Retry succeeds", async ()
     bounds(author, "alpha", "head", { has_more: false, next_cursor: null }),
   ];
   // Two failed history reads within one live connection, then recovery.
+  // Only the timeline's page fails: Inbox unread reads share its kinds.
   let failures = 2;
   vi.stubGlobal(
     "fetch",
@@ -728,7 +729,7 @@ it("keeps a failed message read in place until its own Retry succeeds", async ()
       if (url.endsWith("/query")) {
         const filters = JSON.parse(String(options?.body)) as ReadFilter[];
         if (filters.some((filter) => filter.kinds?.includes(9))) {
-          if (failures > 0) {
+          if (failures > 0 && filters.some((filter) => filter.top_level)) {
             failures--;
             return Response.json({ error: "offline" }, { status: 503 });
           }
