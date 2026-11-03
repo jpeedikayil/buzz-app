@@ -58,7 +58,15 @@ function harness() {
     live.state({ status: "connected", routes: [] });
     live.established();
   };
-  return { owner, wire, update, discover, reconnect, connect };
+  return {
+    owner,
+    wire,
+    update,
+    discover,
+    reconnect,
+    connect,
+    receive: (events: readonly RelayEvent[]) => live.receive(events as never),
+  };
 }
 /** The relay's signed metadata and roster of a channel only `other` is in. */
 const channel = (
@@ -284,6 +292,55 @@ it("reads again a channel found unreadable, holding it pending, and keeps it liv
   expect(pending()).toBe(true);
   // Now public, by newer metadata: known, and live.
   answer(channel(OPEN, "public", 20));
+  await vi.waitFor(() => expect(pending()).toBe(false));
+  await vi.waitFor(() => expect(live()).toContain(OPEN));
+});
+
+it("reads again a channel that newer metadata makes private, at once and then after a growing wait, and hears it once it is public again", async () => {
+  const h = harness();
+  const live = () => h.update.mock.lastCall?.[0] ?? [];
+  const pending = () => h.owner.session.attendPending(OPEN);
+  const lookup = () =>
+    h.wire.pending.find(
+      (entry) => !entry.signal?.aborted && asks(entry.filters, OPEN),
+    );
+  const answer = (events: readonly unknown[]) => {
+    const entry = lookup();
+    if (!entry) throw new Error("No metadata read");
+    h.wire.pending.splice(h.wire.pending.indexOf(entry), 1);
+    entry.respond(events as RelayEvent[]);
+  };
+  h.owner.session.attend([OPEN]);
+  await h.discover();
+  await vi.waitFor(() => expect(lookup()).toBeDefined());
+  answer(channel(OPEN, "public"));
+  await vi.waitFor(() => expect(live()).toContain(OPEN));
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    // Newer metadata makes it private: it leaves the live routes, and its
+    // metadata is read again at once.
+    h.receive(channel(OPEN, "private", 20) as RelayEvent[]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pending()).toBe(true);
+    expect(live()).not.toContain(OPEN);
+    expect(lookup()).toBeDefined();
+    // Still private: read again after 30 s, then after 60 s.
+    answer(channel(OPEN, "private", 20));
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(lookup()).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(lookup()).toBeDefined();
+    answer(channel(OPEN, "private", 20));
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(lookup()).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(lookup()).toBeDefined();
+    // Public again: known, and live.
+    answer(channel(OPEN, "public", 30));
+    await vi.advanceTimersByTimeAsync(0);
+  } finally {
+    vi.useRealTimers();
+  }
   await vi.waitFor(() => expect(pending()).toBe(false));
   await vi.waitFor(() => expect(live()).toContain(OPEN));
 });

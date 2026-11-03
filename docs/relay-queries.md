@@ -328,8 +328,9 @@ in the capacity those leave, and are never joined, listed or counted unread.
 Until the session knows a channel, `session.attendPending(id)` is true, also
 before the channel is attended: a read of it returns none of its events, so
 agent catch-up waits for it. A metadata read that fails, or finds nothing the
-viewer may read (a private channel may turn public), is tried again after 30 s,
-and after a reconnect. A read of
+viewer may read (a private channel may turn public), is tried again after a wait
+that starts at 30 s and doubles up to 5 minutes, and after a reconnect or a new
+`attend`. A channel that newer metadata makes unknown again is read again at once. A read of
 every channel with `resolveChannels` resolves the channels its events name, of
 any kinds, before visibility filtering, as ranked search does for chat kinds;
 before discovery it fails and is tried again, rather than drop what it finds.

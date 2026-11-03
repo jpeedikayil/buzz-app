@@ -1256,36 +1256,47 @@ export function createRelaySession(
   const followRevocations = new Set<() => void>();
   /** Channels each `attend` keeps live for agents' watches, its own list. */
   const attended = new Set<readonly string[]>();
-  /** Attended channels whose metadata was read for them, or is being read. */
+  /** Attended channels read since the last wait ended, in flight or done.
+   * One known again leaves it, so it is read at once if it is unknown again. */
   const attendChecked = new Set<string>();
-  /** How long an attended channel still unknown after a read waits. */
+  /** Attended channels whose metadata read is in flight. */
+  const attendReading = new Set<string>();
+  /** The first wait before an attended channel still unknown is read again,
+   * and the most it grows to while channels stay unknown. */
   const ATTEND_RETRY_MS = 30_000;
+  const ATTEND_RETRY_MAX_MS = 300_000;
+  let attendDelay = ATTEND_RETRY_MS;
   /** One wait for every channel still unknown, so reads do not multiply. */
   let attendRetry: ReturnType<typeof setTimeout> | undefined;
   /** Forgets the reads made, and any wait for them, so channels still
-   * unknown are read again. */
-  const retryAttended = () => {
+   * unknown are read again; a reconnect or new `attend` also starts the wait
+   * over from `ATTEND_RETRY_MS`. */
+  const retryAttended = (restart = true) => {
     if (attendRetry) {
       clearTimeout(attendRetry);
       timers.delete(attendRetry);
       attendRetry = undefined;
     }
     attendChecked.clear();
+    if (restart) attendDelay = ATTEND_RETRY_MS;
   };
   const retryAttendedLater = () => {
     if (closed || attendRetry) return;
+    const delay = attendDelay;
+    attendDelay = Math.min(delay * 2, ATTEND_RETRY_MAX_MS);
     attendRetry = setTimeout(() => {
-      retryAttended();
+      retryAttended(false);
       updateInterests();
-    }, ATTEND_RETRY_MS);
+    }, delay);
     timers.add(attendRetry);
   };
-  /** Reads the metadata of attended channels not known yet. Only into a
-   * ready list: a lookup may extend one, never stand in for initial
-   * discovery. A channel still unknown after its read, because the read
-   * failed or found nothing the viewer may read, is read again after
-   * `ATTEND_RETRY_MS`, or once discovery is after a reconnect: it may have
-   * turned public since. */
+  /** Reads the metadata of attended channels not known. Only into a ready
+   * list: a lookup may extend one, never stand in for initial discovery. A
+   * channel still unknown after its read, because the read failed or found
+   * nothing the viewer may read, is read again after a wait that doubles up
+   * to `ATTEND_RETRY_MAX_MS`, or once discovery is after a reconnect: it may
+   * have turned public since. So is one that becomes unknown again, as when
+   * newer metadata makes it private. */
   const resolveAttended = () => {
     if (
       closed ||
@@ -1294,18 +1305,27 @@ export function createRelaySession(
     )
       return;
     const unknown = [...new Set([...attended].flat())].filter(
-      (id) => !attendChecked.has(id) && !channels.queries.get?.(id),
+      (id) => !channels.queries.get?.(id),
     );
-    for (const id of unknown) attendChecked.add(id);
-    for (let start = 0; start < unknown.length; start += 128) {
-      const batch = unknown.slice(start, start + 128);
+    for (const id of attendChecked)
+      if (channels.queries.get?.(id)) attendChecked.delete(id);
+    if (!unknown.length) attendDelay = ATTEND_RETRY_MS;
+    if (unknown.some((id) => attendChecked.has(id) && !attendReading.has(id)))
+      retryAttendedLater();
+    const fresh = unknown.filter((id) => !attendChecked.has(id));
+    for (const id of fresh) {
+      attendChecked.add(id);
+      attendReading.add(id);
+    }
+    for (let start = 0; start < fresh.length; start += 128) {
+      const batch = fresh.slice(start, start + 128);
       void channels.queries
         .resolve(batch, { signal: lifetime.signal })
-        .then(() => {
-          if (batch.some((id) => !channels.queries.get?.(id)))
-            retryAttendedLater();
-        }, retryAttendedLater)
-        .finally(updateInterests);
+        .catch(() => {})
+        .finally(() => {
+          for (const id of batch) attendReading.delete(id);
+          updateInterests();
+        });
     }
   };
   const liveListeners = new Set<() => void>();
@@ -2259,8 +2279,9 @@ export function createRelaySession(
           channelIds.filter((id) => /^[a-zA-Z0-9_-]{1,128}$/.test(id)),
         ),
       ];
-      // Unread or refused before, it is read again.
+      // Unread or refused before, it is read again, and soon.
       for (const id of ids) attendChecked.delete(id);
+      attendDelay = ATTEND_RETRY_MS;
       attended.add(ids);
       updateInterests();
       return () => {
