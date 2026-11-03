@@ -8478,6 +8478,49 @@ it("listens in a public channel it is not in, but delivers a watch's turn only w
   expect(trigger.text).toContain('watch "here"');
 });
 
+it("does not listen in a public channel it is not in that is hidden or a DM", async () => {
+  const { service, run, emit, session } = await setup();
+  const hidden = "5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b";
+  const dm = "6f7a8b9c-0d1e-4f2a-9b3c-4d5e6f7a8b9c";
+  const get = session.channels.get;
+  vi.spyOn(session.channels, "get").mockImplementation((id: string) =>
+    id === hidden || id === dm
+      ? ({
+          id,
+          name: id,
+          visibility: "public",
+          readOnly: true,
+          members: [other],
+          ...(id === hidden ? { hidden: true } : { channelType: "dm" }),
+        } as never)
+      : get?.(id),
+  );
+  await service.create({ type: "example/echo", name: "Echo" });
+  await service.save(bot, { attentionEnabled: true });
+  await service.save(bot, {
+    attention: {
+      "watch/public": {
+        type: "event",
+        interest_id: "default",
+        enabled: true,
+        since: 1,
+        channels: [hidden, dm, plaza],
+        kinds: [9],
+      },
+    },
+  });
+  emit({
+    events: [
+      event("hidden", { tags: [["h", hidden]] }),
+      event("dm", { tags: [["h", dm]] }),
+      event("plaza", { tags: [["h", plaza]] }),
+    ],
+  });
+  await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1));
+  await settle();
+  expect(woke(run)).toEqual(["plaza"]);
+});
+
 it("holds a public channel's catch-up until its metadata is known, and hears it in a watch of every channel", async () => {
   vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
   try {
