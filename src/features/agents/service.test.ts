@@ -8485,10 +8485,12 @@ it("finds mentions the live subscription lost while it stayed connected", async 
   }
 });
 
-it("keeps finding lost mentions while its watches are edited every minute", async () => {
+it("keeps finding lost mentions while its watches are edited more often than it polls", async () => {
   vi.useFakeTimers({ now: 1_000_000_000 });
   try {
-    const { service, run, history } = await setup({ identities: [echo] });
+    const { service, run, history, session } = await setup({
+      identities: [echo],
+    });
     await service.save(bot, { attentionEnabled: true, attention: chat });
     await vi.advanceTimersByTimeAsync(60_000);
     history.push(
@@ -8496,8 +8498,9 @@ it("keeps finding lost mentions while its watches are edited every minute", asyn
         message(author, "other", "lost mention", nowSeconds(), [["p", bot]]),
       ),
     );
-    // Each edit restarts catch-up, more often than it reads by itself.
-    for (let minute = 0; minute < 10; minute++) {
+    // Each edit restarts the watches' catch-up, more often than it polls;
+    // the mention poll goes on.
+    for (let edit = 0; edit < 30; edit++) {
       await service.save(bot, {
         attention: {
           "watch/chat": {
@@ -8506,9 +8509,23 @@ it("keeps finding lost mentions while its watches are edited every minute", asyn
           },
         },
       });
-      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.advanceTimersByTimeAsync(20_000);
     }
     expect(heard(run)).toEqual(["lost mention"]);
+    // An edit does not read mentions again: only the poll does.
+    const reads = mentionReads(session).length;
+    for (let edit = 0; edit < 10; edit++) {
+      await service.save(bot, {
+        attention: {
+          "watch/chat": {
+            ...chat["watch/chat"],
+            exclude_authors: [keypair().pubkey],
+          },
+        },
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    expect(mentionReads(session).length - reads).toBeLessThanOrEqual(1);
   } finally {
     vi.useRealTimers();
   }

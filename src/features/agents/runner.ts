@@ -359,10 +359,11 @@ export type LiveCommunity = {
   readonly controller: AbortController;
   readonly connection: Connection;
 };
-/** One agent's catch-up, for the attention, community and connect it started
- * under; any of them changing starts another. */
+/** One agent's catch-up, for the community and connect it started under, and
+ * for its watches, the attention; any of them changing starts another. The
+ * mention pass has no attention: an edit does not change what it reads. */
 type Pass = {
-  attention: Agent["attention"];
+  attention?: Agent["attention"];
   community: LiveCommunity;
   epoch: number;
   controller: AbortController;
@@ -1257,8 +1258,10 @@ export class AgentRunners {
           catching([]);
           continue;
         }
+        const attention = mentions ? undefined : agent.attention;
         if (
-          pass?.attention === agent.attention &&
+          pass &&
+          pass.attention === attention &&
           pass.community === community &&
           pass.epoch === community.connection.epoch &&
           !(pass.failedAt && Date.now() - pass.failedAt >= CATCH_UP_RETRY_MS)
@@ -1318,7 +1321,7 @@ export class AgentRunners {
         }
         pass?.controller.abort();
         const next: Pass = {
-          attention: agent.attention,
+          ...(attention && { attention }),
           community,
           epoch: community.connection.epoch,
           controller: new AbortController(),
@@ -1550,8 +1553,8 @@ export class AgentRunners {
    * watches, so a mention from before the app listened is not answered late.
    * A later one live would have heard, mentions too; catch-up may read it
    * before replay does, which then skips it as seen. Returns how many events
-   * were taken, or 0 when an edit since ends the pass: the next one reads them
-   * again. */
+   * were taken, or 0 when an edit since ends the watches' pass: the next one
+   * reads them again. */
   private async caughtUp(
     runner: Runner,
     pass: Pass,
@@ -1563,7 +1566,8 @@ export class AgentRunners {
     for (;;) {
       signal.throwIfAborted();
       const agent = this.host.ready(runner.key);
-      if (agent?.attention !== pass.attention) return 0;
+      if (!agent || (pass.attention && agent.attention !== pass.attention))
+        return 0;
       const taken = this.batch(runner, agent, pass, slug, events, skipped);
       if (taken) return taken;
       await new Promise<void>((resolve) => {
