@@ -24,6 +24,7 @@ import {
   viewRevision,
 } from "../../shared/view-state";
 import { MessageComposer } from "../messages/MessageComposer";
+import type { MentionPicks } from "../relay/messages";
 import { useDefaultAgent } from "./default-agent";
 import { WorkspaceControl } from "./WorkspaceControl";
 import { rememberedMentions } from "../messages/remembered-mentions";
@@ -248,6 +249,7 @@ export function SoloDraft({
     draft: MentionDraft,
     files: AttachmentDraft,
     addressed?: readonly MentionRecipient[],
+    picks?: MentionPicks,
   ) {
     const text = composerMarkdown(draft);
     if (submitting.current || !text.trim() || !available) return;
@@ -352,12 +354,28 @@ export function SoloDraft({
           : undefined,
       );
       try {
-        session.messages.send(
-          channelId,
-          text,
-          recipients,
-          ...(uploaded.length ? [uploaded] : []),
+        const firstPicks: MentionPicks = Object.fromEntries(
+          Object.entries(picks ?? {}).filter(([pubkey]) =>
+            recipients.includes(pubkey),
+          ),
         );
+        if (Object.keys(firstPicks).length)
+          session.messages.send(
+            channelId,
+            text,
+            recipients,
+            uploaded,
+            undefined,
+            [],
+            firstPicks,
+          );
+        else
+          session.messages.send(
+            channelId,
+            text,
+            recipients,
+            ...(uploaded.length ? [uploaded] : []),
+          );
         files.clear();
         writeView(
           scope,
@@ -504,8 +522,8 @@ export function SoloDraft({
           unsaved: (held) => {
             unsaved.current = held;
           },
-          submit: (draft, files, addressed) => {
-            void start(draft, files, addressed);
+          submit: (draft, files, addressed, picks) => {
+            void start(draft, files, addressed, picks);
           },
         }}
       />

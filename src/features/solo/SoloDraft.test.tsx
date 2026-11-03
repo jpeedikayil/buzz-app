@@ -29,6 +29,8 @@ import type {
 } from "../conversation/contracts";
 import { createAgentChoices } from "../agents/choices";
 import { createAgentLibrary } from "../agents/library";
+import { AgentsContext } from "../agents/react";
+import type { Agents } from "../agents/service";
 import { MentionCompletion } from "../../bundled/mentions/MentionCompletion";
 import { mentionQuery } from "../../bundled/mentions/mention-query";
 import type { ComposerCompletion } from "../conversation/contracts";
@@ -2017,6 +2019,138 @@ it("a first message that can't go out waits in the new chat's composer with its 
       .snapshot()
       .map((item) => item.uploaded),
   ).toEqual([notes]);
+});
+
+it("sends the selected model and effort with a Solo chat's first message", async () => {
+  const test = setup(),
+    onStarted = vi.fn(),
+    user = userEvent.setup();
+  const pubkey = "a".repeat(64);
+  const agent = {
+    pubkey,
+    key: pubkey,
+    name: "Member agent",
+    type: "test/agent",
+  };
+  const snapshot = { status: "ready", agents: [agent] };
+  const types = [
+    {
+      key: "test/agent",
+      models: () => ({
+        current: "fast",
+        sendDefaults: true,
+        models: [
+          { id: "fast", label: "Fast", efforts: [] },
+          {
+            id: "deep",
+            label: "Deep",
+            efforts: [
+              { id: "low", label: "Low" },
+              { id: "high", label: "High" },
+            ],
+          },
+        ],
+      }),
+    },
+  ];
+  const modelAgents = {
+    find: (key: string) => (key === pubkey ? agent : undefined),
+    joinable: () => [],
+    sessionState: () => "unavailable" as const,
+    subscribe: () => () => {},
+    snapshot: () => snapshot,
+    types: () => types,
+  } as unknown as Agents;
+  writeView("test", "solo:new-draft", taggedDraft("Start with care"));
+  render(
+    <AgentsContext.Provider value={modelAgents}>
+      <SoloDraft session={test.session} scope="test" onStarted={onStarted} />
+    </AgentsContext.Provider>,
+  );
+
+  await user.click(
+    await screen.findByRole("button", { name: /Model.*effort/ }),
+  );
+  await user.click(
+    await screen.findByRole("button", {
+      name: "Model for Member agent's next run",
+    }),
+  );
+  await user.click(await screen.findByRole("menuitemradio", { name: "Deep" }));
+  const effort = await screen.findByLabelText(
+    "Effort for Member agent's next run",
+  );
+  effort.focus();
+  await user.keyboard("{ArrowRight}");
+  expect(effort).toHaveAttribute("aria-valuetext", "High");
+
+  await user.keyboard("{Escape}");
+  await user.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(onStarted).toHaveBeenCalledOnce());
+  const [id] = onStarted.mock.calls[0] ?? [];
+  expect(test.messages.send).toHaveBeenLastCalledWith(
+    id,
+    "@Member agent Start with care",
+    [pubkey],
+    [],
+    undefined,
+    [],
+    { [pubkey]: { model: "deep", effort: "high" } },
+  );
+  expect(readView("test", `solo:model-picks:${id}`, null)).toEqual({
+    [pubkey]: { model: "deep", effort: "high", type: "test/agent" },
+  });
+});
+
+it("keeps provider defaults unchanged on an unconfigured Solo first message", async () => {
+  const test = setup(),
+    onStarted = vi.fn(),
+    user = userEvent.setup();
+  const pubkey = "a".repeat(64);
+  const agent = {
+    pubkey,
+    key: pubkey,
+    name: "Member agent",
+    type: "test/agent",
+  };
+  const snapshot = { status: "ready", agents: [agent] };
+  const types = [
+    {
+      key: "test/agent",
+      models: () => ({
+        current: "fast",
+        sendDefaults: true,
+        models: [
+          { id: "fast", label: "Fast", efforts: [] },
+          { id: "deep", label: "Deep", efforts: [] },
+        ],
+      }),
+    },
+  ];
+  const modelAgents = {
+    find: (key: string) => (key === pubkey ? agent : undefined),
+    joinable: () => [],
+    sessionState: () => "unavailable" as const,
+    subscribe: () => () => {},
+    snapshot: () => snapshot,
+    types: () => types,
+  } as unknown as Agents;
+  writeView("test", "solo:new-draft", taggedDraft("Use configured defaults"));
+  render(
+    <AgentsContext.Provider value={modelAgents}>
+      <SoloDraft session={test.session} scope="test" onStarted={onStarted} />
+    </AgentsContext.Provider>,
+  );
+
+  await user.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(onStarted).toHaveBeenCalledOnce());
+  const [id] = onStarted.mock.calls[0] ?? [];
+  expect(test.messages.send).toHaveBeenLastCalledWith(
+    id,
+    "@Member agent Use configured defaults",
+    [pubkey],
+  );
+  expect(readView("test", `solo:model-picks:${id}`, null)).toBeNull();
 });
 
 it("resumes a new chat's interrupted upload after navigating away and back", async () => {

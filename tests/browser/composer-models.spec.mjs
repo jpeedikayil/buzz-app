@@ -46,6 +46,48 @@ test("effort picker opens, follows the keyboard and returns focus", async ({
   await expect(trigger).toBeFocused();
 });
 
+test("Solo first-send choices stay selected until explicit reset", async ({
+  page,
+}, testInfo) => {
+  await page.goto("/tests/fixtures/composer-models.html");
+  const trigger = page.getByRole("button", {
+    name: "Model and effort for the next run",
+  });
+  await expect(trigger).toBeVisible();
+  await page.screenshot({
+    path: testInfo.outputPath("solo-model-picker-before-selection.png"),
+  });
+  await trigger.click();
+  await page
+    .getByRole("button", { name: "Model for Honey's next run" })
+    .click();
+  await page.getByRole("menuitemradio", { name: "Alternate model" }).click();
+  const effort = page.getByRole("slider", {
+    name: "Effort for Honey's next run",
+  });
+  await expect(effort).toHaveAttribute("aria-valuetext", "Medium");
+  await effort.focus();
+  await page.keyboard.press("ArrowRight");
+  await expect(effort).toHaveAttribute("aria-valuetext", "High");
+  await page.keyboard.press("Escape");
+  await expect(trigger).toHaveAttribute("data-selected", "");
+
+  await trigger.click();
+  const popup = page.getByRole("dialog");
+  await expect(
+    popup.getByRole("button", { name: "Model for Honey's next run" }),
+  ).toContainText("Alternate model");
+  await expect(effort).toHaveAttribute("aria-valuetext", "High");
+  await expect(
+    popup.getByRole("button", { name: "Reset model and effort" }),
+  ).toBeVisible();
+  await popup.screenshot({ path: testInfo.outputPath("solo-first-send.png") });
+
+  await popup.getByRole("button", { name: "Reset model and effort" }).click();
+  await expect(trigger).not.toHaveAttribute("data-selected");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+});
+
 // Browser-only: inherited animated progress, real track geometry and label clamping.
 // A DOM emulator cannot catch the fill jumping ahead or the label moving backwards.
 test("entrance keeps the fill and delayed model button attached to the handle", async ({

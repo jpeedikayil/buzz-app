@@ -109,7 +109,9 @@ that agent in Buzz; they do not notify the external app through this connection.
 
 - **Solo** organizes your chats with agents. Choose **New chat**, select or tag
   an agent, and send a message. Solo conversations continue at the chat's top
-  level rather than requiring a new thread for each reply. Solo chats can also
+  level rather than requiring a new thread for each reply. Where available, use
+  **Model and effort** in the composer before sending; Solo keeps those choices
+  for that chat until you reset them in the same control. Solo chats can also
   be shared with other people; do not describe every Solo chat as visible only
   to its creator.
 - **Team** contains community channels and their threads. Use the **@** picker

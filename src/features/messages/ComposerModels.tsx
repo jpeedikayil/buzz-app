@@ -62,6 +62,8 @@ export function ComposerModels({
   media,
   value,
   disabled,
+  resettable = false,
+  explicitOnly = false,
   onChange,
   onResolved,
   startsThread,
@@ -72,6 +74,10 @@ export function ComposerModels({
   media: Parameters<typeof avatarMedia>[1];
   value: DraftPicks;
   disabled: boolean;
+  /** Solo chat picks are defaults for the chat until explicitly reset. */
+  resettable?: boolean;
+  /** A new Solo chat keeps provider defaults unchanged unless picked. */
+  explicitOnly?: boolean;
   onChange(value: DraftPicks): void;
   onResolved(value: MentionPicks): void;
   /** The message starts a thread of its own, as a channel's top-level one
@@ -131,30 +137,46 @@ export function ComposerModels({
   // Publish the displayed defaults separately from the user's draft picks.
   // A settings refresh or model-only pick must still follow the new default.
   useLayoutEffect(() => {
-    const resolved: Record<string, RunPick> = Object.fromEntries(
-      Object.entries(value).map(([pubkey, { model, effort }]) => [
-        pubkey,
-        { ...(model ? { model } : {}), ...(effort ? { effort } : {}) },
-      ]),
-    );
+    const resolved: Record<string, RunPick> = resettable
+      ? {}
+      : Object.fromEntries(
+          Object.entries(value).map(([pubkey, { model, effort }]) => [
+            pubkey,
+            { ...(model ? { model } : {}), ...(effort ? { effort } : {}) },
+          ]),
+        );
     for (const choice of choices) {
-      if (choice.loading || !choice.sendDefaults) continue;
+      if (choice.loading) continue;
       const saved = value[choice.pubkey] ?? {};
-      const runs = runModel(choice, saved.model);
-      if (!runs.id) continue;
-      const effort = runs.efforts.some((item) => item.id === saved.effort)
-        ? saved.effort
-        : runs.efforts.some((item) => item.id === runs.effort)
+      const selected = choice.models.find((item) => item.id === saved.model);
+      const runs =
+        selected ??
+        choice.models.find((item) => item.id === choice.current) ??
+        choice.models[0];
+      if (!runs?.id) continue;
+      const explicitEffort = runs.efforts.find(
+        (item) => item.id === saved.effort,
+      )?.id;
+      const effort =
+        explicitEffort ??
+        (runs.efforts.some((item) => item.id === runs.effort)
           ? runs.effort
-          : undefined;
-      resolved[choice.pubkey] = {
-        model: runs.id,
-        ...(effort ? { effort } : {}),
-      };
+          : undefined);
+      if (choice.sendDefaults && !explicitOnly) {
+        resolved[choice.pubkey] = {
+          model: runs.id,
+          ...(effort ? { effort } : {}),
+        };
+      } else if (resettable && (selected || explicitEffort)) {
+        resolved[choice.pubkey] = {
+          ...(selected ? { model: selected.id } : {}),
+          ...(explicitEffort ? { effort: explicitEffort } : {}),
+        };
+      }
     }
     onResolved(resolved);
     return () => onResolved({});
-  }, [choices, value, onResolved]);
+  }, [choices, value, onResolved, resettable, explicitOnly]);
   if (!choices.length) return null;
   const picked = choices.flatMap((choice) => {
     const { model, effort } = value[choice.pubkey] ?? {};
@@ -213,6 +235,18 @@ export function ComposerModels({
             aria-label={label}
             initialFocus={thumb}
           >
+            {resettable && Object.keys(value).length > 0 && (
+              <Button
+                variant="subtle"
+                size="sm"
+                onClick={() => {
+                  onChange({});
+                  setOpen(false);
+                }}
+              >
+                Reset model and effort
+              </Button>
+            )}
             {choices.map((choice, index) => (
               <AgentChoice
                 key={choice.pubkey}

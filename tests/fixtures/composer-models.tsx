@@ -33,7 +33,16 @@ const types = [
             { id: "high", label: "High" },
           ],
         },
-        { id: "alternate", label: "Alternate model", efforts: [] },
+        {
+          id: "alternate",
+          label: "Alternate model",
+          effort: "medium",
+          efforts: [
+            { id: "low", label: "Low" },
+            { id: "medium", label: "Medium" },
+            { id: "high", label: "High" },
+          ],
+        },
       ],
     }),
   },
@@ -68,6 +77,8 @@ function Fixture() {
             media={media}
             value={picks}
             disabled={false}
+            resettable
+            explicitOnly
             startsThread={false}
             place={{ channelId: "fixture" }}
             onChange={setPicks}
