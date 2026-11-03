@@ -81,6 +81,7 @@ import {
   finished,
   heardOf,
   inStream,
+  MENTIONS,
   oldestFirst,
   POLL_OVERLAP,
   readWindow,
@@ -291,6 +292,11 @@ type Runner = {
    * other channels' traffic cannot push out one a replay sends again. Only the
    * `SEEN_CHANNELS` most recently active channels are kept. */
   readonly seenIn: Map<string, Set<string>>;
+  /** Mentions it was given, with their times, kept while a read can find
+   * them again, and seen as long. Any traffic pushes ids out of the seen
+   * sets, which only hold a count, and one pass can read a mention another
+   * gave. */
+  readonly mentioned: Map<string, number>;
   /** Replayed events waiting, oldest first, until the agent has room for the
    * jobs each makes. */
   readonly backlog: PendingEvent[];
@@ -348,7 +354,7 @@ export type Connection = {
 /** An agent's community while it is live: one object for as long as its
  * session lasts. */
 export type LiveCommunity = {
-  readonly session: Pick<RelaySession, "read" | "readRemote" | "live">;
+  readonly session: Pick<RelaySession, "readRemote" | "live">;
   /** Aborts when the session is replaced, so no work outlives it. */
   readonly controller: AbortController;
   readonly connection: Connection;
@@ -383,6 +389,9 @@ const overlapOf = (live: ReadonlyMap<string, number>) => (stream: Stream) =>
   coveredSince(stream, live) === undefined ? POLL_OVERLAP : 0;
 
 const seconds = () => Math.floor(Date.now() / 1000);
+/** The key of an agent's mention or watch catch-up pass. */
+const passKey = (agent: AgentKey, mentions: boolean) =>
+  `${agent}:${mentions ? "mentions" : "watches"}`;
 const message = (error: unknown) =>
   String(error instanceof Error ? error.message : error);
 
@@ -882,6 +891,7 @@ export class AgentRunners {
       later: [],
       seen: new Set(),
       seenIn: new Map(),
+      mentioned: new Map(),
       backlog: [],
       working: 0,
       typing: new Map(),
@@ -897,8 +907,11 @@ export class AgentRunners {
     };
   }
   private retire(runner: Runner) {
-    this.passes.get(runner.key)?.controller.abort();
-    this.passes.delete(runner.key);
+    for (const mentions of [true, false]) {
+      const key = passKey(runner.key, mentions);
+      this.passes.get(key)?.controller.abort();
+      this.passes.delete(key);
+    }
     this.host.activity.clear(runner.scope, runner.member.pubkey);
     this.dropMentions(runner, true);
     this.dropWatchWork(runner);
@@ -964,6 +977,7 @@ export class AgentRunners {
   private hasSeen(runner: Runner, id: string, channel: string | undefined) {
     return (
       runner.seen.has(id) ||
+      runner.mentioned.has(id) ||
       (!!channel && !!runner.seenIn.get(channel)?.has(id))
     );
   }
@@ -1137,8 +1151,8 @@ export class AgentRunners {
     };
   }
   /** Keeps each agent's catch-up going: on start, and after each connect, its
-   * event watches read the events they missed from their saved checkpoints,
-   * up to the connect. From then on live events cover a stream whose channel
+   * mentions and event watches read the events they missed from their saved
+   * checkpoints, up to the connect. From then on live events cover a stream whose channel
    * is live, of kinds live hears, so while the connection stays up a `tick`
    * moves its checkpoint to now; a quit or a drop leaves the checkpoint where
    * the next catch-up starts. Any other stream, and one whose checkpoint is
@@ -1192,15 +1206,17 @@ export class AgentRunners {
       const reading: Stream[] = [];
       for (const stream of agent && !held ? streamsOf(agent) : []) {
         const checkpoint = this.checkpoints[stream.key];
-        if (!on || !stream.enabled) {
+        // Mentions are answered with Attention off or not shown.
+        const hidden = !shown && !stream.mentions;
+        if (!(stream.mentions ? runner.type?.run : on) || !stream.enabled) {
           // Saved too, so one turned on after a restart starts from about
           // when this copy last saw it off, or from when Attention is shown.
           this.quiet.add(stream.key);
           if (
             (checkpoint?.through ?? 0) < now ||
-            (!shown && !checkpoint?.hidden)
+            (hidden && !checkpoint?.hidden)
           )
-            move(stream.key, { through: now, ...(!shown && { hidden: true }) });
+            move(stream.key, { through: now, ...(hidden && { hidden: true }) });
         } else if (
           this.quiet.delete(stream.key) ||
           !checkpoint ||
@@ -1211,99 +1227,119 @@ export class AgentRunners {
           move(stream.key, { through: now });
         else reading.push(stream);
       }
-      const pass = this.passes.get(runner.key);
       const since = community?.connection.since;
       // Seen on every call, so a route that drops and comes back between
       // ticks is not taken as live all along.
       const live =
         community && since !== undefined ? liveOf(community) : undefined;
-      if (!agent || !community || since === undefined || !reading.length) {
-        pass?.controller.abort();
-        this.passes.delete(runner.key);
-        this.setCatching(runner, new Set());
-        continue;
-      }
-      if (
-        pass?.attention === agent.attention &&
-        pass.community === community &&
-        pass.epoch === community.connection.epoch &&
-        !(pass.failedAt && Date.now() - pass.failedAt >= CATCH_UP_RETRY_MS)
-      ) {
-        if (!pass.done) continue;
-        const channels = live ?? new Map<string, number>();
-        // Read up to the connect, and to when live began to cover it.
-        const due = (stream: Stream) =>
-          Math.max(since, coveredSince(stream, channels) ?? since);
-        // How far it was read: one read with an overlap keeps its
-        // checkpoint behind that.
-        const through = (stream: Stream) => {
-          const checkpoint = this.checkpoints[stream.key];
-          return checkpoint?.read ?? checkpoint?.through ?? 0;
-        };
-        const ticks = (stream: Stream) =>
-          coveredSince(stream, channels) !== undefined &&
-          through(stream) >= due(stream);
-        if (tick)
-          for (const stream of reading.filter(ticks)) {
-            const checkpoint = this.checkpoints[stream.key];
-            if (checkpoint && !checkpoint.upper && checkpoint.through < now)
-              move(stream.key, { through: now });
-          }
-        const behind = reading.filter(
-          (stream) => through(stream) < due(stream),
+      // A mention a read cannot find again need not be remembered: below its
+      // stream's checkpoint, with an overlap's margin for the watches' reads.
+      const mentioned =
+        this.checkpoints[streamKey(runner.key, MENTIONS)]?.through ?? 0;
+      for (const [id, created] of runner.mentioned)
+        if (created < mentioned - POLL_OVERLAP) runner.mentioned.delete(id);
+      // Mentions have their own pass, so watch work waiting for room never
+      // holds up the next mention read.
+      for (const mentions of [true, false]) {
+        const key = passKey(runner.key, mentions);
+        const streams = reading.filter(
+          (stream) => !!stream.mentions === mentions,
         );
-        const polled = reading.filter((stream) => !ticks(stream));
-        if (
-          !behind.length &&
-          !(
-            polled.length && Date.now() - (pass.doneAt ?? 0) >= CATCH_UP_POLL_MS
-          )
-        )
+        const pass = this.passes.get(key);
+        // Only a watch's live events wait for its catch-up.
+        const catching = (slugs: readonly Stream[]) => {
+          if (!mentions)
+            this.setCatching(runner, new Set(slugs.map(({ slug }) => slug)));
+        };
+        if (!agent || !community || since === undefined || !streams.length) {
+          pass?.controller.abort();
+          this.passes.delete(key);
+          catching([]);
           continue;
-        const next: Pass = { ...pass, controller: new AbortController() };
-        delete next.done;
-        delete next.doneAt;
-        this.passes.set(runner.key, next);
-        // Only one behind holds its live events back, to go on in order.
-        this.setCatching(runner, new Set(behind.map(({ slug }) => slug)));
+        }
+        if (
+          pass?.attention === agent.attention &&
+          pass.community === community &&
+          pass.epoch === community.connection.epoch &&
+          !(pass.failedAt && Date.now() - pass.failedAt >= CATCH_UP_RETRY_MS)
+        ) {
+          if (!pass.done) continue;
+          const channels = live ?? new Map<string, number>();
+          // Read up to the connect, and to when live began to cover it.
+          const due = (stream: Stream) =>
+            Math.max(since, coveredSince(stream, channels) ?? since);
+          // How far it was read: one read with an overlap keeps its
+          // checkpoint behind that.
+          const through = (stream: Stream) => {
+            const checkpoint = this.checkpoints[stream.key];
+            return checkpoint?.read ?? checkpoint?.through ?? 0;
+          };
+          const ticks = (stream: Stream) =>
+            coveredSince(stream, channels) !== undefined &&
+            through(stream) >= due(stream);
+          if (tick)
+            for (const stream of streams.filter(ticks)) {
+              const checkpoint = this.checkpoints[stream.key];
+              if (checkpoint && !checkpoint.upper && checkpoint.through < now)
+                move(stream.key, { through: now });
+            }
+          const behind = streams.filter(
+            (stream) => through(stream) < due(stream),
+          );
+          const polled = streams.filter((stream) => !ticks(stream));
+          if (
+            !behind.length &&
+            !(
+              polled.length &&
+              Date.now() - (pass.doneAt ?? 0) >= CATCH_UP_POLL_MS
+            )
+          )
+            continue;
+          const next: Pass = { ...pass, controller: new AbortController() };
+          delete next.done;
+          delete next.doneAt;
+          this.passes.set(key, next);
+          // Only one behind holds its live events back, to go on in order.
+          catching(behind);
+          void this.readMissed(
+            runner,
+            next,
+            polled,
+            // One behind reads up to when live began to cover it; any other
+            // stays behind now, for events the relay stores late.
+            (stream) =>
+              Math.max(
+                now - CATCH_UP_POLL_LAG,
+                behind.includes(stream) ? due(stream) : since,
+              ),
+            overlapOf(channels),
+          );
+          continue;
+        }
+        pass?.controller.abort();
+        const next: Pass = {
+          attention: agent.attention,
+          community,
+          epoch: community.connection.epoch,
+          controller: new AbortController(),
+        };
+        this.passes.set(key, next);
+        catching(streams);
+        const channels = live ?? new Map<string, number>();
         void this.readMissed(
           runner,
           next,
-          polled,
-          // One behind reads up to when live began to cover it; any other
-          // stays behind now, for events the relay stores late.
+          streams,
+          // A stream live does not cover is read as a poll reads it: an edit
+          // starts a new pass, and edits more often than the poll would
+          // otherwise keep it from being read.
           (stream) =>
-            Math.max(
-              now - CATCH_UP_POLL_LAG,
-              behind.includes(stream) ? due(stream) : since,
-            ),
+            coveredSince(stream, channels) === undefined
+              ? Math.max(since, now - CATCH_UP_POLL_LAG)
+              : since,
           overlapOf(channels),
         );
-        continue;
       }
-      pass?.controller.abort();
-      const next: Pass = {
-        attention: agent.attention,
-        community,
-        epoch: community.connection.epoch,
-        controller: new AbortController(),
-      };
-      this.passes.set(runner.key, next);
-      this.setCatching(runner, new Set(reading.map(({ slug }) => slug)));
-      const channels = live ?? new Map<string, number>();
-      void this.readMissed(
-        runner,
-        next,
-        reading,
-        // A stream live does not cover is read as a poll reads it: an edit
-        // starts a new pass, and edits more often than the poll would
-        // otherwise keep it from being read.
-        (stream) =>
-          coveredSince(stream, channels) === undefined
-            ? Math.max(since, now - CATCH_UP_POLL_LAG)
-            : since,
-        overlapOf(channels),
-      );
     }
     // Once each catch-up is under way, so they are heard after what it reads.
     if (!held && this.heldForStartup) {
@@ -1421,14 +1457,15 @@ export class AgentRunners {
     ]);
     const name = () => this.host.agent(runner.key)?.name;
     const read = async (filter: ReadFilter) => {
-      const events = await pass.community.session.read([filter], {
+      // Only the relay's page: read() also adds events the session observed
+      // meanwhile and the owner's messages not yet sent, and an older one of
+      // those would page past events the relay has not returned yet.
+      const events = await pass.community.session.readRemote([filter], {
         signal,
         priority: "background",
         fresh: true,
       });
       signal.throwIfAborted();
-      // Only what the relay signed: a read also returns the owner's own
-      // messages not yet sent, which can be older than its page.
       return events.filter(hasEventProof) as RelayEvent[];
     };
     const progress = (key: string, checkpoint: Checkpoint) => {
@@ -1487,17 +1524,20 @@ export class AgentRunners {
               ),
             );
           }
-        const catching = new Set(runner.catching);
-        catching.delete(slug);
-        this.setCatching(runner, catching);
+        if (runner.catching.has(slug)) {
+          const catching = new Set(runner.catching);
+          catching.delete(slug);
+          this.setCatching(runner, catching);
+        }
       }
       pass.done = true;
       pass.doneAt = Date.now();
     } catch (error) {
       if (signal.aborted) return;
       pass.failedAt = Date.now();
-      // Live events go on rather than wait for the next try.
-      this.setCatching(runner, new Set());
+      // Live events go on rather than wait for the next try. Mentions never
+      // wait, so their pass leaves the watches' catch-up alone.
+      if (!streams[0]?.mentions) this.setCatching(runner, new Set());
       console.warn(`Agent ${name()} could not catch up`, error);
     }
   }
@@ -1724,14 +1764,17 @@ export class AgentRunners {
    * starts from the last saved one again, which `seen` dedupes until a
    * restart, and each stream's saved `heard` after one. */
   private saveCheckpoints() {
-    const keys = new Set(
-      this.host.records().flatMap((record) =>
+    const keys = new Set([
+      ...this.host.records().flatMap((record) =>
         // A record's `pubkey` is its membership's key.
         streamsOf({ key: record.pubkey, attention: record.attention }).map(
           (stream) => stream.key,
         ),
       ),
-    );
+      // Mentions need no record: a membership added to a community has none
+      // until something is saved for it there.
+      ...[...this.runners.keys()].map((key) => streamKey(key, MENTIONS)),
+    ]);
     this.checkpoints = Object.fromEntries(
       Object.entries(this.checkpoints).filter(([key]) => keys.has(key)),
     );
@@ -2232,6 +2275,8 @@ export class AgentRunners {
 
   /** Queues `job`, or drops it when the lane is full; returns whether queued. */
   private enqueue(runner: Runner, job: Job) {
+    if (job.trigger.type === "mention")
+      runner.mentioned.set(job.trigger.event.id, job.trigger.event.created_at);
     const now = Date.now();
     const lane = laneOf(job.trigger);
     const rate = runner.rates[lane];

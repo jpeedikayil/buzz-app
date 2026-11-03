@@ -1,11 +1,13 @@
 // Saved catch-up progress for event watches, as Janet keeps it: one stream
-// for each watch and channel, which reads the watch's own kinds. Each window
-// of missed events is read whole, newest page first, within a bound, and then
-// delivered oldest first. Only the progress is saved, never an event.
+// for each watch and channel, which reads the watch's own kinds, and one for
+// the agent's mentions. Each window of missed events is read whole, newest
+// page first, within a bound, and then delivered oldest first. Only the
+// progress is saved, never an event.
+import { CHAT_KINDS } from "./attention";
 import type { Agent } from "./service";
 import type { EventData, ReadFilter } from "../relay/events";
 import type { AgentStore } from "./store";
-import { AGENT_KEY, type AgentKey } from "./membership";
+import { AGENT_KEY, type AgentKey, pubkeyOf } from "./membership";
 import { CHANNEL_KINDS, LIVE_RESUME_LAG } from "../relay/live";
 
 export const CATCH_UP_KEY = "buzz.agents.catch-up.v1";
@@ -48,11 +50,13 @@ export const HEARD_MOST = 16 * HEARD_LIMIT;
  * clocks can disagree by a little more, so a later read must still reach it. */
 export const POLL_OVERLAP = LIVE_RESUME_LAG;
 export type Checkpoints = Readonly<Record<string, Checkpoint>>;
-/** One watch's history in one channel, or in every channel it may read. */
+/** One watch's history in one channel, or in every channel it may read; or,
+ * with `mentions`, the messages that name that agent anywhere. */
 export type Stream = Readonly<{
   key: string;
   slug: string;
   channel?: string;
+  mentions?: string;
   /** The watch's kinds; a watch of every kind reads those live hears, as a
    * relay read must name its kinds. */
   kinds: readonly number[];
@@ -68,14 +72,23 @@ const ID = /^[0-9a-f]{64}$/;
 export const oldestFirst = (a: Position, b: Position) =>
   a.created_at - b.created_at || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
-/** Whether `event` is of the stream's kinds and of its channel. */
+/** The slug of an agent's mention stream. Attention slugs have no `@`. */
+export const MENTIONS = "@mentions";
+/** Whether `event` is of the stream's kinds and of its channel, and names
+ * its agent when it is a mention stream. */
 export const inStream = (
-  stream: Pick<Stream, "kinds" | "channel">,
+  stream: Pick<Stream, "kinds" | "channel" | "mentions">,
   event: Pick<EventData, "kind" | "tags">,
 ) =>
   stream.kinds.includes(event.kind) &&
   (stream.channel === undefined ||
-    event.tags.some(([key, value]) => key === "h" && value === stream.channel));
+    event.tags.some(
+      ([key, value]) => key === "h" && value === stream.channel,
+    )) &&
+  (stream.mentions === undefined ||
+    event.tags.some(
+      ([key, value]) => key === "p" && value === stream.mentions,
+    ));
 /** The key of a membership's watch's stream in one channel, or in every
  * channel. */
 export const streamKey = (agent: AgentKey, slug: string, channel?: string) =>
@@ -296,10 +309,19 @@ export async function splitLegacyCheckpoints(storage: AgentStore) {
   }
 }
 
-/** The agent's streams: one for each channel of each event watch, enabled or
- * not. */
+/** The membership's streams: its mentions, which it answers with attention
+ * on or off, and one for each channel of each event watch, enabled or not. */
 export function streamsOf(agent: Pick<Agent, "key" | "attention">) {
-  const streams: Stream[] = [];
+  const streams: Stream[] = [
+    {
+      key: streamKey(agent.key, MENTIONS),
+      slug: MENTIONS,
+      mentions: pubkeyOf(agent.key),
+      kinds: CHAT_KINDS,
+      since: 0,
+      enabled: true,
+    },
+  ];
   for (const { slug, value } of Object.values(agent.attention)) {
     if (value.type !== "event") continue;
     for (const channel of value.channels === "all"
@@ -338,8 +360,9 @@ export type Window<Event extends Position> = Readonly<{
  * `upper`. Pages are read newest first; past `CATCH_UP_PAGES` pages or
  * `CATCH_UP_BYTES` bytes the read stops, and the oldest second it reached is
  * skipped with everything older, so no event of a second is left half
- * delivered. Tags are not sent: the relay applies most tag filters after its
- * page limit, so a page could come back empty with older matches left. */
+ * delivered. Only `#h` and `#p` are sent, which the relay pages by index: it
+ * applies most other tag filters after its page limit, so a page could come
+ * back empty with older matches left. */
 export async function readWindow<Event extends Position>(
   stream: Stream,
   saved: Checkpoint | undefined,
@@ -373,6 +396,7 @@ export async function readWindow<Event extends Position>(
     const filter: ReadFilter = {
       kinds: [...stream.kinds],
       ...(stream.channel ? { "#h": [stream.channel] } : {}),
+      ...(stream.mentions ? { "#p": [stream.mentions] } : {}),
       since: floor,
       until: cursor?.created_at ?? window,
       ...(cursor ? { before_id: cursor.id } : {}),

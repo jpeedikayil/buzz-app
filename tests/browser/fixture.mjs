@@ -1458,6 +1458,29 @@ export const test = base.extend({
               ),
             ),
         ];
+      // A local agent's mention catch-up: chat events naming it anywhere.
+      if (filter["#p"] && !filter["#h"] && !filter["#p"].includes(viewer))
+        return [...histories.entries()]
+          .filter(([key]) => key.startsWith(`${community}/`))
+          .flatMap(([, events]) => events)
+          .filter(
+            (event) =>
+              filter.kinds.includes(event.kind) &&
+              event.tags.some(
+                ([key, value]) => key === "p" && filter["#p"].includes(value),
+              ) &&
+              (filter.since === undefined ||
+                event.created_at >= filter.since) &&
+              (filter.until === undefined ||
+                event.created_at < filter.until ||
+                (event.created_at === filter.until &&
+                  (filter.before_id === undefined ||
+                    event.id > filter.before_id))),
+          )
+          .toSorted(
+            (a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id),
+          )
+          .slice(0, filter.limit);
       if (filter["#p"] && !filter["#h"] && filter.kinds?.includes(9)) {
         expect([...filter.kinds].sort((a, b) => a - b)).toEqual([9, 40002]);
         expect(filter["#p"]).toEqual([viewer]);

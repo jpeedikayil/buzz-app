@@ -117,15 +117,23 @@ export function fakeRelay(origin = "https://relay.example.test") {
         filters.some((filter) => !filter.kinds?.length && !filter.ids?.length)
       )
         throw new Error("Relay reads need valid kinds or event IDs");
-      // A catch-up read is bounded on both sides; it may ask for any kinds.
-      return filters[0]?.kinds?.includes(9) ||
-        (filters[0]?.since !== undefined && filters[0]?.until !== undefined)
+      return filters[0]?.kinds?.includes(9)
         ? page(history, filters[0])
         : [...listed];
     }),
+    // Catch-up pages only through this: the relay's own page.
     readRemote: vi.fn(async (filters: readonly ReadFilter[]) => {
-      const ids = filters[0]?.ids ?? [];
-      return history.filter((event) => ids.includes(event.id));
+      const [filter] = filters;
+      if (filter?.ids)
+        return history.filter((event) => filter.ids?.includes(event.id));
+      // As the session's reader refuses it.
+      if (!filter?.kinds?.length)
+        throw new Error("Relay reads need valid kinds or event IDs");
+      // A catch-up read is bounded on both sides; it may ask for any kinds.
+      return filter.kinds.includes(9) ||
+        (filter.since !== undefined && filter.until !== undefined)
+        ? page(history, filter)
+        : [];
     }),
     channelWrites: {
       starting: (_id: string): Promise<void> | undefined => undefined,
@@ -263,6 +271,10 @@ export function page(events: readonly RelayEvent[], filter: ReadFilter) {
         (!filter["#h"] ||
           event.tags.some(
             ([key, value]) => key === "h" && value === filter["#h"]?.[0],
+          )) &&
+        (!filter["#p"] ||
+          event.tags.some(
+            ([key, value]) => key === "p" && value === filter["#p"]?.[0],
           )),
     )
     .sort((a, b) => b.created_at - a.created_at || (a.id < b.id ? -1 : 1))

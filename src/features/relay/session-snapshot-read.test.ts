@@ -184,6 +184,61 @@ it("starts remote pages fresh instead of joining an older identical read", async
   await Promise.all([first, second]);
 });
 
+// Catch-up pages by the oldest event of each page: one the session merely
+// observed meanwhile must not become that cursor.
+it("keeps a remote page to what the relay returned for it, while read() adds what the session observed meanwhile", async () => {
+  const channel = "remote-mentions";
+  const mentioned = keypair().pubkey;
+  const mention = (content: string, created_at: number) =>
+    message(viewer, channel, content, created_at, [["p", mentioned]]);
+  const newest = mention("newest", 1700001100);
+  const newer = mention("newer", 1700001085);
+  const observed = mention("observed meanwhile", 1700000750);
+  const discovery = [
+    metadata(relay, channel, "Public channel", 1700000000, [["public"]]),
+    roster(relay, channel, []),
+  ];
+  const pages: ReturnType<typeof deferred<RelayEvent[]>>[] = [];
+  const query = vi.fn(async (filters: readonly ReadFilter[]) => {
+    const [filter] = filters;
+    if (filter?.["#p"]) {
+      const page = deferred<RelayEvent[]>();
+      pages.push(page);
+      return page.promise;
+    }
+    return [...discovery, observed].filter((event) =>
+      filters.some((each) => matchesEvent(event, each)),
+    );
+  });
+  const owner = createRelaySession({
+    viewer: viewer.pubkey,
+    relayAuthor: relay.pubkey,
+    media: () => undefined,
+    query,
+  });
+  owners.push(owner);
+  await owner.session.read([{ kinds: [39000, 39002], limit: 10 }]);
+  const filter = {
+    kinds: [9],
+    "#p": [mentioned],
+    since: 1700000701,
+    until: 1700001120,
+    limit: 2,
+  };
+  const merged = owner.session.read([filter], { fresh: true });
+  const remote = owner.session.readRemote([filter]);
+  await vi.waitFor(() => expect(pages).toHaveLength(2));
+  await owner.session.read([{ ids: [observed.id], limit: 1 }]);
+  for (const page of pages) page.resolve([newest, newer]);
+  expect((await merged).map((event) => event.content)).toContain(
+    "observed meanwhile",
+  );
+  expect((await remote).map((event) => event.content)).toEqual([
+    "newest",
+    "newer",
+  ]);
+});
+
 it("refuses remote pages on a cached-only session", async () => {
   const query = vi.fn(async () => [] as RelayEvent[]);
   const owner = createRelaySession(

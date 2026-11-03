@@ -9,8 +9,8 @@ Terms:
 - **Interest**: a named piece of work with saved instructions. Subscriptions (event watches, timers and function producers) belong to one.
 - **Delivery address**: optional `channel` and `root` on any subscription, separate from event listening `channels`. Without an address it runs independently; with one it continues that conversation.
 - **Lane**: a queue that runs one turn at a time.
-- **Catch-up**: the events a watch missed while the agent was offline, read
-  from the relay when the agent comes back.
+- **Catch-up**: the events a watch or a mention missed, read from the relay
+  when the agent comes back, and again while it is connected.
 
 ## Compared behavior
 
@@ -28,6 +28,7 @@ Terms:
 | Watch tags are sent in the catch-up read | Yes | No. The relay applies most tag filters after its page limit, so a tagged read can return an empty page while older matches remain. The watch's own match still checks the tags, so results are the same. | Intended difference |
 | Catch-up order | Newest page first, oldest first inside each page | Reads the whole window, then delivers strictly oldest first | Intended difference |
 | Catch-up delivery | One event per turn | Batches of up to 64 messages or 64 Ki JSON characters (about 16k–32k tokens) per turn | Intended difference |
+| Mentions missed by the live connection are caught up | On reconnect, each channel resubscribes from 5 s before its last seen event | Yes, from the agent's saved mention checkpoint, with a `#p` read the relay pages by index, with Attention on or off. Like a watch on every channel, it is read again about every 30 s while connected, and each read covers the last 15 minutes again. It has its own pass, so a watch waiting for room cannot hold it up. Only mentions sent after the app started are answered. A one-to-one DM that does not name the agent is not read. | Intended difference |
 | The agent is told that an event comes from catch-up | Yes | Yes, for every agent type with standalone turns (Claude Code, Codex and Goose) | Same |
 | Conversation delivery address | No watch delivery address; reporting policy lives in Interest instructions | Optional channel/thread executes in that conversation. Explicit Interest reporting instructions override its default destination. | Intended difference |
 | Timers | Yes | Yes, for every agent type with standalone turns (Claude Code, Codex and Goose) | Same |
