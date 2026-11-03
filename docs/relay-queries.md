@@ -325,10 +325,11 @@ membership. Only demanded retained previews enter the existing live interest set
 and the public channels agents' watches name (`session.attend`), which the session
 reads metadata for first. Attended channels come after joined and demanded ones,
 in the capacity those leave, and are never joined, listed or counted unread.
-Until the session knows a channel, or has read its metadata for `attend`,
-`session.attendPending(id)` is true, also before the channel is attended: a read
-of it returns none of its events, so agent catch-up waits for it. A
-failed metadata read is tried again after 30 s, and after a reconnect. A read of
+Until the session knows a channel, `session.attendPending(id)` is true, also
+before the channel is attended: a read of it returns none of its events, so
+agent catch-up waits for it. A metadata read that fails, or finds nothing the
+viewer may read (a private channel may turn public), is tried again after 30 s,
+and after a reconnect. A read of
 every channel with `resolveChannels` resolves the channels its events name, of
 any kinds, before visibility filtering, as ranked search does for chat kinds;
 before discovery it fails and is tried again, rather than drop what it finds.

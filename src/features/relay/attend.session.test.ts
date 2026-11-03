@@ -61,17 +61,21 @@ function harness() {
   return { owner, wire, update, discover, reconnect, connect };
 }
 /** The relay's signed metadata and roster of a channel only `other` is in. */
-const channel = (id: string, visibility: "public" | "private") => [
+const channel = (
+  id: string,
+  visibility: "public" | "private",
+  created_at = 10,
+) => [
   signed(relay, {
     kind: 39000,
     content: "",
-    created_at: 10,
+    created_at,
     tags: [["d", id], ["name", id.slice(0, 4)], [visibility]],
   }),
   signed(relay, {
     kind: 39002,
     content: "",
-    created_at: 10,
+    created_at,
     tags: [
       ["d", id],
       ["p", other.pubkey],
@@ -238,4 +242,48 @@ it("does not answer a read of every channel that resolves its channels before di
   await flush();
   // It is tried again later, not answered empty.
   expect(settled).toBe(false);
+});
+
+it("reads again a channel found unreadable, holding it pending, and keeps it live once it turns public", async () => {
+  const h = harness();
+  const live = () => h.update.mock.lastCall?.[0] ?? [];
+  const pending = () => h.owner.session.attendPending(OPEN);
+  const lookup = () =>
+    h.wire.pending.find(
+      (entry) => !entry.signal?.aborted && asks(entry.filters, OPEN),
+    );
+  const answer = (events: readonly unknown[]) => {
+    const entry = lookup();
+    if (!entry) throw new Error("No metadata read");
+    h.wire.pending.splice(h.wire.pending.indexOf(entry), 1);
+    entry.respond(events as RelayEvent[]);
+  };
+  h.owner.session.attend([OPEN]);
+  await h.discover();
+  await vi.waitFor(() => expect(lookup()).toBeDefined());
+  // Private, and the viewer is not in it: nothing it can read yet. It stays
+  // pending, so catch-up keeps its checkpoint, and a reconnect reads it again.
+  answer(channel(OPEN, "private"));
+  await flush();
+  expect(pending()).toBe(true);
+  expect(lookup()).toBeUndefined();
+  await h.reconnect();
+  await vi.waitFor(() => expect(lookup()).toBeDefined());
+  // So does a wait, with no reconnect: the relay may have no answer at all.
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    answer([]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pending()).toBe(true);
+    expect(lookup()).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(30_000);
+  } finally {
+    vi.useRealTimers();
+  }
+  await vi.waitFor(() => expect(lookup()).toBeDefined());
+  expect(pending()).toBe(true);
+  // Now public, by newer metadata: known, and live.
+  answer(channel(OPEN, "public", 20));
+  await vi.waitFor(() => expect(pending()).toBe(false));
+  await vi.waitFor(() => expect(live()).toContain(OPEN));
 });

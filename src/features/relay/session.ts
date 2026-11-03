@@ -1258,19 +1258,34 @@ export function createRelaySession(
   const attended = new Set<readonly string[]>();
   /** Attended channels whose metadata was read for them, or is being read. */
   const attendChecked = new Set<string>();
-  /** How long a failed metadata read of attended channels waits. */
+  /** How long an attended channel still unknown after a read waits. */
   const ATTEND_RETRY_MS = 30_000;
-  /** Attended channels whose metadata read finished, found or not. */
-  const attendRead = new Set<string>();
-  /** Forgets the reads that did not finish, so they are tried again. */
+  /** One wait for every channel still unknown, so reads do not multiply. */
+  let attendRetry: ReturnType<typeof setTimeout> | undefined;
+  /** Forgets the reads made, and any wait for them, so channels still
+   * unknown are read again. */
   const retryAttended = () => {
-    for (const id of attendChecked)
-      if (!attendRead.has(id)) attendChecked.delete(id);
+    if (attendRetry) {
+      clearTimeout(attendRetry);
+      timers.delete(attendRetry);
+      attendRetry = undefined;
+    }
+    attendChecked.clear();
   };
-  /** Reads the metadata of attended channels not known yet, once each. Only
-   * into a ready list: a lookup may extend one, never stand in for initial
-   * discovery. A failed read is tried again after `ATTEND_RETRY_MS`, or once
-   * discovery is after a reconnect. */
+  const retryAttendedLater = () => {
+    if (closed || attendRetry) return;
+    attendRetry = setTimeout(() => {
+      retryAttended();
+      updateInterests();
+    }, ATTEND_RETRY_MS);
+    timers.add(attendRetry);
+  };
+  /** Reads the metadata of attended channels not known yet. Only into a
+   * ready list: a lookup may extend one, never stand in for initial
+   * discovery. A channel still unknown after its read, because the read
+   * failed or found nothing the viewer may read, is read again after
+   * `ATTEND_RETRY_MS`, or once discovery is after a reconnect: it may have
+   * turned public since. */
   const resolveAttended = () => {
     if (
       closed ||
@@ -1286,20 +1301,10 @@ export function createRelaySession(
       const batch = unknown.slice(start, start + 128);
       void channels.queries
         .resolve(batch, { signal: lifetime.signal })
-        .then(
-          () => {
-            for (const id of batch) attendRead.add(id);
-          },
-          () => {
-            if (closed) return;
-            const timer = setTimeout(() => {
-              timers.delete(timer);
-              retryAttended();
-              updateInterests();
-            }, ATTEND_RETRY_MS);
-            timers.add(timer);
-          },
-        )
+        .then(() => {
+          if (batch.some((id) => !channels.queries.get?.(id)))
+            retryAttendedLater();
+        }, retryAttendedLater)
         .finally(updateInterests);
     }
   };
@@ -2255,23 +2260,21 @@ export function createRelaySession(
         ),
       ];
       // Unread or refused before, it is read again.
-      for (const id of ids) {
-        attendChecked.delete(id);
-        attendRead.delete(id);
-      }
+      for (const id of ids) attendChecked.delete(id);
       attended.add(ids);
       updateInterests();
       return () => {
         if (attended.delete(ids)) updateInterests();
       };
     },
-    /** Whether the session does not know `channelId` yet, and has not read
-     * its metadata for `attend`: until then, a read of the channel returns
-     * none of its events. True of a channel not attended yet too, so a read
-     * that runs before its `attend` waits for it as well. */
+    /** Whether the session does not know `channelId`: a read of the channel
+     * returns none of its events. True of a channel not attended yet, so a
+     * read that runs before its `attend` waits for it as well, and of one
+     * whose metadata read found nothing the viewer may read, until a later
+     * read finds it. */
     attendPending(channelId: string): boolean {
       const channel = channels.queries.get?.(channelId);
-      return channel ? !!channel.pending : !attendRead.has(channelId);
+      return !channel || !!channel.pending;
     },
     /** Verified, access-filtered live-phase events of any kind, after reconciliation.
      * Never finite reads or local intent, except the viewer's own messages in
