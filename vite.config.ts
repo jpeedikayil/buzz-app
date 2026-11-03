@@ -60,9 +60,11 @@ function federatedBuilderlabUrl(legacy: string | undefined) {
   const raw = process.env.BUZZ_BUILD_FEDERATED_IDENTITY_CONFIG;
   if (raw === "") return undefined;
   if (raw === undefined)
-    return legacy === undefined || isBuiltInBuilderlab(legacy)
+    return legacy === undefined
       ? BUILT_IN_BUILDERLAB
-      : undefined;
+      : isBuiltInBuilderlab(legacy)
+        ? legacy
+        : undefined;
   const parsed = JSON.parse(raw) as unknown;
   const { identityOrigin, apiBasePath } = (
     Array.isArray(parsed) ? parsed[0] : parsed
