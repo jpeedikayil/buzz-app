@@ -16,9 +16,10 @@ const HOSTED = [
 /**
  * Whether a community URL given before setup is hosted by this build's
  * Builderlab, so first run signs in for it at once rather than asking. A
- * build has one Builderlab; one whose `BUZZ_BUILDERLAB_URL` is not a listed
- * portal (including an unconfigured or federated-identity build) treats every
- * community as unhosted.
+ * build has one Builderlab, its first sign-in server or, without one, its
+ * `BUZZ_BUILDERLAB_URL`. One whose Builderlab is not a listed portal (an
+ * unconfigured build, or one whose first server is another deployment)
+ * treats every community as unhosted.
  *
  * Hostname first (exact or label-boundary suffix: `design.communities.buzz.xyz`
  * and the apex match `communities.buzz.xyz`; `notcommunities.buzz.xyz` and

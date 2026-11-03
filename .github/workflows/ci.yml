@@ -122,12 +122,20 @@ jobs:
       - name: FI Builderlab build and grant tests
         env:
           # Fixture authority only; never use a release's real configuration.
+          # It is added before the built-in server, as an internal build's is.
           BUZZ_BUILD_FEDERATED_IDENTITY_CONFIG: '{"version":1,"id":"ci-fi","identityOrigin":"https://identity.example.test","communityHosts":["relay.example.test"],"adapterBase":"https://identity.example.test/api/goose/nip-fa","apiBasePath":"/api/goose/"}'
           BUZZ_BUILDERLAB_URL: ""
         run: |
           ./bin/cargo test -p buzzodz-plugins --lib --locked
           ./bin/cargo test -p Buzz --lib --locked host_request
           ./bin/pnpm exec vite build
+      - name: FI opt-out build and grant tests
+        env:
+          # An empty value opts out of every sign-in server, the built-in one too.
+          BUZZ_BUILD_FEDERATED_IDENTITY_CONFIG: ""
+        run: |
+          ./bin/cargo test -p buzzodz-plugins --lib --locked
+          ./bin/cargo test -p Buzz --lib --locked host_request
       - name: Scheduled agent command identity
         run: ./bin/node scripts/test-agent-command.mjs
       - name: Bundled buzz CLI

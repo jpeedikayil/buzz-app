@@ -298,7 +298,7 @@ async fn upgrade(
     }
     let cancel = match &assertion {
         Some(assertion) => {
-            let cancel = fi.cancellation_for(&assertion.revision)?;
+            let cancel = assertion.cancellation()?;
             fi.admit_assertion(identity, assertion).await?;
             cancel
         }

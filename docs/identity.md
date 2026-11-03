@@ -16,7 +16,9 @@ wireframes. When a page replaces another, focus moves to the new page's
 heading unless the page focuses a field itself, and **Back** returns focus to
 the choice that opened the page.
 
-In federated-identity builds (`BUZZ_BUILD_FEDERATED_IDENTITY_CONFIG`) the
+In builds with a sign-in server, which is every build unless it opts out or
+names another Builderlab deployment (see
+[configuration](configuration.md#federated-identity-build-input)), the
 bundled Builderlab plugin has no network grant of its own: its Builderlab calls
 go through the native FI session (#1461). There, **Sign in with Builderlab** is the
 native [organization sign-in](#native-federated-session-module), whose browser
@@ -818,10 +820,17 @@ The consent hooks are the base of the draft stack:
 
 Federated identity ([NIP-FI](https://github.com/block/buzz/blob/main/docs/nips/NIP-FI.md),
 [NIP-FA](https://github.com/block/buzz/blob/main/docs/nips/NIP-FA.md)) adds a native
-owner separate from the human Nostr key. Its deployment descriptor is documented
-in [configuration](configuration.md#federated-identity-build-input).
-The native commands return status, authority, revision, optional email, and fixed
-failure codes. Session tokens and assertion headers are native-only.
+owner separate from the human Nostr key, one per compiled sign-in server. The
+list of servers is documented in
+[configuration](configuration.md#federated-identity-build-input). Each relay is
+routed by its host to the server that covers it, never by anything the relay
+publishes; that server issues its assertions and later checks ask it alone. A
+community no server covers connects without a token. The build's first server
+is its Builderlab: the bundled plugin, agent credentials and Settings use its
+session, and the native commands act on it unless given a community `relay`,
+which a community's sign-in prompt passes so it signs in to that community's
+server. The native commands return status, authority, revision, optional email,
+and fixed failure codes. Session tokens and assertion headers are native-only.
 
 Sign-in uses the existing native loopback callback owner with NIP-FA `return_to`
 and an S256 handoff challenge, exchanges the code natively, and verifies the
@@ -831,7 +840,8 @@ replacement. Local expiry, cancellation, and sign-out fence stale work.
 
 FI records use the OS secure-store service
 `xyz.block.buzz.desktop.federated-session` (with `.debug` for Rust debug
-builds), keyed by profile and deployment fingerprint. On macOS one item per
+builds), keyed by profile and each server's deployment fingerprint, so a build's
+first server keeps the sessions it saved as the only server. On macOS one item per
 profile and deployment holds the session and every agent grant, so Keychain
 prompts once; Windows and Linux keep one item per record. Older macOS items
 move into it on read. This is a one-way development migration: close older

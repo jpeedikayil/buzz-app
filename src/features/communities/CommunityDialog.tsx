@@ -495,7 +495,11 @@ export function CommunityDialog({
             )}
             {error && (
               <CommunitySignIn
-                identity={federatedIdentity}
+                identity={
+                  (destination &&
+                    federatedIdentity?.forCommunity?.(destination.url)) ||
+                  federatedIdentity
+                }
                 error={error}
                 // Sign-in only clears the refusal: Continue then runs the current
                 // step with current input, never one captured before the login.

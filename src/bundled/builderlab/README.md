@@ -63,7 +63,7 @@ pre-app consent still use the existing canonical browser authentication gate.
 The bundled `block.builderlab` plugin adds Settings → Plugins → Builderlab: one
 sign-in, then hosted communities (`communities/`, see
 [plugin architecture](../../../docs/plugin-architecture.md)) and remote agents.
-With a valid `BUZZ_BUILDERLAB_URL` build input, it also registers
+With a configured Builderlab, it also registers
 `block.builderlab/builderlab` in Agents' new-agent type picker.
 `adapter-type/` connects this hosted type to Beekeeper: provision registers the
 agent, activation submits the owner proof and community supplied by Agents, and
@@ -81,7 +81,7 @@ Beekeeper accepts an owner proof only from the Buzz key bound to the signed-in
 Builderlab account. After sign-in, and again before each activation, the plugin
 checks `/v1/buzz/nostr-identities/current` and binds an unbound account to this
 device's key through the native kind 24243 signer, which accepts only
-production Builderlab or this build's `BUZZ_BUILDERLAB_URL` origin. An account
+production Builderlab or this build's Builderlab origin. An account
 bound to another key is reported and never unbound.
 The agent's Identity tab reads its current instructions from Builderlab and
 saves changes directly to the provider. Loading and saving use the same login;
@@ -204,8 +204,12 @@ agents are not migrated into this type.
   could never save is dropped and counted, never a halt. See
   [communities](../../../docs/communities.md#known-communities).
 
-The plugin uses the `BUZZ_BUILDERLAB_URL` [build input](../../../docs/configuration.md#builderlab-url-build-input)
-as its server address and appends `/api/goose`.
+The plugin's server is the build's Builderlab: its first
+[sign-in server](../../../docs/configuration.md#federated-identity-build-input),
+the built-in `https://app.builderlab.xyz` unless the build adds another, whose
+native session it uses and which survives a restart. A build without one uses
+the `BUZZ_BUILDERLAB_URL` [build input](../../../docs/configuration.md#builderlab-url-build-input)
+as its server address, appends `/api/goose`, and keeps its sign-in in memory.
 
 On desktop, the plugin supplies `/v1/auth/login` with `type=cli` and
 `product=builderlab` to the shared native

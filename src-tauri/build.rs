@@ -1,3 +1,5 @@
+#[path = "../crates/build_env.rs"]
+mod build_env;
 #[path = "src/build_resources.rs"]
 mod build_resources;
 #[path = "src/enterprise_adapter_url.rs"]
@@ -276,13 +278,16 @@ fn configure_enterprise_auth() {
 
 fn configure_federated_identity() {
     const NAME: &str = "BUZZ_BUILD_FEDERATED_IDENTITY_CONFIG";
+    const BUILDERLAB_URL: &str = "BUZZ_BUILDERLAB_URL";
     println!("cargo:rerun-if-env-changed={NAME}");
-    println!("cargo:rerun-if-env-changed=BUZZ_BUILDERLAB_URL");
-    if let Some(raw) = std::env::var(NAME).ok().filter(|raw| !raw.is_empty()) {
-        let config = federated_identity_config::Config::parse(&raw)
-            .unwrap_or_else(|error| panic!("{error}"));
+    println!("cargo:rerun-if-env-changed={BUILDERLAB_URL}");
+    let local = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap())
+        .join("../.env.local");
+    println!("cargo:rerun-if-changed={}", local.display());
+    let added = std::env::var(NAME).ok();
+    if added.as_deref().is_some_and(|raw| !raw.is_empty()) {
         for legacy in [
-            "BUZZ_BUILDERLAB_URL",
+            BUILDERLAB_URL,
             "BUZZ_BUILD_ENTERPRISE_AUTH_RELAYS",
             "BUZZ_BUILD_ENTERPRISE_AUTH_ADAPTER_BASE_URL",
         ] {
@@ -290,9 +295,17 @@ fn configure_federated_identity() {
                 panic!("{legacy} must be removed when {NAME} is configured");
             }
         }
+    }
+    // The Builderlab URL is read as the plugin manager reads it, .env.local included.
+    let builderlab_url = build_env::load(&local, &[BUILDERLAB_URL], |key| std::env::var(key).ok())
+        .unwrap_or_else(|error| panic!("{error}"))
+        .remove(BUILDERLAB_URL);
+    let servers = federated_identity_config::compiled(added.as_deref(), builderlab_url.as_deref())
+        .unwrap_or_else(|error| panic!("{error}"));
+    if !servers.is_empty() {
         println!(
             "cargo:rustc-env={NAME}={}",
-            serde_json::to_string(&config).expect("public descriptor")
+            serde_json::to_string(&servers).expect("public descriptors")
         );
     }
 }

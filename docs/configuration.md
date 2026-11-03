@@ -15,7 +15,7 @@ Build defaults are readable binary data, **never secret storage**.
 | `BUZZ_DATABRICKS_HOST` | Frontend build and dev server: `https://` Databricks workspace URL passed as `DATABRICKS_HOST` to every bundled `goose-acp`, which then prefers it to the host in goose's config. Unset in OSS builds. See [Databricks host](#databricks-host). |
 | `BUZZ_RELAY_URL` | Live development broker's default community, not an agent relay override or a packaged default. |
 | `BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY` | Presence-only alias for fresh-viewer community selection in live development only. Saved viewer choice wins. |
-| `BUZZ_BUILD_FEDERATED_IDENTITY_CONFIG` | Native build: federated identity authority, adapter prefix and community hosts. See below. |
+| `BUZZ_BUILD_FEDERATED_IDENTITY_CONFIG` | Native and frontend build: sign-in servers added to the built-in one, each with its adapter prefix and community hosts; empty opts out. See below. |
 | `BUZZ_DEV_OPEN_RELAY` | Development-specific override of that alias: only `1` enables; `0` explicitly opts out. Requires a relay URL and live viewer pin to have an effect. |
 | `BUZZ_DEV_FIRST_RUN_ACCOUNT` | Dev server only: replaces first run's kgoose reads and writes (including the key link, the unlink and the saved-community add), its key backup and backup recovery. Builds define it empty. See [below](#first-run-account-seed-development). |
 | `BUZZ_DEV_VIEWER`, `BUZZ_COMMUNITY_ALIASES`, `BUZZ_DEV_NOTIFICATIONS` | Existing public viewer pin, public routing aliases and dev notification override; unchanged. See the [development setup](contributing.md). |
@@ -84,8 +84,8 @@ builds.
 
 ## Builderlab URL build input
 
-Development and packaged builds default to `https://app.builderlab.xyz`, matching
-the desktop release workflow. To use another deployment, set `BUZZ_BUILDERLAB_URL`
+Development and packaged builds default to `https://app.builderlab.xyz`, the
+built-in sign-in server below. To use another deployment, set `BUZZ_BUILDERLAB_URL`
 in repository-root `.env.local` for development, or in the process running
 `bin/pnpm build` / `bin/pnpm tauri build` for packaging:
 
@@ -93,17 +93,42 @@ in repository-root `.env.local` for development, or in the process running
 BUZZ_BUILDERLAB_URL=https://app.builderlab.xyz bin/pnpm tauri build
 ```
 
-Without the federated identity input below, the bundled Builderlab plugin keeps
-its own in-memory login against this origin. With it, Builderlab is the FI
-identity origin with `apiBasePath` less its `/api/goose/` suffix (another API
-base leaves Builderlab unconfigured), sign-in uses the native FI session, and a
-nonempty `BUZZ_BUILDERLAB_URL` fails the build.
+Builderlab is the build's first sign-in server below: its identity origin with
+`apiBasePath` less its `/api/goose/` suffix (another API base leaves Builderlab
+unconfigured), and sign-in uses that server's native session, which is kept in
+the system keyring and survives a restart. Unset or set to
+`https://app.builderlab.xyz`, `BUZZ_BUILDERLAB_URL` keeps the built-in server.
+Another origin, or an empty value, turns it off when nothing is added, and the
+bundled Builderlab plugin keeps its own in-memory login against this origin.
+Alongside an added sign-in server, a nonempty `BUZZ_BUILDERLAB_URL` fails the
+build.
 
 ## Federated identity build input
 
-`BUZZ_BUILD_FEDERATED_IDENTITY_CONFIG` is a public JSON descriptor supplied to
-Cargo through the build environment. It is validated and compiled into native
-code, with no runtime override or credential field. For `just desktop` and
+Every build trusts a compiled list of sign-in servers. A relay never chooses
+one: each community is matched by its host against the list, and a community no
+server covers connects without a token. Each server keeps its own native
+session. The list starts with a built-in server, Builderlab for the public
+hosted communities:
+
+```json
+{
+  "version": 1,
+  "id": "bb-public",
+  "identityOrigin": "https://app.builderlab.xyz",
+  "communityHosts": ["*.communities.buzz.xyz", "communities.buzz.xyz"],
+  "adapterBase": "https://app.builderlab.xyz/api/goose",
+  "apiBasePath": "/api/goose/"
+}
+```
+
+`BUZZ_BUILD_FEDERATED_IDENTITY_CONFIG` adds servers to it. Unset, the build
+has the built-in server only. Empty, it has no sign-in servers. Otherwise it is
+a public JSON descriptor, or a JSON list of them, placed before the built-in
+server: the first server is the build's Builderlab. No two servers may share an
+id or a community host. The value is supplied to Cargo through the build
+environment, validated and compiled into native code, with no runtime override
+or credential field. For `just desktop` and
 `just desktop-bundle`, it can be set in `.env.local` (single-quote the JSON);
 see [launch environment](#launch-environment).
 
@@ -126,7 +151,8 @@ the viewer, or from Settings → Identity. `at-launch` signs in before the app
 opens and again whenever the session ends (see
 [identity](identity.md#sign-in-at-launch)). `organization` is the display name
 used in that sign-in copy, up to 64 characters. Neither is part of the deployment
-fingerprint, so changing them keeps saved sessions.
+fingerprint, so changing them keeps saved sessions. Each server's sessions are
+stored under its own fingerprint, so adding servers keeps those saved before.
 
 The first-run welcome screen's **Sign in with email** is the native
 organization sign-in in an FI build (see [identity](identity.md)).
@@ -137,8 +163,8 @@ For desktop, supply the full URL in `.env.local` or the build process environmen
 so both stages receive it. Vite's additional `.env` and mode-specific files do
 not configure native grants. Process values take precedence, including an
 explicit empty value. Set `BUZZ_BUILDERLAB_URL=` to leave login unconfigured and
-clear the bundled plugin's native grants. The desktop release workflow supplies the
-production URL by default; see [release configuration](releases.md#builderlab-url).
+clear the bundled plugin's native grants. The desktop release workflow leaves it
+unset; see [release configuration](releases.md#builderlab-url).
 
 Any HTTPS host is supported, including an explicit port or deployment path. URL
 credentials, query parameters and fragments are rejected by the native build.

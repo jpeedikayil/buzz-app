@@ -72,6 +72,64 @@ pub(super) fn record() -> Arc<Session> {
     })
 }
 
+#[test]
+fn each_community_routes_by_host_to_its_own_server() {
+    let servers = config::compiled(
+        Some(r#"{"version":1,"id":"bb-block","identityOrigin":"https://block.builderlab.xyz","communityHosts":["buzz.block.builderlab.xyz"],"adapterBase":"https://block.builderlab.xyz/api/goose","apiBasePath":"/api/goose/"}"#),
+        None,
+    )
+    .unwrap();
+    let server = |config: Config| {
+        FederatedIdentity::with_store(
+            Some(config),
+            String::new(),
+            String::new(),
+            Arc::new(Memory::default()),
+        )
+    };
+    let mut servers = servers.into_iter();
+    let first = servers.next().unwrap();
+    let public = server(servers.next().unwrap());
+    let first = FederatedIdentity::build(
+        Some(first),
+        String::new(),
+        String::new(),
+        Arc::new(Memory::default()),
+        vec![public.clone()],
+    );
+    let id = |relay: &str| {
+        first
+            .server_for(relay)
+            .unwrap()
+            .0
+            .config
+            .as_ref()
+            .unwrap()
+            .id
+            .clone()
+    };
+    assert_eq!(id("wss://buzz.block.builderlab.xyz"), "bb-block");
+    assert_eq!(id("wss://team.communities.buzz.xyz"), "bb-public");
+    assert!(first
+        .server_for("wss://team.communities.buzz.xyz")
+        .unwrap()
+        .is(&public));
+    // A community no server covers stays with the first, which attaches no token.
+    assert_eq!(id("wss://relay.example"), "bb-block");
+    assert_eq!(
+        first
+            .server_for_command(Some("https://Team.communities.buzz.xyz"))
+            .unwrap()
+            .0
+            .config
+            .as_ref()
+            .unwrap()
+            .id,
+        "bb-public"
+    );
+    assert!(first.server_for_command(None).unwrap().is(&first));
+}
+
 #[tokio::test]
 async fn restored_snapshots_do_not_wait_for_an_interactive_operation() {
     use futures_util::FutureExt;

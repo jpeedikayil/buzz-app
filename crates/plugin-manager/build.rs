@@ -96,13 +96,22 @@ fn main() {
     };
     const FI: &str = "BUZZ_BUILD_FEDERATED_IDENTITY_CONFIG";
     println!("cargo:rerun-if-env-changed={FI}");
-    let fi = std::env::var(FI)
-        .ok()
-        .filter(|raw| !raw.is_empty())
-        .map(|raw| {
-            federated_identity_config::Config::parse(&raw)
-                .expect("Invalid FI deployment descriptor")
-        });
+    let added = process(FI);
+    let builderlab_url = build_env::load(&local, &[BUILDERLAB_URL_KEY], |_| {
+        process(BUILDERLAB_URL_KEY)
+    })
+    .expect("Invalid Builderlab build configuration")
+    .remove(BUILDERLAB_URL_KEY);
+    if added.as_deref().is_some_and(|raw| !raw.is_empty())
+        && builderlab_url.as_deref().is_some_and(|url| !url.is_empty())
+    {
+        panic!("BUZZ_BUILDERLAB_URL must be removed when FI is configured");
+    }
+    // The build's Builderlab is its first sign-in server, when it has one.
+    let fi = federated_identity_config::compiled(added.as_deref(), builderlab_url.as_deref())
+        .expect("Invalid FI deployment descriptor")
+        .into_iter()
+        .next();
     println!(
         "cargo:rustc-env={FI}={}",
         fi.as_ref()
@@ -111,19 +120,7 @@ fn main() {
     );
     // An FI build signs in to Builderlab through its NIP-FI identity origin.
     let (origin, api_base_path) = match &fi {
-        Some(config) => {
-            let legacy = build_env::load(&local, &[BUILDERLAB_URL_KEY], |_| {
-                process(BUILDERLAB_URL_KEY)
-            })
-            .expect("Invalid Builderlab build configuration");
-            if legacy
-                .get(BUILDERLAB_URL_KEY)
-                .is_some_and(|url| !url.is_empty())
-            {
-                panic!("BUZZ_BUILDERLAB_URL must be removed when FI is configured");
-            }
-            (config.identity_origin.clone(), config.api_base_path.clone())
-        }
+        Some(config) => (config.identity_origin.clone(), config.api_base_path.clone()),
         None => builderlab_target(&local, process(BUILDERLAB_URL_KEY))
             .expect("Invalid Builderlab build configuration"),
     };

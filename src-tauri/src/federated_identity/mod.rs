@@ -1,4 +1,5 @@
-//! One native authority session owner. Secrets and adapter responses never cross IPC.
+//! Native sign-in server session owners, one per compiled server. Secrets and
+//! adapter responses never cross IPC.
 pub(crate) mod access;
 pub(crate) mod agent;
 pub(crate) mod assertion;
@@ -125,20 +126,40 @@ struct Inner {
     agent_tokens: Mutex<std::sync::Weak<agent::Inner>>,
     assertions: Mutex<assertion::AssertionCache>,
     discoveries: Mutex<assertion::DiscoveryCache>,
+    /// The build's other sign-in servers, each with its own session. Only the
+    /// first server, the build's Builderlab, has them.
+    peers: Vec<FederatedIdentity>,
 }
+/// A sign-in server's session. The app holds the build's first server, which
+/// routes each community to its own server (`server_for`).
 #[derive(Clone)]
 pub(crate) struct FederatedIdentity(Arc<Inner>);
 
 impl FederatedIdentity {
     pub(crate) fn new() -> Result<Self, String> {
-        let config = option_env!("BUZZ_BUILD_FEDERATED_IDENTITY_CONFIG")
+        let servers = option_env!("BUZZ_BUILD_FEDERATED_IDENTITY_CONFIG")
             .filter(|raw| !raw.is_empty())
-            .map(Config::parse)
-            .transpose()?;
+            .map(Config::parse_list)
+            .transpose()?
+            .unwrap_or_default();
         let profile = std::env::var("BUZZODZ_PROFILE").unwrap_or_else(|_| "default".into());
         if profile.is_empty() || profile.len() > 128 {
             return Err("Invalid federated identity profile".into());
         }
+        let mut servers = servers.into_iter().map(Some);
+        let first = servers.next().flatten();
+        let peers = servers
+            .map(|config| Self::open(config, &profile, Vec::new()))
+            .collect::<Result<_, _>>()?;
+        Self::open(first, &profile, peers)
+    }
+    /// Each server's sessions are stored under its own descriptor, so a
+    /// build's first server keeps the sessions it saved as the only one.
+    fn open(
+        config: Option<Config>,
+        profile: &str,
+        peers: Vec<FederatedIdentity>,
+    ) -> Result<Self, String> {
         let fingerprint = format!(
             "{:x}",
             Sha256::digest(
@@ -152,13 +173,23 @@ impl FederatedIdentity {
             root: store::root()?,
             bundled: store::BUNDLED,
         });
-        Ok(Self::with_store(config, fingerprint, account, store))
+        Ok(Self::build(config, fingerprint, account, store, peers))
     }
+    #[cfg(test)]
     fn with_store(
         config: Option<Config>,
         fingerprint: String,
         account: String,
         store: Arc<dyn Store>,
+    ) -> Self {
+        Self::build(config, fingerprint, account, store, Vec::new())
+    }
+    fn build(
+        config: Option<Config>,
+        fingerprint: String,
+        account: String,
+        store: Arc<dyn Store>,
+        peers: Vec<FederatedIdentity>,
     ) -> Self {
         let snapshot = Snapshot {
             status: if config.is_some() {
@@ -205,7 +236,31 @@ impl FederatedIdentity {
             agent_tokens: Mutex::default(),
             assertions: Mutex::new(Default::default()),
             discoveries: Mutex::new(Default::default()),
+            peers,
         }))
+    }
+    /// The server for a canonical relay, chosen by its host from the
+    /// compiled list, never by the relay. A community no server covers stays
+    /// with this one, which attaches no token for it.
+    pub(crate) fn server_for(&self, relay: &str) -> Result<Self, String> {
+        for peer in &self.0.peers {
+            if let Some(config) = &peer.0.config {
+                if config.matches_relay(relay)? {
+                    return Ok(peer.clone());
+                }
+            }
+        }
+        Ok(self.clone())
+    }
+    /// The server named by a sign-in command: this one without a relay.
+    fn server_for_command(&self, relay: Option<&str>) -> Result<Self, String> {
+        match relay {
+            Some(relay) => self.server_for(&config::canonical_relay(relay)?),
+            None => Ok(self.clone()),
+        }
+    }
+    fn is(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.0
@@ -226,11 +281,17 @@ impl FederatedIdentity {
         self.state().snapshot.clone()
     }
     pub(crate) fn watch<R: tauri::Runtime>(&self, app: tauri::AppHandle<R>) {
+        self.emit(app.clone(), "federated-identity");
+        for peer in &self.0.peers {
+            peer.emit(app.clone(), "federated-identity-community");
+        }
+    }
+    fn emit<R: tauri::Runtime>(&self, app: tauri::AppHandle<R>, event: &'static str) {
         let mut changes = self.0.changes.subscribe();
         tauri::async_runtime::spawn(async move {
             while changes.changed().await.is_ok() {
                 let snapshot = changes.borrow_and_update().clone();
-                let _ = app.emit_to("main", "federated-identity", snapshot);
+                let _ = app.emit_to("main", event, snapshot);
             }
         });
     }
@@ -390,6 +451,9 @@ impl FederatedIdentity {
         state.cancellation = CancellationToken::new();
     }
     pub(crate) fn close(&self) {
+        for peer in &self.0.peers {
+            peer.close();
+        }
         self.clear_discoveries();
         let mut state = self.state();
         self.retire_state(&mut state, Status::SignedOut, None);
@@ -910,7 +974,7 @@ impl FederatedIdentity {
             self.retire_state(&mut state, Status::SignedOut, None);
         }
     }
-    #[cfg(test)]
+    /// Agent grants belong to the first server; its sign-out is `AgentTokens::sign_out`.
     pub(crate) async fn sign_out(&self) -> Snapshot {
         self.finish_sign_out(self.begin_sign_out()).await
     }
@@ -982,28 +1046,43 @@ fn due(now: i64, warn: i64, expires: i64, warned: bool) -> Due {
     }
 }
 
+// `relay` names the community a sign-in is for; without one, the build's Builderlab.
 #[tauri::command]
 pub(crate) async fn federated_identity_snapshot(
     host: tauri::State<'_, FederatedIdentity>,
+    relay: Option<String>,
 ) -> Result<Snapshot, String> {
-    Ok(host.restore().await)
+    Ok(host.server_for_command(relay.as_deref())?.restore().await)
 }
 #[tauri::command]
 pub(crate) async fn federated_identity_sign_in<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     host: tauri::State<'_, FederatedIdentity>,
+    relay: Option<String>,
 ) -> Result<Snapshot, String> {
-    host.sign_in(&app).await.map_err(String::from)
+    let server = host.server_for_command(relay.as_deref())?;
+    server.sign_in(&app).await.map_err(String::from)
 }
 #[tauri::command]
-pub(crate) fn federated_identity_cancel_sign_in(host: tauri::State<'_, FederatedIdentity>) {
-    host.cancel_sign_in();
+pub(crate) fn federated_identity_cancel_sign_in(
+    host: tauri::State<'_, FederatedIdentity>,
+    relay: Option<String>,
+) -> Result<(), String> {
+    host.server_for_command(relay.as_deref())?.cancel_sign_in();
+    Ok(())
 }
 #[tauri::command]
 pub(crate) async fn federated_identity_sign_out(
+    host: tauri::State<'_, FederatedIdentity>,
     tokens: tauri::State<'_, agent::AgentTokens>,
+    relay: Option<String>,
 ) -> Result<Snapshot, String> {
-    tokens.sign_out().await
+    let server = host.server_for_command(relay.as_deref())?;
+    if server.is(&host) {
+        tokens.sign_out().await
+    } else {
+        Ok(server.sign_out().await)
+    }
 }
 
 #[cfg(test)]

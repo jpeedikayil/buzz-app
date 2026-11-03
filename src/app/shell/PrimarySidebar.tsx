@@ -246,7 +246,10 @@ function ScopedSidebar({
                 )}
                 <LiveSignIn
                   session={connection.session}
-                  identity={props.federatedIdentity}
+                  identity={communityIdentity(
+                    props.federatedIdentity,
+                    connection.origin,
+                  )}
                 />
                 {before}
                 <SidebarUnread listRef={sidebar.list} dmPreviews={dmPreviews}>
@@ -333,7 +336,10 @@ function ScopedSidebar({
                 {connection.status === "error" && !connection.retrying && (
                   <>
                     <CommunitySignIn
-                      identity={props.federatedIdentity}
+                      identity={communityIdentity(
+                        props.federatedIdentity,
+                        connection.origin,
+                      )}
                       error={connection.error}
                       retry={props.relay.retry}
                     />
@@ -347,6 +353,14 @@ function ScopedSidebar({
       )}
     </SidebarBoundary>
   );
+}
+
+/** The sign-in session for the community's own server, when it has one. */
+function communityIdentity(
+  identity: FederatedIdentity | undefined,
+  origin: string | undefined,
+) {
+  return (origin && identity?.forCommunity?.(origin)) || identity;
 }
 
 /** A protected community can refuse after its channel list is shown: native

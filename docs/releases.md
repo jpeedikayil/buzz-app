@@ -187,12 +187,13 @@ Setup, by a repository admin:
 
 ### Builderlab URL
 
-The **Desktop previews** workflow sets `BUZZ_BUILDERLAB_URL` for all platform
-builds, including candidate-only runs. It defaults to `https://app.builderlab.xyz`.
-To override it, set the repository's non-secret Actions variable
-`BUZZ_BUILDERLAB_URL`; an unset or empty variable uses the production default.
-When `BUZZ_BUILD_FEDERATED_IDENTITY_CONFIG` is set, the workflow supplies an
-empty `BUZZ_BUILDERLAB_URL` instead, because FI builds reject the legacy origin.
+The **Desktop previews** workflow leaves `BUZZ_BUILDERLAB_URL` unset, so every
+platform build, including candidate-only runs, signs in to the built-in
+Builderlab server (`https://app.builderlab.xyz`) with the native session. When
+the repository's non-secret Actions variable
+`BUZZ_BUILD_FEDERATED_IDENTITY_CONFIG` is nonempty, the workflow adds its
+servers to the built-in one; see
+[federated identity build input](configuration.md#federated-identity-build-input).
 
 ### Signing
 

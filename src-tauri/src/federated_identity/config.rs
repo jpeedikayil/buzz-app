@@ -37,6 +37,83 @@ impl SignIn {
 
 const INVALID: &str = "Invalid BUZZ_BUILD_FEDERATED_IDENTITY_CONFIG";
 
+/// The sign-in server every build trusts unless it opts out: Builderlab for
+/// the public hosted communities. Shaped like the descriptors that builds add.
+#[allow(dead_code)] // Compiled in by build.rs.
+pub(crate) const BUILT_IN: &str = r#"{"version":1,"id":"bb-public","identityOrigin":"https://app.builderlab.xyz","communityHosts":["*.communities.buzz.xyz","communities.buzz.xyz"],"adapterBase":"https://app.builderlab.xyz/api/goose","apiBasePath":"/api/goose/"}"#;
+
+/// The compiled list of trusted sign-in servers, from the build's
+/// `BUZZ_BUILD_FEDERATED_IDENTITY_CONFIG` (`added`) and `BUZZ_BUILDERLAB_URL`.
+/// Unset: the built-in server only. Empty: none. A descriptor or a list of
+/// them: those servers, then the built-in one. A Builderlab URL for another
+/// deployment turns the built-in server off when nothing is added, so that
+/// build keeps its own Builderlab sign-in. The first server is the build's
+/// Builderlab, used by the Builderlab plugin.
+#[allow(dead_code)] // Called by build.rs.
+pub(crate) fn compiled(
+    added: Option<&str>,
+    builderlab_url: Option<&str>,
+) -> Result<Vec<Config>, String> {
+    let built_in = Config::parse(BUILT_IN)?;
+    let servers = match added {
+        Some("") => return Ok(Vec::new()),
+        Some(raw) => {
+            let mut servers = Config::parse_list(raw)?;
+            servers.push(built_in);
+            servers
+        }
+        None if builderlab_url.is_none_or(is_built_in_builderlab) => vec![built_in],
+        None => return Ok(Vec::new()),
+    };
+    distinct(&servers)?;
+    Ok(servers)
+}
+
+/// Whether a Builderlab build URL names the built-in server's deployment.
+#[allow(dead_code)]
+fn is_built_in_builderlab(raw: &str) -> bool {
+    Url::parse(raw).is_ok_and(|url| {
+        url.origin().ascii_serialization() == "https://app.builderlab.xyz"
+            && url.path().trim_end_matches('/').is_empty()
+            && url.query().is_none()
+            && url.fragment().is_none()
+    })
+}
+
+/// Each community has at most one server: no two share an id, a host
+/// pattern, or a host that another's wildcard covers.
+fn distinct(servers: &[Config]) -> Result<(), String> {
+    for (index, server) in servers.iter().enumerate() {
+        for other in &servers[index + 1..] {
+            if server.id == other.id
+                || server.community_hosts.iter().any(|host| {
+                    other.community_hosts.contains(host)
+                        || covers(&other.community_hosts, host)
+                        || other
+                            .community_hosts
+                            .iter()
+                            .any(|theirs| covers(&server.community_hosts, theirs))
+                })
+            {
+                return Err(INVALID.into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a one-label wildcard in `patterns` matches the exact `host`.
+fn covers(patterns: &[String], host: &str) -> bool {
+    !host.starts_with("*.")
+        && patterns.iter().any(|pattern| {
+            pattern.strip_prefix("*.").is_some_and(|suffix| {
+                host.strip_suffix(suffix)
+                    .and_then(|prefix| prefix.strip_suffix('.'))
+                    .is_some_and(|label| !label.is_empty() && !label.contains(['.', ':']))
+            })
+        })
+}
+
 impl Config {
     pub(crate) fn parse(raw: &str) -> Result<Self, String> {
         if raw.len() > 8192 {
@@ -99,6 +176,23 @@ impl Config {
         }
         config.community_hosts = hosts;
         Ok(config)
+    }
+
+    /// One descriptor, or a JSON list of them.
+    pub(crate) fn parse_list(raw: &str) -> Result<Vec<Self>, String> {
+        if !raw.trim_start().starts_with('[') {
+            return Ok(vec![Self::parse(raw)?]);
+        }
+        let entries: Vec<serde_json::Value> = serde_json::from_str(raw).map_err(|_| INVALID)?;
+        if entries.is_empty() || entries.len() > 16 {
+            return Err(INVALID.into());
+        }
+        let servers = entries
+            .iter()
+            .map(|entry| Self::parse(&entry.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        distinct(&servers)?;
+        Ok(servers)
     }
 
     /// The deployment as it identifies saved sessions, without presentation.
@@ -224,6 +318,89 @@ mod tests {
             "wss://evilcommunities.example",
         ] {
             assert!(!config.matches_relay(relay).unwrap(), "{relay}");
+        }
+    }
+
+    const BB_BLOCK: &str = r#"{"version":1,"id":"bb-block","identityOrigin":"https://block.builderlab.xyz","communityHosts":["buzz.block.builderlab.xyz"],"adapterBase":"https://block.builderlab.xyz/api/goose","apiBasePath":"/api/goose/","signIn":"at-launch","organization":"Block"}"#;
+
+    fn ids(servers: &[Config]) -> Vec<&str> {
+        servers.iter().map(|server| server.id.as_str()).collect()
+    }
+
+    #[test]
+    fn a_build_without_configuration_trusts_the_built_in_server() {
+        let servers = compiled(None, None).unwrap();
+        assert_eq!(ids(&servers), ["bb-public"]);
+        let built_in = &servers[0];
+        assert_eq!(built_in.identity_origin, "https://app.builderlab.xyz");
+        assert_eq!(
+            built_in.endpoint("/v1/login/start").as_str(),
+            "https://app.builderlab.xyz/api/goose/v1/login/start"
+        );
+        assert!(built_in.sign_in == SignIn::OnDemand);
+        for relay in [
+            "wss://team.communities.buzz.xyz",
+            "wss://communities.buzz.xyz",
+        ] {
+            assert!(built_in.matches_relay(relay).unwrap(), "{relay}");
+        }
+        assert!(!built_in
+            .matches_relay("wss://buzz.block.builderlab.xyz")
+            .unwrap());
+        // The default Builderlab URL, however written, keeps it.
+        for url in ["https://app.builderlab.xyz", "https://app.builderlab.xyz/"] {
+            assert_eq!(ids(&compiled(None, Some(url)).unwrap()), ["bb-public"]);
+        }
+    }
+
+    #[test]
+    fn an_empty_value_or_another_builderlab_opts_out() {
+        assert!(compiled(Some(""), None).unwrap().is_empty());
+        assert!(compiled(Some(""), Some("https://app.builderlab.xyz"))
+            .unwrap()
+            .is_empty());
+        for url in [
+            "",
+            "https://staging.example",
+            "https://app.builderlab.xyz/other",
+        ] {
+            assert!(compiled(None, Some(url)).unwrap().is_empty(), "{url}");
+        }
+    }
+
+    #[test]
+    fn an_internal_build_adds_its_server_before_the_built_in_one() {
+        let servers = compiled(Some(BB_BLOCK), None).unwrap();
+        assert_eq!(ids(&servers), ["bb-block", "bb-public"]);
+        assert!(servers[0].sign_in == SignIn::AtLaunch);
+        let list = format!("[{BB_BLOCK}]");
+        assert_eq!(
+            ids(&compiled(Some(&list), None).unwrap()),
+            ["bb-block", "bb-public"]
+        );
+        // build.rs compiles the list; the app parses the same bytes back.
+        let rebuilt = Config::parse_list(&serde_json::to_string(&servers).unwrap()).unwrap();
+        assert_eq!(ids(&rebuilt), ["bb-block", "bb-public"]);
+    }
+
+    #[test]
+    fn a_community_has_at_most_one_server() {
+        let mut value = descriptor();
+        for hosts in [
+            serde_json::json!(["*.communities.buzz.xyz"]),
+            serde_json::json!(["team.communities.buzz.xyz"]),
+            serde_json::json!(["communities.buzz.xyz"]),
+        ] {
+            value["communityHosts"] = hosts;
+            assert!(compiled(Some(&value.to_string()), None).is_err());
+        }
+        value["communityHosts"] = serde_json::json!(["a.b.communities.buzz.xyz"]);
+        assert!(compiled(Some(&value.to_string()), None).is_ok());
+        let mut same_id = descriptor();
+        same_id["id"] = serde_json::json!("bb-public");
+        assert!(compiled(Some(&same_id.to_string()), None).is_err());
+        for bad in ["[]", "{}", "[1]"] {
+            assert!(Config::parse_list(bad).is_err(), "{bad}");
         }
     }
 
