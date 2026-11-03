@@ -2451,8 +2451,10 @@ export function createUnread({
    * from where its pages stopped (`rest`). A read still full at its last
    * page, which holding the mark back would only widen, gives way to a read
    * by ID of the edits and deletions of the held content that is not
-   * `current` (returned by a read of the pass, or received while it ran) in
+   * `live` (received while the pass ran, so its edits arrive live too) in
    * the chunks not read to their end, which `accept` applies as it does any.
+   * Content a read of the pass returned is read too: the relay leaves out
+   * what is deleted, but those reads carry no edits.
    * The outcome: `read`, or `dropped` when a read was dropped, which holds
    * the mark back for the next pass to retry, and the next read by ID
    * resumes the one dropped (see `byIdReads`). `newest` is the newest time
@@ -2460,7 +2462,7 @@ export function createUnread({
   async function vouch(
     ids: readonly string[],
     prior: UnreadMark,
-    current: (id: string) => boolean,
+    live: (id: string) => boolean,
     rest: readonly ReadFilter[] | undefined,
     newest: number | undefined,
     generation: number,
@@ -2501,16 +2503,16 @@ export function createUnread({
       const channels = new Set(
         reading?.rest().flatMap((gap) => gap["#h"] ?? []),
       );
-      const unreturned = [...events.values()].flatMap((event) =>
+      const unsettled = [...events.values()].flatMap((event) =>
         contentKind(event) &&
         channels.has(channelOf(event) ?? "") &&
-        !current(event.id)
+        !live(event.id)
           ? [event.id]
           : [],
       );
       const top = Math.max(newest ?? 0, reading?.newest() ?? 0);
       const byId = await scan(
-        byIdReads(unreturned, since, prior),
+        byIdReads(unsettled, since, prior),
         DELETION_PAGES,
         generation,
         priority,
@@ -2519,7 +2521,7 @@ export function createUnread({
       outcome = byId?.outcome();
       resumable =
         byId && outcome === "dropped"
-          ? { mark: prior, top, ids: new Set(unreturned), rest: byId.rest() }
+          ? { mark: prior, top, ids: new Set(unsettled), rest: byId.rest() }
           : undefined;
     }
     if (!outcome) return;
@@ -4284,7 +4286,7 @@ export function createUnread({
                 ids,
                 prior,
                 (id) =>
-                  returned.has(id) || (!before.has(id) && !unconfirmed.has(id)),
+                  !returned.has(id) && !before.has(id) && !unconfirmed.has(id),
                 catching?.rest(),
                 Math.max(sampledNewest ?? 0, catching?.newest() ?? 0),
                 generation,

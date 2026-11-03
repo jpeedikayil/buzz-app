@@ -213,8 +213,9 @@ point, the edits and deletions since it in every channel holding events, so a
 message deleted meanwhile is not kept past it; after a catch-up that stopped
 short, only those it did not reach. When those edits and deletions are more
 than it reads, it reads instead those of each event held in the channels it
-did not read to the end that none of its reads returned, and applies them, so
-nothing is dropped that was not deleted. When those of several events are more
+did not read to the end, other than those that arrived live meanwhile, and
+applies them, so nothing is dropped that was not deleted and no edit is
+missed: its other reads return no edits. When those of several events are more
 than it reads too, it reads on in halves, down to single events, and for one
 event its newest edits, with any deletion made after them, are enough. The
 point moves once that read lands. When it fails, or would need too many

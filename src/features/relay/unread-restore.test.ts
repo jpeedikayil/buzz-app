@@ -1259,9 +1259,11 @@ it("a full window's cut is its own limit-th match, and a deletion made while clo
   expect(await saved(late.memory)).not.toContain(removal.id);
   late.warm.owner.dispose();
   // More edits and deletions since the mark than that read reads: those of
-  // the restored evidence no read of the pass returned are read by ID, which
-  // returns this deletion, the rest stays, and the roster sample moves the
-  // mark, so the restored evidence owes no second read.
+  // the evidence held in its channels are read by ID, the restored evidence
+  // no read of the pass returned and, since those reads carry no edits, what
+  // they returned. That returns this deletion, the rest stays, and the
+  // roster sample moves the mark, so the restored evidence owes no second
+  // read.
   const edits = Array.from({ length: 1001 }, (_, i) =>
     hashed("team", T + 200 + i, 40003, [["e", "f".repeat(64)]]),
   );
@@ -1270,9 +1272,9 @@ it("a full window's cut is its own limit-th match, and a deletion made while clo
     filters.some((filter) => filter.kinds?.join() === "40003,5,9005"),
   );
   expect(overlays).toHaveLength(3);
-  expect(new Set(overlays[2]?.[0][0]?.["#e"])).toEqual(
-    new Set(unread.slice(0, 30).map(({ id }) => id)),
-  );
+  expect(
+    new Set(overlays[2]?.[0].flatMap((filter) => filter["#e"] ?? [])),
+  ).toEqual(new Set([mine, ...unread, ...busy].map(({ id }) => id)));
   expect((await overflow.memory.read())?.mark).toEqual({
     at: T + 50_499,
     checked: SECONDS,
@@ -2346,7 +2348,7 @@ const overlayRead = (filters: readonly ReadFilter[]) =>
 const byIdRead = (filters: readonly ReadFilter[]) =>
   overlayRead(filters) && filters.some((filter) => !!filter["#e"]);
 
-it("more edits and deletions since a stale mark than the bootstrap reads have those of the held content no read returned read by ID: a deletion applies, an unread message past its window's cut stays, and the mark moves once that read lands", async () => {
+it("more edits and deletions since a stale mark than the bootstrap reads have those of the held content not received live read by ID: a deletion applies, an unread message past its window's cut stays, and the mark moves once that read lands", async () => {
   const at = T + 10_000;
   // Confirmed over a day ago: the launch reads the bootstrap.
   const storage = await marked({ at, checked: SECONDS - 86_401 });
@@ -2375,7 +2377,7 @@ it("more edits and deletions since a stale mark than the bootstrap reads have th
   const { release, waiting } = h.hold();
   const launched = h.owner.capability.ensure();
   await waiting;
-  // Received while the pass reads, and returned by none of its reads.
+  // Received while the pass reads, so its edits arrive live too.
   const live = hashed("team", at + 600);
   h.owner.accept([live]);
   release();
@@ -2389,24 +2391,24 @@ it("more edits and deletions since a stale mark than the bootstrap reads have th
   // says some activity could not be checked.
   const sent = h.reader.read.mock.calls.map(([filters]) => filters);
   expect(sent.filter(overlayRead)).toHaveLength(4);
-  expect(sent.filter(byIdRead)).toEqual([
-    [
-      {
-        kinds: [40003, 5, 9005],
-        "#e": [old.id, mention.id],
-        since: at - 1865,
-        limit: 500,
-      },
-    ],
-    [
-      {
-        kinds: [40003, 5, 9005],
-        "#e": [old.id, mention.id],
-        since: at - 1865,
-        limit: 500,
-      },
-    ],
-  ]);
+  // Those held before the pass and those its reads returned, which carry no
+  // edits, in one request tried twice.
+  const byId = sent.filter(byIdRead);
+  expect(byId).toHaveLength(2);
+  for (const filters of byId) {
+    expect(filters).toEqual(
+      filters.map(() =>
+        expect.objectContaining({
+          kinds: [40003, 5, 9005],
+          since: at - 1865,
+          limit: 500,
+        }),
+      ),
+    );
+    expect(new Set(filters.flatMap((filter) => filter["#e"] ?? []))).toEqual(
+      new Set([old, mention, ...newer, ...busy].map(({ id }) => id)),
+    );
+  }
   expect(h.count("team")).toBe(103);
   expect(mentioned()).toBe(true);
   expect(h.owner.capability.inbox().partial).toBe(true);
@@ -2438,12 +2440,61 @@ it("more edits and deletions since a stale mark than the bootstrap reads have th
   expect(mentioned()).toBe(true);
 });
 
+it("more edits and deletions since a stale mark than the bootstrap reads have those of the content its reads returned read by ID too, since those reads carry no edits: a reply in the viewer's thread shows the edit below the cut, and the mark moves", async () => {
+  const at = T + 10_000;
+  // Confirmed over a day ago: the launch reads the bootstrap.
+  const storage = await marked({ at, checked: SECONDS - 86_401 });
+  // The viewer's thread, which team's window and the thread read return
+  // with no edits, and a peer's edit of its answer older than the 1,000
+  // edits and deletions since the mark the read of them reaches.
+  const root = hashed("team", at + 1, 9, [], viewer);
+  const answer = hashed("team", at + 2, 9, [["e", root.id, "", "reply"]]);
+  const edit = signed(peerKey, {
+    kind: 40003,
+    content: "answer, edited",
+    created_at: at + 3,
+    tags: [
+      ["h", "team"],
+      ["e", answer.id],
+    ],
+  });
+  const noise = Array.from({ length: 1000 }, (_, i) =>
+    hashed("team", at + 4 + i, 5, [["e", "f".repeat(64)]]),
+  );
+  const h = await launch({
+    store: [root, answer, edit, ...noise, ...busy],
+    storage,
+    frontiers: { ...BUSY_READ, team: at },
+  });
+  const save = vi.spyOn(storage, "save");
+  await h.owner.capability.ensure();
+  await save.mock.results.at(-1)?.value;
+  const sent = h.reader.read.mock.calls.map(([filters]) => filters);
+  expect(
+    sent
+      .filter(byIdRead)
+      .flatMap((filters) => filters.flatMap((filter) => filter["#e"] ?? [])),
+  ).toEqual(expect.arrayContaining([root.id, answer.id]));
+  expect(h.rows()).toContainEqual(
+    expect.objectContaining({
+      messageIds: [answer.id],
+      preview: "answer, edited",
+    }),
+  );
+  expect(h.owner.capability.inbox().partial).toBeUndefined();
+  expect((await storage.read())?.mark).toEqual({
+    at: T + 50_499,
+    checked: SECONDS,
+  });
+});
+
 it("of the reads by ID sharing a request, a full one pages on below the newest it matches, so another's older match does not skip a deletion it did not return", async () => {
   const at = T + 10_000;
   const since = at - 1865;
   const storage = await marked({ at, checked: SECONDS - 86_401 });
   // Unread past the window's cut and outside the roster sample: read by ID
-  // in two filters, the first of 100 and the second of one.
+  // in the first two filters, the first of 100 and the second led by one,
+  // ahead of what the reads returned.
   const held = Array.from({ length: 101 }, (_, i) =>
     hashed("team", at + 1 + i),
   );
@@ -2474,7 +2525,9 @@ it("of the reads by ID sharing a request, a full one pages on below the newest i
   const byId = h.reader.read.mock.calls
     .map(([filters]) => filters)
     .filter(byIdRead);
-  expect(byId[0]?.map((filter) => filter["#e"]?.length)).toEqual([100, 1]);
+  const [first, second] = byId[0] ?? [];
+  expect(first?.["#e"]).toEqual(held.slice(0, 100).map(({ id }) => id));
+  expect(second?.["#e"]?.[0]).toBe(held[100]?.id);
   expect(h.owner.event(hidden.id)).toBeDefined();
   expect(h.count("team")).toBe(197);
 });
@@ -2485,9 +2538,9 @@ it.each(["edited", "deleted"])(
     const at = T + 10_000;
     const since = at - 1865;
     const storage = await marked({ at, checked: SECONDS - 86_401 });
-    // Unread past the window's cut and outside the roster sample, read by ID
-    // together: one an agent edits more often than that read pages through,
-    // twice over, and one deleted below where its pages of both stop.
+    // Unread, and all the content held, read by ID together: one an agent
+    // edits more often than that read pages through, twice over, and one
+    // deleted below where its pages of both stop.
     const status = hashed("team", at - 2000);
     const other = hashed("team", at - 1999);
     const edits = Array.from({ length: 2001 }, (_, i) =>
@@ -2499,9 +2552,6 @@ it.each(["edited", "deleted"])(
     const noise = Array.from({ length: 1000 }, (_, i) =>
       hashed("team", since + 2002 + i, 5, [["e", "f".repeat(64)]]),
     );
-    const newer = Array.from({ length: 100 }, (_, i) =>
-      hashed("team", at + 500 + i),
-    );
     const deleted = variant === "deleted";
     const h = await launch({
       store: [
@@ -2511,11 +2561,9 @@ it.each(["edited", "deleted"])(
         ...(deleted ? [removal] : []),
         gone,
         ...noise,
-        ...newer,
-        ...busy,
       ],
       storage,
-      frontiers: { ...BUSY_READ, team: at - 3000 },
+      frontiers: { team: at - 3000 },
     });
     h.owner.accept([status, other]);
     const save = vi.spyOn(storage, "save");
@@ -2523,12 +2571,10 @@ it.each(["edited", "deleted"])(
     await save.mock.results.at(-1)?.value;
     // The other's half applies its deletion.
     expect(h.owner.event(gone.id)).toBeDefined();
-    expect(h.count("team")).toBe(deleted ? 100 : 101);
+    expect(h.count("team")).toBe(deleted ? 0 : 1);
     expect(h.owner.capability.inbox().partial).toBeUndefined();
-    expect((await storage.read())?.mark).toEqual({
-      at: T + 50_499,
-      checked: SECONDS,
-    });
+    // The roster sample's newest is below the mark, which it confirms.
+    expect((await storage.read())?.mark).toEqual({ at, checked: SECONDS });
     // Two pages of both, then each half on from where they stopped: the
     // deleted one is short, the edited one full at its last page.
     const shift = deleted ? 1 : 0;
@@ -2714,8 +2760,8 @@ it("a read by ID dropped at 200 halves is resumed by the next pass from where it
   const since = at - 1865;
   const storage = await marked({ at, checked: SECONDS - 86_401 });
   // Unread past the window's cut and outside the roster sample, read by ID
-  // in 15 filters of 100, beside more edits and deletions than the read by
-  // channel reaches.
+  // in 15 filters of 100 ahead of what the reads returned, beside more edits
+  // and deletions than the read by channel reaches.
   const held = Array.from({ length: 1500 }, (_, i) =>
     hashed("team", at - 2000 + i),
   );
@@ -2805,11 +2851,10 @@ it("a read by ID dropped at 200 halves is resumed by the next pass from where it
   // On from where the dropped read stopped, and its IDs again since the
   // roster's newest less the lookback: nothing is read again from the top
   // since the mark.
-  expect(second.flat().filter((filter) => filter.until === undefined)).toEqual(
-    first[0]?.concat(first[1] ?? []).map((filter) => ({
-      ...filter,
-      since: T + 50_499 - 1865,
-    })),
+  const top = (requests: readonly (readonly ReadFilter[])[]) =>
+    requests.flat().filter((filter) => filter.until === undefined);
+  expect(top(second)).toEqual(
+    top(first).map((filter) => ({ ...filter, since: T + 50_499 - 1865 })),
   );
   expect(first.length).toBeGreaterThan(200);
   expect(second.length).toBeLessThan(first.length / 4);
@@ -2856,6 +2901,7 @@ it("on a roster of more than 128 channels holding evidence, only the chunks whos
       .filter((filters) => overlayRead(filters) && !byIdRead(filters))
       .map(([filter]) => filter?.["#h"]?.length),
   ).toEqual([128, 2, 128]);
+  // Of the first chunk, what is held and what the roster sample returned.
   const edge = held.at(-1);
   expect(
     sent
@@ -2864,8 +2910,7 @@ it("on a roster of more than 128 channels holding evidence, only the chunks whos
       .flatMap((filter) => filter["#e"] ?? [])
       .sort(),
   ).toEqual(
-    held
-      .filter((item) => item !== edge)
+    [...held.filter((item) => item !== edge), ...busy]
       .map((item) => item.id)
       .sort(),
   );
@@ -2911,7 +2956,8 @@ it("unread messages in a channel whose window dropped beside a busy one's edits 
       .filter((filters) => filters.some(windowOf("team")))
       .every((filters) => !filters.some((filter) => filter.authors)),
   ).toBe(true);
-  // Each within the reader's 64 KiB of filters, together every one.
+  // Each within the reader's 64 KiB of filters, together every one and what
+  // the roster sample returned.
   const byId = sent.filter(byIdRead);
   expect(
     byId.every(
@@ -2925,7 +2971,7 @@ it("unread messages in a channel whose window dropped beside a busy one's edits 
       .flat()
       .flatMap((filter) => filter["#e"] ?? [])
       .sort(),
-  ).toEqual(unread.map((item) => item.id).sort());
+  ).toEqual([...unread, ...busy].map((item) => item.id).sort());
   expect(h.owner.capability.inbox().partial).toBe(true);
   expect(h.count("team")).toBe(1000);
   failing = false;
